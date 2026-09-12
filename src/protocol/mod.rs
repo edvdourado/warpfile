@@ -1,4 +1,5 @@
 pub mod decoder;
+pub mod discovery;
 pub mod encoder;
 pub mod frame;
 pub mod io;
@@ -7,6 +8,8 @@ pub mod offer;
 pub mod reject;
 
 pub use decoder::{DecodeError, decode_frame};
+
+pub use discovery::{DeviceAnnouncement, DiscoveryError, decode_announcement, encode_announcement};
 
 pub use encoder::{EncodeError, encode_frame};
 

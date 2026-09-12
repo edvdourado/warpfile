@@ -3,9 +3,10 @@ use std::io;
 use std::path::Path;
 
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
-use crate::protocol::frame::WFP_VERSION;
+use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
 use crate::protocol::{FileOffer, Frame, MessageType, encode_offer, read_frame, write_frame};
 
 pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Error>> {
@@ -92,7 +93,62 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
         }
     }
 
-    println!("File negotiation successful");
+    let mut file = fs::File::open(path).await?;
+
+    let mut buffer = vec![0u8; MAX_DATA_PAYLOAD_LENGTH];
+
+    let mut hasher = blake3::Hasher::new();
+
+    let mut bytes_sent: u64 = 0;
+
+    loop {
+        let bytes_read = file.read(&mut buffer).await?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+
+        let data_frame = Frame::new(MessageType::Data, buffer[..bytes_read].to_vec());
+
+        write_frame(&mut stream, &data_frame).await?;
+
+        bytes_sent += bytes_read as u64;
+    }
+
+    if bytes_sent != file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected to send {file_size} bytes, sent {bytes_sent}"),
+        )
+        .into());
+    }
+
+    println!("Sent {bytes_sent} bytes");
+
+    let digest = hasher.finalize();
+
+    let complete = Frame::new(MessageType::Complete, digest.as_bytes().to_vec());
+
+    write_frame(&mut stream, &complete).await?;
+
+    println!("Sent COMPLETE");
+
+    let response = read_frame(&mut stream).await?;
+
+    if response.message_type != MessageType::Verified {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected VERIFIED").into());
+    }
+
+    if !response.payload.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "VERIFIED payload must be empty").into(),
+        );
+    }
+
+    println!("Received VERIFIED");
+    println!("Transfer successful");
 
     Ok(())
 }

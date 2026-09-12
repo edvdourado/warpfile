@@ -249,3 +249,87 @@ async fn removes_partial_file_when_sender_disconnects() {
         "partial file remained after the sender disconnected"
     );
 }
+
+#[tokio::test]
+async fn rejects_file_with_invalid_hash() {
+    let temp = tempdir().unwrap();
+
+    let destination_directory = temp.path().join("received");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let address = listener.local_addr().unwrap();
+
+    let receiver = receive_once(listener, &destination_directory);
+
+    let fake_sender = async {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+
+        let hello = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
+
+        write_frame(&mut stream, &hello).await.unwrap();
+
+        let hello_ack = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+
+        let data = vec![0xCD; 4096];
+
+        let offer = FileOffer {
+            filename: "corrupted.bin".to_string(),
+            file_size: data.len() as u64,
+        };
+
+        let offer_payload = encode_offer(&offer).unwrap();
+
+        let offer_frame = Frame::new(MessageType::Offer, offer_payload);
+
+        write_frame(&mut stream, &offer_frame).await.unwrap();
+
+        let accept = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(accept.message_type, MessageType::Accept);
+
+        let data_frame = Frame::new(MessageType::Data, data.clone());
+
+        write_frame(&mut stream, &data_frame).await.unwrap();
+
+        let real_hash = blake3::hash(&data);
+
+        let mut wrong_hash = real_hash.as_bytes().to_vec();
+
+        wrong_hash[0] ^= 0xFF;
+
+        let complete = Frame::new(MessageType::Complete, wrong_hash);
+
+        write_frame(&mut stream, &complete).await.unwrap();
+    };
+
+    let (receiver_result, _) = tokio::join!(receiver, fake_sender);
+
+    assert!(
+        receiver_result.is_err(),
+        "receiver should reject a file with an invalid hash"
+    );
+
+    let receiver_error = receiver_result.unwrap_err().to_string();
+
+    assert!(
+        receiver_error.contains("file integrity verification failed"),
+        "receiver reported the wrong error: {receiver_error}"
+    );
+
+    let final_path = destination_directory.join("corrupted.bin");
+
+    assert!(
+        !final_path.exists(),
+        "receiver created a final file even though integrity verification failed"
+    );
+
+    let partial_path = destination_directory.join("corrupted.bin.part");
+
+    assert!(
+        !partial_path.exists(),
+        "partial file remained after integrity verification failed"
+    );
+}

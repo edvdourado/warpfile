@@ -6,6 +6,7 @@ use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
+use crate::progress::ProgressTracker;
 use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
 
 use crate::protocol::{
@@ -119,6 +120,8 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
 
     let mut bytes_sent: u64 = 0;
 
+    let mut progress = ProgressTracker::new("Sending", file_size);
+
     loop {
         let bytes_read = file.read(&mut buffer).await?;
 
@@ -133,6 +136,8 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
         write_frame(&mut stream, &data_frame).await?;
 
         bytes_sent += bytes_read as u64;
+
+        progress.add(bytes_read);
     }
 
     if bytes_sent != file_size {
@@ -142,6 +147,8 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
         )
         .into());
     }
+
+    progress.finish();
 
     println!("Sent {bytes_sent} bytes");
 

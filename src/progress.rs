@@ -10,6 +10,8 @@ pub struct ProgressTracker {
     started_at: Instant,
     last_draw_at: Instant,
     last_line_length: usize,
+    has_drawn: bool,
+    finished: bool,
 }
 
 impl ProgressTracker {
@@ -23,6 +25,8 @@ impl ProgressTracker {
             started_at: now,
             last_draw_at: now,
             last_line_length: 0,
+            has_drawn: false,
+            finished: false,
         }
     }
 
@@ -42,6 +46,8 @@ impl ProgressTracker {
         self.draw();
 
         println!();
+
+        self.finished = true;
     }
 
     fn draw(&mut self) {
@@ -86,6 +92,18 @@ impl ProgressTracker {
         let _ = io::stdout().flush();
 
         self.last_line_length = line.len();
+
+        self.has_drawn = true;
+    }
+}
+
+impl Drop for ProgressTracker {
+    fn drop(&mut self) {
+        if self.has_drawn && !self.finished {
+            println!();
+
+            let _ = io::stdout().flush();
+        }
     }
 }
 

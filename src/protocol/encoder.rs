@@ -1,13 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use super::frame::{
-    Frame,
-    HEADER_LENGTH,
-    MAX_DATA_PAYLOAD_LENGTH,
-    MAX_PAYLOAD_LENGTH,
-    WFP_MAGIC,
-};
+use super::frame::{Frame, HEADER_LENGTH, MAX_DATA_PAYLOAD_LENGTH, MAX_PAYLOAD_LENGTH, WFP_MAGIC};
 use super::message::MessageType;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,12 +24,9 @@ impl Error for EncodeError {}
 pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, EncodeError> {
     let payload_length = frame.payload.len();
 
-
-    if frame.message_type == MessageType::Data
-    && payload_length > MAX_DATA_PAYLOAD_LENGTH
-{
-    return Err(EncodeError::PayloadTooLarge(payload_length));
-}
+    if frame.message_type == MessageType::Data && payload_length > MAX_DATA_PAYLOAD_LENGTH {
+        return Err(EncodeError::PayloadTooLarge(payload_length));
+    }
 
     if payload_length > MAX_PAYLOAD_LENGTH {
         return Err(EncodeError::PayloadTooLarge(payload_length));
@@ -64,20 +55,12 @@ mod tests {
 
     #[test]
     fn encodes_hello_frame_exactly_as_specified() {
-        let frame = Frame::new(
-            MessageType::Hello,
-            vec![WFP_VERSION],
-        );
+        let frame = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
 
         let encoded = encode_frame(&frame).unwrap();
 
         let expected = vec![
-            0x57, 0x46, 0x50, 0x00,
-            0x01,
-            0x01,
-            0x00, 0x00,
-            0x00, 0x00, 0x00, 0x01,
-            0x01,
+            0x57, 0x46, 0x50, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
         ];
 
         assert_eq!(encoded, expected);
@@ -85,19 +68,12 @@ mod tests {
 
     #[test]
     fn encodes_empty_payload() {
-        let frame = Frame::new(
-            MessageType::Accept,
-            Vec::new(),
-        );
+        let frame = Frame::new(MessageType::Accept, Vec::new());
 
         let encoded = encode_frame(&frame).unwrap();
 
         let expected = vec![
-            0x57, 0x46, 0x50, 0x00,
-            0x01,
-            0x11,
-            0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x57, 0x46, 0x50, 0x00, 0x01, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
         assert_eq!(encoded, expected);
@@ -107,10 +83,7 @@ mod tests {
     fn rejects_payload_larger_than_protocol_limit() {
         let payload = vec![0u8; MAX_PAYLOAD_LENGTH + 1];
 
-        let frame = Frame::new(
-            MessageType::Offer,
-            payload,
-        );
+        let frame = Frame::new(MessageType::Offer, payload);
 
         let result = encode_frame(&frame);
 
@@ -121,21 +94,16 @@ mod tests {
     }
 
     #[test]
-fn rejects_data_payload_larger_than_data_limit() {
-    let payload = vec![0u8; MAX_DATA_PAYLOAD_LENGTH + 1];
+    fn rejects_data_payload_larger_than_data_limit() {
+        let payload = vec![0u8; MAX_DATA_PAYLOAD_LENGTH + 1];
 
-    let frame = Frame::new(
-        MessageType::Data,
-        payload,
-    );
+        let frame = Frame::new(MessageType::Data, payload);
 
-    let result = encode_frame(&frame);
+        let result = encode_frame(&frame);
 
-    assert_eq!(
-        result,
-        Err(EncodeError::PayloadTooLarge(
-            MAX_DATA_PAYLOAD_LENGTH + 1
-        ))
-    );
-}
+        assert_eq!(
+            result,
+            Err(EncodeError::PayloadTooLarge(MAX_DATA_PAYLOAD_LENGTH + 1))
+        );
+    }
 }

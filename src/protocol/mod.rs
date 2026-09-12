@@ -4,22 +4,12 @@ pub mod frame;
 pub mod io;
 pub mod message;
 
-pub use decoder::{
-    decode_frame,
-    DecodeError,
-};
+pub use decoder::{DecodeError, decode_frame};
 
-pub use encoder::{
-    encode_frame,
-    EncodeError,
-};
+pub use encoder::{EncodeError, encode_frame};
 
 pub use frame::Frame;
 
-pub use io::{
-    read_frame,
-    write_frame,
-    ProtocolIoError,
-};
+pub use io::{ProtocolIoError, read_frame, write_frame};
 
 pub use message::MessageType;

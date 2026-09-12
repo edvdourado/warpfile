@@ -2,29 +2,13 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use tokio::io::{
-    AsyncRead,
-    AsyncReadExt,
-    AsyncWrite,
-    AsyncWriteExt,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::decoder::{
-    decode_frame,
-    DecodeError,
-};
+use super::decoder::{DecodeError, decode_frame};
 
-use super::encoder::{
-    encode_frame,
-    EncodeError,
-};
+use super::encoder::{EncodeError, encode_frame};
 
-use super::frame::{
-    Frame,
-    HEADER_LENGTH,
-    MAX_DATA_PAYLOAD_LENGTH,
-    MAX_PAYLOAD_LENGTH,
-};
+use super::frame::{Frame, HEADER_LENGTH, MAX_DATA_PAYLOAD_LENGTH, MAX_PAYLOAD_LENGTH};
 
 use super::message::MessageType;
 
@@ -36,10 +20,7 @@ pub enum ProtocolIoError {
 }
 
 impl fmt::Display for ProtocolIoError {
-    fn fmt(
-        &self,
-        f: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProtocolIoError::Io(error) => {
                 write!(f, "I/O error: {error}")
@@ -76,10 +57,7 @@ impl From<EncodeError> for ProtocolIoError {
     }
 }
 
-pub async fn write_frame<W>(
-    writer: &mut W,
-    frame: &Frame,
-) -> Result<(), ProtocolIoError>
+pub async fn write_frame<W>(writer: &mut W, frame: &Frame) -> Result<(), ProtocolIoError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -91,9 +69,7 @@ where
     Ok(())
 }
 
-pub async fn read_frame<R>(
-    reader: &mut R,
-) -> Result<Frame, ProtocolIoError>
+pub async fn read_frame<R>(reader: &mut R) -> Result<Frame, ProtocolIoError>
 where
     R: AsyncRead + Unpin,
 {
@@ -101,54 +77,27 @@ where
 
     reader.read_exact(&mut header).await?;
 
-    let payload_length = u32::from_be_bytes([
-        header[8],
-        header[9],
-        header[10],
-        header[11],
-    ]) as usize;
+    let payload_length =
+        u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
 
     if payload_length > MAX_PAYLOAD_LENGTH {
-        return Err(
-            DecodeError::PayloadTooLarge(
-                payload_length,
-            )
-            .into(),
-        );
+        return Err(DecodeError::PayloadTooLarge(payload_length).into());
     }
 
-    let message_type =
-        MessageType::try_from(header[5])
-            .map_err(
-                DecodeError::UnknownMessageType,
-            )?;
+    let message_type = MessageType::try_from(header[5]).map_err(DecodeError::UnknownMessageType)?;
 
-    if message_type == MessageType::Data
-        && payload_length
-            > MAX_DATA_PAYLOAD_LENGTH
-    {
-        return Err(
-            DecodeError::DataPayloadTooLarge(
-                payload_length,
-            )
-            .into(),
-        );
+    if message_type == MessageType::Data && payload_length > MAX_DATA_PAYLOAD_LENGTH {
+        return Err(DecodeError::DataPayloadTooLarge(payload_length).into());
     }
 
-    let mut bytes =
-        Vec::with_capacity(
-            HEADER_LENGTH + payload_length,
-        );
+    let mut bytes = Vec::with_capacity(HEADER_LENGTH + payload_length);
 
     bytes.extend_from_slice(&header);
 
     if payload_length > 0 {
-        let mut payload =
-            vec![0u8; payload_length];
+        let mut payload = vec![0u8; payload_length];
 
-        reader
-            .read_exact(&mut payload)
-            .await?;
+        reader.read_exact(&mut payload).await?;
 
         bytes.extend_from_slice(&payload);
     }
@@ -166,83 +115,35 @@ mod tests {
 
     #[tokio::test]
     async fn writes_and_reads_one_frame() {
-        let (
-            mut side_a,
-            mut side_b,
-        ) = duplex(1024);
+        let (mut side_a, mut side_b) = duplex(1024);
 
-        let original = Frame::new(
-            MessageType::Hello,
-            vec![WFP_VERSION],
-        );
+        let original = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
 
-        write_frame(
-            &mut side_a,
-            &original,
-        )
-        .await
-        .unwrap();
+        write_frame(&mut side_a, &original).await.unwrap();
 
-        let received =
-            read_frame(&mut side_b)
-                .await
-                .unwrap();
+        let received = read_frame(&mut side_b).await.unwrap();
 
-        assert_eq!(
-            received,
-            original
-        );
+        assert_eq!(received, original);
     }
 
     #[tokio::test]
     async fn keeps_two_frames_separate() {
-        let (
-            mut side_a,
-            mut side_b,
-        ) = duplex(1024);
+        let (mut side_a, mut side_b) = duplex(1024);
 
-        let first = Frame::new(
-            MessageType::Hello,
-            vec![WFP_VERSION],
-        );
+        let first = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
 
-        let second = Frame::new(
-            MessageType::Accept,
-            Vec::new(),
-        );
+        let second = Frame::new(MessageType::Accept, Vec::new());
 
-        write_frame(
-            &mut side_a,
-            &first,
-        )
-        .await
-        .unwrap();
+        write_frame(&mut side_a, &first).await.unwrap();
 
-        write_frame(
-            &mut side_a,
-            &second,
-        )
-        .await
-        .unwrap();
+        write_frame(&mut side_a, &second).await.unwrap();
 
-        let received_first =
-            read_frame(&mut side_b)
-                .await
-                .unwrap();
+        let received_first = read_frame(&mut side_b).await.unwrap();
 
-        let received_second =
-            read_frame(&mut side_b)
-                .await
-                .unwrap();
+        let received_second = read_frame(&mut side_b).await.unwrap();
 
-        assert_eq!(
-            received_first,
-            first
-        );
+        assert_eq!(received_first, first);
 
-        assert_eq!(
-            received_second,
-            second
-        );
+        assert_eq!(received_second, second);
     }
 }

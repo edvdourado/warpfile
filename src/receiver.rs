@@ -5,8 +5,9 @@ use std::path::{Component, Path};
 use tokio::fs;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+use crate::discovery::{DISCOVERY_PORT, local_device_name, run_discovery_responder};
 use crate::progress::ProgressTracker;
 use crate::protocol::frame::WFP_VERSION;
 use crate::protocol::{
@@ -16,11 +17,40 @@ use crate::protocol::{
 
 pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
     println!("WarpFile Receiver");
-    println!("Listening on {address}");
 
     let listener = TcpListener::bind(address).await?;
 
-    receive_once(listener, Path::new("received")).await
+    let tcp_port = listener.local_addr()?.port();
+
+    println!("Listening on {address}");
+
+    let discovery_socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await?;
+
+    let device_name = local_device_name();
+
+    println!("Discovery: {device_name} on UDP 0.0.0.0:{DISCOVERY_PORT}");
+
+    let receiver = receive_once(listener, Path::new("received"));
+
+    let discovery = run_discovery_responder(&discovery_socket, &device_name, tcp_port);
+
+    tokio::pin!(receiver);
+
+    tokio::pin!(discovery);
+
+    tokio::select! {
+        result =
+            &mut receiver =>
+        {
+            result
+        }
+
+        result =
+            &mut discovery =>
+        {
+            result
+        }
+    }
 }
 
 pub async fn receive_once(
@@ -70,8 +100,11 @@ pub async fn receive_once(
 
     println!();
     println!("Incoming file:");
+
     println!("Name: {}", offer.filename);
+
     println!("Size: {} bytes", offer.file_size);
+
     println!();
 
     if let Err(error) = fs::create_dir_all(destination_directory).await {
@@ -295,6 +328,7 @@ async fn send_reject(
 ) -> Result<(), Box<dyn Error>> {
     let reject = FileReject {
         code,
+
         message: message.to_string(),
     };
 

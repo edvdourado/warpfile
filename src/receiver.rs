@@ -7,6 +7,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::progress::ProgressTracker;
 use crate::protocol::frame::WFP_VERSION;
 use crate::protocol::{
     FileReject, Frame, MessageType, RejectCode, decode_offer, encode_reject, read_frame,
@@ -148,6 +149,8 @@ pub async fn receive_once(
 
     let mut bytes_received: u64 = 0;
 
+    let mut progress = ProgressTracker::new("Receiving", offer.file_size);
+
     let sender_hash = loop {
         let frame = read_frame(&mut stream).await?;
 
@@ -174,6 +177,8 @@ pub async fn receive_once(
                 hasher.update(&frame.payload);
 
                 bytes_received = next_total;
+
+                progress.add(frame.payload.len());
             }
 
             MessageType::Complete => {
@@ -229,6 +234,8 @@ pub async fn receive_once(
         )
         .into());
     }
+
+    progress.finish();
 
     fs::rename(&partial_destination, &destination).await?;
 

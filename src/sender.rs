@@ -8,7 +8,6 @@ use tokio::net::TcpStream;
 
 use crate::progress::ProgressTracker;
 use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
-
 use crate::protocol::{
     FileOffer, Frame, MessageType, decode_reject, encode_offer, read_frame, write_frame,
 };
@@ -122,8 +121,51 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
 
     let mut progress = ProgressTracker::new("Sending", file_size);
 
+    let cancel_signal = tokio::signal::ctrl_c();
+
+    tokio::pin!(cancel_signal);
+
     loop {
-        let bytes_read = file.read(&mut buffer).await?;
+        let read_result = tokio::select! {
+            signal_result =
+                &mut cancel_signal =>
+            {
+                signal_result?;
+
+                let cancel =
+                    Frame::new(
+                        MessageType::Cancel,
+                        Vec::new(),
+                    );
+
+                write_frame(
+                    &mut stream,
+                    &cancel,
+                )
+                .await?;
+
+                println!();
+                println!("Sent CANCEL");
+
+                return Err(
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "transfer cancelled by user",
+                    )
+                    .into(),
+                );
+            }
+
+            read_result =
+                file.read(
+                    &mut buffer,
+                ) =>
+            {
+                read_result
+            }
+        };
+
+        let bytes_read = read_result?;
 
         if bytes_read == 0 {
             break;

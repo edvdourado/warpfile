@@ -119,7 +119,7 @@ pub async fn receive_once(
         }
     }
 
-    let mut output = match OpenOptions::new()
+    let output = match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&partial_destination)
@@ -141,18 +141,62 @@ pub async fn receive_once(
 
     let accept = Frame::new(MessageType::Accept, Vec::new());
 
-    write_frame(&mut stream, &accept).await?;
+    if let Err(error) = write_frame(&mut stream, &accept).await {
+        drop(output);
+
+        let _ = fs::remove_file(&partial_destination).await;
+
+        return Err(error.into());
+    }
 
     println!("Sent ACCEPT");
 
+    let transfer_result = receive_file_data(&mut stream, output, offer.file_size).await;
+
+    let bytes_received = match transfer_result {
+        Ok(bytes_received) => bytes_received,
+
+        Err(error) => {
+            let _ = fs::remove_file(&partial_destination).await;
+
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = fs::rename(&partial_destination, &destination).await {
+        let _ = fs::remove_file(&partial_destination).await;
+
+        return Err(error.into());
+    }
+
+    println!("Received {bytes_received} bytes");
+
+    println!("BLAKE3 verification successful");
+
+    let verified = Frame::new(MessageType::Verified, Vec::new());
+
+    write_frame(&mut stream, &verified).await?;
+
+    println!("Sent VERIFIED");
+
+    println!("Saved to {}", destination.display());
+
+    Ok(())
+}
+
+async fn receive_file_data(
+    stream: &mut TcpStream,
+    mut output: fs::File,
+    expected_size: u64,
+) -> Result<u64, Box<dyn Error>> {
     let mut hasher = blake3::Hasher::new();
 
     let mut bytes_received: u64 = 0;
 
-    let mut progress = ProgressTracker::new("Receiving", offer.file_size);
+    let mut progress = ProgressTracker::new("Receiving", expected_size);
 
     let sender_hash = loop {
-        let frame = read_frame(&mut stream).await?;
+        let frame = read_frame(stream).await?;
 
         match frame.message_type {
             MessageType::Data => {
@@ -162,9 +206,7 @@ pub async fn receive_once(
                     io::Error::new(io::ErrorKind::InvalidData, "received byte count overflow")
                 })?;
 
-                if next_total > offer.file_size {
-                    let _ = fs::remove_file(&partial_destination).await;
-
+                if next_total > expected_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "received more bytes than announced",
@@ -183,8 +225,6 @@ pub async fn receive_once(
 
             MessageType::Complete => {
                 if frame.payload.len() != 32 {
-                    let _ = fs::remove_file(&partial_destination).await;
-
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "COMPLETE must contain a 32-byte BLAKE3 hash",
@@ -196,8 +236,6 @@ pub async fn receive_once(
             }
 
             _ => {
-                let _ = fs::remove_file(&partial_destination).await;
-
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "expected DATA or COMPLETE",
@@ -208,17 +246,13 @@ pub async fn receive_once(
     };
 
     output.flush().await?;
+
     drop(output);
 
-    if bytes_received != offer.file_size {
-        let _ = fs::remove_file(&partial_destination).await;
-
+    if bytes_received != expected_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "expected {} bytes, received {}",
-                offer.file_size, bytes_received
-            ),
+            format!("expected {expected_size} bytes, received {bytes_received}"),
         )
         .into());
     }
@@ -226,8 +260,6 @@ pub async fn receive_once(
     let receiver_hash = hasher.finalize();
 
     if sender_hash.as_slice() != receiver_hash.as_bytes() {
-        let _ = fs::remove_file(&partial_destination).await;
-
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file integrity verification failed",
@@ -237,21 +269,7 @@ pub async fn receive_once(
 
     progress.finish();
 
-    fs::rename(&partial_destination, &destination).await?;
-
-    println!("Received {bytes_received} bytes");
-
-    println!("BLAKE3 verification successful");
-
-    let verified = Frame::new(MessageType::Verified, Vec::new());
-
-    write_frame(&mut stream, &verified).await?;
-
-    println!("Sent VERIFIED");
-
-    println!("Saved to {}", destination.display());
-
-    Ok(())
+    Ok(bytes_received)
 }
 
 async fn send_reject(

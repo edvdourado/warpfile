@@ -16,6 +16,13 @@ pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
 
     let listener = TcpListener::bind(address).await?;
 
+    receive_once(listener, Path::new("received")).await
+}
+
+pub async fn receive_once(
+    listener: TcpListener,
+    destination_directory: &Path,
+) -> Result<(), Box<dyn Error>> {
     let (mut stream, peer_address) = listener.accept().await?;
 
     println!("Connection from {peer_address}");
@@ -56,13 +63,13 @@ pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
     println!("Size: {} bytes", offer.file_size);
     println!();
 
-    fs::create_dir_all("received").await?;
+    fs::create_dir_all(destination_directory).await?;
 
-    let destination = Path::new("received").join(&offer.filename);
+    let destination = destination_directory.join(&offer.filename);
 
     let partial_name = format!("{}.part", offer.filename);
 
-    let partial_destination = Path::new("received").join(partial_name);
+    let partial_destination = destination_directory.join(partial_name);
 
     if fs::try_exists(&destination).await? {
         return Err(io::Error::new(

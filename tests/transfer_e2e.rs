@@ -54,6 +54,63 @@ async fn transfers_file_end_to_end() {
 }
 
 #[tokio::test]
+async fn transfers_empty_file_end_to_end() {
+    let temp = tempdir().unwrap();
+
+    let source_directory = temp.path().join("source");
+
+    let destination_directory = temp.path().join("received");
+
+    fs::create_dir_all(&source_directory).unwrap();
+
+    let source_path = source_directory.join("empty.bin");
+
+    fs::write(&source_path, []).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let address = listener.local_addr().unwrap().to_string();
+
+    let source_path_string = source_path.to_string_lossy().into_owned();
+
+    let receiver = receive_once(listener, &destination_directory);
+
+    let sender = run_sender(&source_path_string, &address);
+
+    let (receiver_result, sender_result) = tokio::join!(receiver, sender);
+
+    assert!(
+        receiver_result.is_ok(),
+        "receiver failed: {:?}",
+        receiver_result.err()
+    );
+
+    assert!(
+        sender_result.is_ok(),
+        "sender failed: {:?}",
+        sender_result.err()
+    );
+
+    let received_path = destination_directory.join("empty.bin");
+
+    assert!(
+        received_path.exists(),
+        "empty destination file was not created"
+    );
+
+    let metadata = fs::metadata(&received_path).unwrap();
+
+    assert_eq!(metadata.len(), 0, "received empty file is not empty");
+
+    let partial_path = destination_directory.join("empty.bin.part");
+
+    assert!(
+        !partial_path.exists(),
+        "partial file remained after successful empty transfer"
+    );
+}
+
+#[tokio::test]
 async fn rejects_file_when_destination_already_exists() {
     let temp = tempdir().unwrap();
 

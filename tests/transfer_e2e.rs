@@ -198,28 +198,9 @@ async fn removes_partial_file_when_sender_disconnects() {
     let fake_sender = async {
         let mut stream = TcpStream::connect(address).await.unwrap();
 
-        let hello = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
+        perform_handshake(&mut stream).await;
 
-        write_frame(&mut stream, &hello).await.unwrap();
-
-        let hello_ack = read_frame(&mut stream).await.unwrap();
-
-        assert_eq!(hello_ack.message_type, MessageType::HelloAck);
-
-        let offer = FileOffer {
-            filename: "interrupted.bin".to_string(),
-            file_size: 100_000,
-        };
-
-        let offer_payload = encode_offer(&offer).unwrap();
-
-        let offer_frame = Frame::new(MessageType::Offer, offer_payload);
-
-        write_frame(&mut stream, &offer_frame).await.unwrap();
-
-        let accept = read_frame(&mut stream).await.unwrap();
-
-        assert_eq!(accept.message_type, MessageType::Accept);
+        send_offer_and_wait_for_accept(&mut stream, "interrupted.bin", 100_000).await;
 
         let data = Frame::new(MessageType::Data, vec![0xAB; 4096]);
 
@@ -265,30 +246,11 @@ async fn rejects_file_with_invalid_hash() {
     let fake_sender = async {
         let mut stream = TcpStream::connect(address).await.unwrap();
 
-        let hello = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
-
-        write_frame(&mut stream, &hello).await.unwrap();
-
-        let hello_ack = read_frame(&mut stream).await.unwrap();
-
-        assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+        perform_handshake(&mut stream).await;
 
         let data = vec![0xCD; 4096];
 
-        let offer = FileOffer {
-            filename: "corrupted.bin".to_string(),
-            file_size: data.len() as u64,
-        };
-
-        let offer_payload = encode_offer(&offer).unwrap();
-
-        let offer_frame = Frame::new(MessageType::Offer, offer_payload);
-
-        write_frame(&mut stream, &offer_frame).await.unwrap();
-
-        let accept = read_frame(&mut stream).await.unwrap();
-
-        assert_eq!(accept.message_type, MessageType::Accept);
+        send_offer_and_wait_for_accept(&mut stream, "corrupted.bin", data.len() as u64).await;
 
         let data_frame = Frame::new(MessageType::Data, data.clone());
 
@@ -332,4 +294,92 @@ async fn rejects_file_with_invalid_hash() {
         !partial_path.exists(),
         "partial file remained after integrity verification failed"
     );
+}
+
+#[tokio::test]
+async fn removes_partial_file_when_sender_cancels() {
+    let temp = tempdir().unwrap();
+
+    let destination_directory = temp.path().join("received");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let address = listener.local_addr().unwrap();
+
+    let receiver = receive_once(listener, &destination_directory);
+
+    let fake_sender = async {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+
+        perform_handshake(&mut stream).await;
+
+        send_offer_and_wait_for_accept(&mut stream, "cancelled.bin", 100_000).await;
+
+        let data = Frame::new(MessageType::Data, vec![0xEF; 4096]);
+
+        write_frame(&mut stream, &data).await.unwrap();
+
+        let cancel = Frame::new(MessageType::Cancel, Vec::new());
+
+        write_frame(&mut stream, &cancel).await.unwrap();
+    };
+
+    let (receiver_result, _) = tokio::join!(receiver, fake_sender);
+
+    assert!(
+        receiver_result.is_err(),
+        "receiver should report a cancelled transfer"
+    );
+
+    let receiver_error = receiver_result.unwrap_err().to_string();
+
+    assert!(
+        receiver_error.contains("transfer cancelled by sender"),
+        "receiver reported the wrong cancellation error: {receiver_error}"
+    );
+
+    let final_path = destination_directory.join("cancelled.bin");
+
+    assert!(
+        !final_path.exists(),
+        "receiver created a final file after cancellation"
+    );
+
+    let partial_path = destination_directory.join("cancelled.bin.part");
+
+    assert!(
+        !partial_path.exists(),
+        "partial file remained after cancellation"
+    );
+}
+
+async fn perform_handshake(stream: &mut TcpStream) {
+    let hello = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
+
+    write_frame(stream, &hello).await.unwrap();
+
+    let hello_ack = read_frame(stream).await.unwrap();
+
+    assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+
+    assert_eq!(hello_ack.payload, vec![WFP_VERSION]);
+}
+
+async fn send_offer_and_wait_for_accept(stream: &mut TcpStream, filename: &str, file_size: u64) {
+    let offer = FileOffer {
+        filename: filename.to_string(),
+        file_size,
+    };
+
+    let offer_payload = encode_offer(&offer).unwrap();
+
+    let offer_frame = Frame::new(MessageType::Offer, offer_payload);
+
+    write_frame(stream, &offer_frame).await.unwrap();
+
+    let accept = read_frame(stream).await.unwrap();
+
+    assert_eq!(accept.message_type, MessageType::Accept);
+
+    assert!(accept.payload.is_empty());
 }

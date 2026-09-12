@@ -235,10 +235,26 @@ async fn receive_file_data(
                 break frame.payload;
             }
 
+            MessageType::Cancel => {
+                if !frame.payload.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CANCEL payload must be empty",
+                    )
+                    .into());
+                }
+
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "transfer cancelled by sender",
+                )
+                .into());
+            }
+
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "expected DATA or COMPLETE",
+                    "expected DATA, COMPLETE, or CANCEL",
                 )
                 .into());
             }

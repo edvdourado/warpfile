@@ -3,6 +3,8 @@ pub mod encoder;
 pub mod frame;
 pub mod io;
 pub mod message;
+pub mod offer;
+pub use offer::{FileOffer, OfferError, decode_offer, encode_offer};
 
 pub use decoder::{DecodeError, decode_frame};
 

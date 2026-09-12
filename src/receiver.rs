@@ -5,10 +5,13 @@ use std::path::{Component, Path};
 use tokio::fs;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::protocol::frame::WFP_VERSION;
-use crate::protocol::{Frame, MessageType, decode_offer, read_frame, write_frame};
+use crate::protocol::{
+    FileReject, Frame, MessageType, RejectCode, decode_offer, encode_reject, read_frame,
+    write_frame,
+};
 
 pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
     println!("WarpFile Receiver");
@@ -54,6 +57,13 @@ pub async fn receive_once(
     let offer = decode_offer(&offer_frame.payload)?;
 
     if !is_safe_filename(&offer.filename) {
+        send_reject(
+            &mut stream,
+            RejectCode::UnsafeFilename,
+            "receiver rejected an unsafe filename",
+        )
+        .await?;
+
         return Err(io::Error::new(io::ErrorKind::InvalidData, "unsafe filename").into());
     }
 
@@ -63,7 +73,16 @@ pub async fn receive_once(
     println!("Size: {} bytes", offer.file_size);
     println!();
 
-    fs::create_dir_all(destination_directory).await?;
+    if let Err(error) = fs::create_dir_all(destination_directory).await {
+        send_reject(
+            &mut stream,
+            RejectCode::CannotPrepareDestination,
+            "receiver could not prepare the destination",
+        )
+        .await?;
+
+        return Err(error.into());
+    }
 
     let destination = destination_directory.join(&offer.filename);
 
@@ -72,6 +91,13 @@ pub async fn receive_once(
     let partial_destination = destination_directory.join(partial_name);
 
     if fs::try_exists(&destination).await? {
+        send_reject(
+            &mut stream,
+            RejectCode::FileExists,
+            "destination file already exists",
+        )
+        .await?;
+
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "destination file already exists",
@@ -80,14 +106,37 @@ pub async fn receive_once(
     }
 
     if fs::try_exists(&partial_destination).await? {
-        fs::remove_file(&partial_destination).await?;
+        if let Err(error) = fs::remove_file(&partial_destination).await {
+            send_reject(
+                &mut stream,
+                RejectCode::CannotPrepareDestination,
+                "receiver could not remove an old partial file",
+            )
+            .await?;
+
+            return Err(error.into());
+        }
     }
 
-    let mut output = OpenOptions::new()
+    let mut output = match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&partial_destination)
-        .await?;
+        .await
+    {
+        Ok(file) => file,
+
+        Err(error) => {
+            send_reject(
+                &mut stream,
+                RejectCode::CannotPrepareDestination,
+                "receiver could not create the destination file",
+            )
+            .await?;
+
+            return Err(error.into());
+        }
+    };
 
     let accept = Frame::new(MessageType::Accept, Vec::new());
 
@@ -198,6 +247,27 @@ pub async fn receive_once(
     Ok(())
 }
 
+async fn send_reject(
+    stream: &mut TcpStream,
+    code: RejectCode,
+    message: &str,
+) -> Result<(), Box<dyn Error>> {
+    let reject = FileReject {
+        code,
+        message: message.to_string(),
+    };
+
+    let payload = encode_reject(&reject)?;
+
+    let frame = Frame::new(MessageType::Reject, payload);
+
+    write_frame(stream, &frame).await?;
+
+    println!("Sent REJECT ({code})");
+
+    Ok(())
+}
+
 fn is_safe_filename(filename: &str) -> bool {
     if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
         return false;
@@ -206,7 +276,7 @@ fn is_safe_filename(filename: &str) -> bool {
     let mut components = Path::new(filename).components();
 
     matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
+        (components.next(), components.next(),),
+        (Some(Component::Normal(_)), None,)
     )
 }

@@ -7,7 +7,10 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
-use crate::protocol::{FileOffer, Frame, MessageType, encode_offer, read_frame, write_frame};
+
+use crate::protocol::{
+    FileOffer, Frame, MessageType, decode_reject, encode_offer, read_frame, write_frame,
+};
 
 pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Error>> {
     println!("WarpFile Sender");
@@ -33,7 +36,9 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
     let file_size = metadata.len();
 
     println!("File: {filename}");
+
     println!("Size: {file_size} bytes");
+
     println!("Connecting to {address}");
 
     let mut stream = TcpStream::connect(address).await?;
@@ -75,13 +80,26 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
 
     match response.message_type {
         MessageType::Accept => {
+            if !response.payload.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ACCEPT payload must be empty",
+                )
+                .into());
+            }
+
             println!("Receiver accepted the file");
         }
 
         MessageType::Reject => {
+            let reject = decode_reject(&response.payload)?;
+
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "receiver rejected the file",
+                format!(
+                    "receiver rejected the file [{}]: {}",
+                    reject.code, reject.message
+                ),
             )
             .into());
         }

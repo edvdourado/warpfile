@@ -15,8 +15,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             run_receiver(DEFAULT_LISTEN_ADDRESS).await?;
         }
 
-        [_, command, address] if command == "send" => {
-            run_sender(address).await?;
+        [_, command, file, address] if command == "send" => {
+            run_sender(file, address).await?;
         }
 
         _ => {
@@ -32,8 +32,8 @@ fn print_usage() {
     println!();
     println!("Usage:");
     println!("  warpfile receive");
-    println!("  warpfile send <ADDRESS>");
+    println!("  warpfile send <FILE> <ADDRESS>");
     println!();
     println!("Example:");
-    println!("  warpfile send 127.0.0.1:42069");
+    println!("  warpfile send .\\teste.txt 127.0.0.1:42069");
 }

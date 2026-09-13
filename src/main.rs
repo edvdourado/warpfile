@@ -1,6 +1,7 @@
 use std::env;
 use std::error::Error;
 
+use warpfile::destination::resolve_destination;
 use warpfile::discovery::discover_devices;
 use warpfile::receiver::run_receiver;
 use warpfile::sender::run_sender;
@@ -20,8 +21,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             run_discover().await?;
         }
 
-        [_, command, file, address] if command == "send" => {
-            run_sender(file, address).await?;
+        [_, command, file, destination] if command == "send" => {
+            let resolved = resolve_destination(destination).await?;
+
+            if resolved != *destination {
+                println!("Resolved {destination} -> {resolved}");
+            }
+
+            run_sender(file, &resolved).await?;
         }
 
         _ => {
@@ -73,13 +80,15 @@ fn print_usage() {
 
     println!("  warpfile discover");
 
-    println!("  warpfile send <file> <address>");
+    println!("  warpfile send <file> <address-or-device>");
 
     println!();
 
     println!("Examples:");
 
     println!("  warpfile discover");
+
+    println!("  warpfile send .\\teste.txt EDBOOK");
 
     println!("  warpfile send .\\teste.txt 127.0.0.1:42069");
 }

@@ -1,396 +1,763 @@
-WarpFile Architecture
+# WarpFile Architecture
 
-Status: Experimental
+**Status:** Experimental  
+**Reference release:** `0.1.0-alpha.1`
 
-This document describes the initial architecture of the WarpFile reference implementation.
+This document describes the current architecture of the WarpFile reference implementation.
 
-1. Architecture goals
+## 1. Architecture goals
 
 WarpFile should remain:
 
-cross-platform;
+- cross-platform;
+- protocol-driven;
+- modular;
+- streaming-oriented;
+- memory-efficient;
+- testable;
+- transport-extensible.
 
-modular;
+A central design principle is separation of responsibilities.
 
-protocol-driven;
+File-transfer code should not need to know how a peer address was discovered.
 
-streaming-oriented;
+Discovery code should not implement file-transfer semantics.
 
-memory-efficient;
+Protocol encoding should remain separate from CLI behavior.
 
-testable.
+## 2. Current high-level architecture
 
-The protocol implementation must remain independent from the CLI and file transfer orchestration whenever possible.
+```text
+                         CLI
+                          |
+          +---------------+---------------+
+          |                               |
+   destination resolver               receive
+          |                               |
+          v                               v
+      discovery                     receiver loop
+          |                               |
+    +-----+------+                        |
+    |            |                        |
+   LAN       Tailscale                    |
+    |            |                        |
+    +-----+------+                        |
+          |                               |
+          v                               |
+   discovered address                    |
+          |                               |
+          +---------------+---------------+
+                          |
+                  sender / receiver
+                          |
+                          v
+                     WFP protocol
+                          |
+                  +-------+-------+
+                  |               |
+                 TCP             UDP
+             file transfer     discovery
+```
 
-2. Initial architecture
+## 3. Current source layout
 
-                       WarpFile
-                          │
-                ┌─────────┴─────────┐
-                │                   │
-             Sender             Receiver
-                │                   │
-                └─────────┬─────────┘
-                          │
-                    WFP Protocol
-                          │
-                       TCP I/O
-                          │
-                        Network
-
-3. Proposed source layout
-
+```text
 src/
 ├── main.rs
-├── cli.rs
-├── sender.rs
+├── lib.rs
+├── destination.rs
+├── discovery.rs
+├── progress.rs
 ├── receiver.rs
+├── sender.rs
+├── tailscale.rs
 └── protocol/
     ├── mod.rs
     ├── frame.rs
     ├── message.rs
     ├── encoder.rs
-    └── decoder.rs
+    ├── decoder.rs
+    ├── io.rs
+    ├── offer.rs
+    ├── reject.rs
+    └── discovery.rs
 
-4. Responsibilities
+tests/
+├── discovery_e2e.rs
+├── receiver_persistent_e2e.rs
+└── transfer_e2e.rs
+```
 
-main.rs
+## 4. `main.rs`
 
-Application entry point.
+`main.rs` is the command-line entry point.
 
-Responsibilities:
+Current commands:
 
-initialize the CLI;
-
-dispatch commands;
-
-display fatal errors;
-
-control process exit status.
-
-It should contain minimal application logic.
-
-cli.rs
-
-Command-line interface definitions.
-
-Initial command model:
-
-warpfile send <FILE> --to <ADDRESS>
-warpfile receive --port <PORT>
-
-Future commands may include:
-
+```text
+warpfile receive
 warpfile discover
-warpfile devices
-warpfile receive <TRANSFER_CODE>
-
-sender.rs
-
-Controls the sender-side transfer lifecycle.
+warpfile send <file> <address-or-device>
+```
 
 Responsibilities:
 
-connect to receiver;
+- read CLI arguments;
+- dispatch commands;
+- resolve send destinations;
+- display discovery results;
+- call sender or receiver orchestration.
 
-perform WFP negotiation;
+It should contain minimal protocol logic.
 
-offer a file;
+## 5. `destination.rs`
 
-stream file contents;
+`destination.rs` converts user input into a concrete transfer address.
 
-calculate BLAKE3;
+Input may already be a socket address:
 
-send completion information;
+```text
+100.68.8.15:42069
+```
 
-wait for verification;
+In that case it is used directly.
 
-expose transfer progress.
+Otherwise, the value is treated as a device name:
 
-The sender should use protocol abstractions rather than manually constructing network bytes.
+```text
+EDBOOK
+```
 
-Conceptually:
-
-sender
-  │
-  └── send(Message::Hello)
-
-instead of:
-
-sender
-  │
-  └── write([0x57, 0x46, 0x50, ...])
-
-receiver.rs
-
-Controls the receiver-side transfer lifecycle.
-
-Responsibilities:
-
-listen for incoming connections;
-
-negotiate WFP;
-
-validate file offers;
-
-accept or reject transfers;
-
-safely choose output paths;
-
-stream incoming file contents to disk;
-
-calculate BLAKE3;
-
-verify integrity;
-
-report final status.
-
-Incoming filenames must always be considered untrusted.
-
-5. Protocol module
-
-The protocol module implements WFP independently of sender and receiver orchestration.
-
-protocol/
-├── frame
-├── message
-├── encoder
-└── decoder
-
-frame.rs
-
-Represents the low-level WFP frame.
-
-Conceptually:
-
-struct Frame {
-    version: u8,
-    message_type: MessageType,
-    flags: u16,
-    payload: Vec<u8>,
-}
-
-The exact implementation may differ.
-
-message.rs
-
-Represents semantic protocol messages.
-
-Examples:
-
-Message::Hello
-Message::HelloAck
-Message::Offer
-Message::Accept
-Message::Reject
-Message::Data
-Message::Complete
-Message::Verified
-Message::Cancel
-Message::Error
-
-The rest of WarpFile should work primarily with these semantic messages.
-
-encoder.rs
-
-Converts semantic protocol structures into bytes suitable for network transmission.
-
-Message
-   │
-   ▼
-Frame
-   │
-   ▼
-bytes
-
-decoder.rs
-
-Converts incoming network bytes into validated WFP frames and messages.
-
-bytes
-   │
-   ▼
-Frame
-   │
-   ▼
-Message
-
-The decoder must validate:
-
-WFP magic;
-
-protocol version;
-
-message type;
-
-flags;
-
-payload size;
-
-message-specific payload format.
-
-Untrusted payload lengths must never cause uncontrolled memory allocations.
-
-6. Streaming model
-
-WarpFile must not load entire files into memory.
+The destination resolver calls discovery and matches device names case-insensitively.
 
 Example:
 
+```text
+EDBOOK
+   |
+   v
+discover_devices()
+   |
+   v
+100.68.8.15:42069
+```
+
+If no device matches, resolution fails.
+
+If more than one discovered endpoint has the same device name, WarpFile currently refuses to choose automatically.
+
+This prevents silent route selection before a real path-selection system exists.
+
+## 6. `discovery.rs`
+
+`discovery.rs` implements peer discovery orchestration.
+
+Responsibilities include:
+
+- UDP discovery responder;
+- UDP DISCOVER transmission;
+- ANNOUNCE collection;
+- local interface enumeration;
+- subnet broadcast calculation;
+- self-discovery filtering;
+- aggregation of discovery targets;
+- device deduplication.
+
+Default discovery port:
+
+```text
+42070/UDP
+```
+
+Discovery is intentionally separate from the transfer sender.
+
+The sender ultimately receives only a concrete socket address.
+
+## 7. `tailscale.rs`
+
+`tailscale.rs` is an optional discovery provider.
+
+It executes:
+
+```text
+tailscale status --json
+```
+
+when the Tailscale CLI is available.
+
+It extracts online IPv4 peer addresses.
+
+Those addresses are treated only as **candidate discovery targets**.
+
+```text
+Tailscale peer
+      |
+      v
+candidate IP
+      |
+      v
+WFP DISCOVER
+      |
+      +---- valid ANNOUNCE ----> WarpFile peer
+      |
+      +---- no response -------> ignored
+```
+
+WarpFile therefore does not equate Tailscale membership with WarpFile availability.
+
+If Tailscale is missing, returns an error or produces invalid JSON, the provider yields no candidates and LAN discovery remains usable.
+
+## 8. `sender.rs`
+
+`sender.rs` controls one outgoing file-transfer session.
+
+Responsibilities include:
+
+- validate the source file;
+- connect to the destination;
+- perform HELLO / HELLO_ACK negotiation;
+- send OFFER;
+- handle ACCEPT or structured REJECT;
+- stream file data;
+- update BLAKE3 incrementally;
+- update progress reporting;
+- send CANCEL after user interruption;
+- send COMPLETE;
+- wait for VERIFIED.
+
+The sender does not need to know whether the destination came from:
+
+- an explicit IP address;
+- LAN discovery;
+- Tailscale-assisted discovery;
+- a future connectivity provider.
+
+This separation is important for future automatic path selection.
+
+## 9. `receiver.rs`
+
+`receiver.rs` controls incoming transfers.
+
+The receiver is persistent at the process level.
+
+Conceptually:
+
+```text
+start receiver
+     |
+     v
+accept connection
+     |
+     v
+receive one file
+     |
+     v
+accept next connection
+     |
+     v
+...
+```
+
+Each TCP connection still represents one file-transfer session.
+
+Responsibilities include:
+
+- listen on the TCP transfer port;
+- perform WFP negotiation;
+- validate incoming filenames;
+- reject unsafe or conflicting destinations;
+- create `.part` files;
+- receive DATA frames;
+- update BLAKE3 incrementally;
+- verify size and hash;
+- atomically promote the partial file after validation;
+- clean partial files after current failure cases;
+- return to the accept loop after a client error.
+
+A failed client transfer therefore does not terminate the whole receiver process.
+
+## 10. Discovery and receiver concurrency
+
+A running receiver serves two independent functions:
+
+```text
+TCP 42069
+file-transfer listener
+
+UDP 42070
+discovery responder
+```
+
+The receiver orchestration keeps both active.
+
+This allows a receiver to remain discoverable while waiting for or processing sequential file transfers.
+
+## 11. `progress.rs`
+
+`progress.rs` provides transfer progress output.
+
+It tracks:
+
+- transferred bytes;
+- total bytes;
+- percentage;
+- average throughput;
+- estimated remaining time.
+
+Progress rendering is throttled rather than redrawn on every transferred chunk.
+
+It also ensures an interrupted progress line is terminated cleanly before error text is printed.
+
+## 12. Protocol module
+
+The `protocol` directory contains WFP-specific encoding and validation.
+
+```text
+protocol/
+├── frame.rs
+├── message.rs
+├── encoder.rs
+├── decoder.rs
+├── io.rs
+├── offer.rs
+├── reject.rs
+└── discovery.rs
+```
+
+### `frame.rs`
+
+Defines:
+
+- WFP magic;
+- protocol version;
+- frame header size;
+- general payload limit;
+- DATA payload limit;
+- low-level `Frame` representation.
+
+Conceptually:
+
+```text
+Frame {
+    version,
+    message_type,
+    flags,
+    payload
+}
+```
+
+### `message.rs`
+
+Defines recognized WFP message type identifiers.
+
+Current message types:
+
+```text
+HELLO
+HELLO_ACK
+OFFER
+ACCEPT
+REJECT
+DATA
+COMPLETE
+VERIFIED
+CANCEL
+DISCOVER
+ANNOUNCE
+ERROR
+```
+
+### `encoder.rs`
+
+Converts validated frames to network bytes.
+
+Responsibilities include:
+
+- magic;
+- version;
+- type;
+- flags;
+- payload length;
+- payload;
+- size validation.
+
+### `decoder.rs`
+
+Converts received bytes into validated frames.
+
+It rejects invalid:
+
+- magic values;
+- protocol versions;
+- message types;
+- flags;
+- payload sizes;
+- incomplete frames.
+
+### `io.rs`
+
+Provides asynchronous WFP frame reading and writing over byte streams.
+
+TCP is a byte stream and does not preserve application-message boundaries.
+
+`io.rs` therefore reads:
+
+```text
+12-byte header
+      |
+      v
+payload length
+      |
+      v
+exact payload bytes
+```
+
+before returning one complete frame.
+
+### `offer.rs`
+
+Encodes and decodes OFFER payloads:
+
+```text
+filename length
+filename
+file size
+```
+
+### `reject.rs`
+
+Encodes and decodes structured REJECT payloads.
+
+Current codes:
+
+```text
+FILE_EXISTS
+UNSAFE_FILENAME
+CANNOT_PREPARE_DESTINATION
+```
+
+### `discovery.rs`
+
+Encodes and decodes ANNOUNCE payloads.
+
+The announcement contains:
+
+```text
+device name
+TCP transfer port
+```
+
+DISCOVER itself uses an empty payload.
+
+## 13. Streaming model
+
+WarpFile must not load complete files into memory.
+
+Current DATA payload maximum:
+
+```text
+64 KiB
+```
+
+Conceptually:
+
+```text
 File
- │
- ├── 64 KiB
- │      ↓
- │    DATA
- │
- ├── 64 KiB
- │      ↓
- │    DATA
- │
- ├── 64 KiB
- │      ↓
- │    DATA
- │
- └── ...
+ |
+ +-- 64 KiB --> DATA
+ |
+ +-- 64 KiB --> DATA
+ |
+ +-- 64 KiB --> DATA
+ |
+ +-- ...
+```
 
-Memory usage should remain roughly constant regardless of file size.
+Memory usage should therefore remain roughly bounded regardless of total file size.
 
-A 100 GiB file must not require significantly more transfer buffer memory than a 100 MiB file.
+A very large file should not require memory proportional to its total size.
 
-7. Async runtime
+## 14. Integrity model
 
-The initial implementation will use Tokio.
-
-Tokio will provide:
-
-asynchronous TCP networking;
-
-asynchronous file operations where useful;
-
-task scheduling;
-
-future support for concurrent transfers.
-
-Concurrency must not be added without a clear need.
-
-The first implementation prioritizes correctness over maximum throughput.
-
-8. Integrity
-
-BLAKE3 will be updated incrementally while data is streamed.
+BLAKE3 is updated during streaming.
 
 Sender:
 
-                       ┌──→ Network
-File → chunk →─────────┤
-                       └──→ BLAKE3
+```text
+                       +--> Network
+File --> chunk --------+
+                       +--> BLAKE3
+```
 
 Receiver:
 
-Network → chunk ───────┬──→ File
-                       │
-                       └──→ BLAKE3
+```text
+                        +--> File
+Network --> chunk ------+
+                        +--> BLAKE3
+```
 
-This avoids an additional full-file read.
+The final digest is transferred in COMPLETE.
 
-9. Platform independence
+The receiver sends VERIFIED only when its independently calculated digest matches.
 
-Core protocol and transfer logic should avoid operating-system-specific APIs.
+## 15. Partial files
 
-Platform-specific functionality should eventually live behind explicit abstractions.
+Incoming files use a temporary path:
 
-Initial target systems:
+```text
+filename.part
+```
 
-Windows
-Linux
+The final destination name does not appear until verification succeeds.
 
-Future support may include:
+Current behavior:
 
-macOS
-Android
+```text
+receive DATA
+    |
+    v
+filename.part
+    |
+    +-- failure ------> remove
+    |
+    +-- verified -----> rename to filename
+```
 
-10. Error model
+Resume support will intentionally change part of this model by retaining validated partial data across recoverable interruptions.
 
-Internal implementation errors and protocol errors are different concepts.
+## 16. Cancellation
+
+During an active send, the sender listens for `Ctrl+C`.
+
+When cancellation is requested:
+
+```text
+Ctrl+C
+  |
+  v
+finish current frame boundary
+  |
+  v
+send CANCEL
+  |
+  v
+sender exits
+```
+
+The implementation avoids interrupting a DATA frame halfway through writing it to the TCP stream.
+
+The receiver handles CANCEL as an explicit interrupted transfer and cleans the current partial file.
+
+## 17. Testing strategy
+
+WarpFile uses both unit and end-to-end tests.
+
+Unit tests cover components such as:
+
+- frame encoding;
+- frame decoding;
+- payload validation;
+- offer parsing;
+- rejection parsing;
+- discovery announcements;
+- interface broadcast calculations;
+- Tailscale JSON parsing;
+- destination-name resolution;
+- progress formatting.
+
+End-to-end tests use real local TCP or UDP sockets.
+
+Current E2E coverage includes:
+
+- complete file transfer;
+- empty files;
+- destination conflicts;
+- sender disconnects;
+- corrupted hashes;
+- explicit cancellation;
+- UDP discovery;
+- multiple sequential transfers through a persistent receiver.
+
+This is intentional: protocol code is tested both as isolated logic and as actual asynchronous network behavior.
+
+## 18. Async runtime
+
+WarpFile uses Tokio.
+
+Tokio currently provides:
+
+- asynchronous TCP;
+- asynchronous UDP;
+- asynchronous file I/O;
+- signal handling;
+- async scheduling.
+
+Concurrency is introduced only where required.
+
+The current receiver handles sequential file transfers rather than simultaneous multi-client transfers.
+
+Correctness currently takes priority over maximum throughput.
+
+## 19. Platform independence
+
+Core transfer and WFP logic should avoid unnecessary operating-system-specific behavior.
+
+Current real multi-machine development has focused on Windows.
+
+Linux remains a target platform.
+
+Platform-specific connectivity integrations should remain isolated behind dedicated modules or providers.
+
+Tailscale integration is one example.
+
+## 20. Security boundaries
+
+All network input is untrusted.
+
+The implementation validates:
+
+- WFP magic;
+- protocol version;
+- message types;
+- flags;
+- payload lengths;
+- UTF-8 fields;
+- filename safety;
+- announced file sizes;
+- actual received byte count;
+- BLAKE3 integrity.
+
+Sender-provided filesystem paths are never accepted as destination paths.
+
+WFP/0.1 currently does not provide encryption or authenticated peer identity.
+
+## 21. Route selection
+
+WarpFile can currently discover the same conceptual machine through different connectivity paths.
 
 Example:
 
-std::io::Error
+```text
+EDBOOK 192.168.1.20:42069
+EDBOOK 100.68.8.15:42069
+```
 
-is an implementation-level error.
+The current destination resolver treats this as ambiguous rather than guessing.
 
-WFP ERROR 0x0008
+Future route selection may evaluate:
 
-is a protocol-level representation that may be sent to another peer.
+- direct LAN;
+- IPv6;
+- overlay-network paths;
+- NAT traversal;
+- relay fallback;
+- latency;
+- throughput;
+- availability.
 
-These layers should not be conflated.
+The selection mechanism should be based on measured or meaningful connectivity information rather than hard-coded assumptions.
 
-11. Security boundaries
+## 22. Future resume architecture
 
-Network input must always be treated as hostile.
+The next major reliability milestone is resumable transfer.
 
-The implementation must validate:
+Current behavior:
 
-frame lengths;
+```text
+disconnect
+    |
+    v
+delete .part
+    |
+    v
+restart from byte 0
+```
 
-filenames;
+Future target behavior:
 
-UTF-8 data;
+```text
+disconnect
+    |
+    v
+retain validated partial state
+    |
+    v
+reconnect
+    |
+    v
+negotiate safe offset
+    |
+    v
+continue missing data
+```
 
-state transitions;
+This will require coordinated changes to:
 
-protocol versions;
+- WFP messages;
+- partial-file persistence;
+- sender file seeking;
+- hash state strategy;
+- safe chunk boundaries;
+- failure classification.
 
-message types;
+It should be implemented as an explicit protocol feature rather than as an implicit filesystem trick.
 
-declared file sizes.
+## 23. Future WorldLink integration
 
-The receiver must never trust a sender-provided path.
+WarpFile is intentionally being built before WorldLink.
 
-For WFP/0.1, received files should be created only inside a receiver-controlled destination directory.
+The intended process is:
 
-12. Future WorldLink integration
-
-WarpFile is being developed before WorldLink intentionally.
-
-The goal is to discover real shared networking requirements through a working application.
-
-Potential functionality that may later move into WorldLink includes:
-
-device identity;
-
-peer discovery;
-
-session establishment;
-
-authenticated encryption;
-
-NAT traversal;
-
-connection multiplexing;
-
-capability negotiation.
-
-File transfer semantics remain WarpFile responsibilities.
-
-This avoids designing WorldLink around hypothetical requirements.
-
-13. Engineering principle
-
-WarpFile should prefer:
-
+```text
 working implementation
-        ↓
-observed reusable concept
-        ↓
+        |
+        v
+observed reusable networking concept
+        |
+        v
 generalization
+```
 
-instead of:
+Potential functionality that may eventually be extracted includes:
 
+- peer discovery;
+- identity;
+- session establishment;
+- authenticated encryption;
+- NAT traversal;
+- relay connectivity;
+- capability negotiation.
+
+File-transfer semantics remain WarpFile responsibilities.
+
+## 24. Engineering principle
+
+WarpFile prefers:
+
+```text
+working implementation
+        |
+        v
+measured behavior
+        |
+        v
+observed reusable concept
+        |
+        v
+generalization
+```
+
+over:
+
+```text
 hypothetical abstraction
-        ↓
+        |
+        v
 large framework
-        ↓
+        |
+        v
 hope that applications need it
+```
 
-WorldLink will be extracted from real requirements rather than invented in isolation.
+The architecture should grow from real requirements.

@@ -1,90 +1,53 @@
-WarpFile Protocol — WFP/0.1
+# WarpFile Protocol — WFP/0.1
 
-Status: Experimental
-Version: 0.1
+**Status:** Experimental  
+**Protocol version:** 0.1  
+**Reference implementation:** WarpFile `0.1.0-alpha.1`
 
 WFP is the application-layer protocol used by WarpFile.
 
-WFP/0.1 is intentionally small. Its purpose is to establish the minimum protocol necessary to transfer one file reliably between two peers over an ordered and reliable byte stream.
+WFP/0.1 currently covers two related operations:
 
-The initial transport is TCP.
+1. file-transfer sessions over TCP;
+2. WarpFile peer discovery over UDP.
 
-1. Design goals
+The protocol is intentionally small and experimental. Compatibility is not guaranteed before a stable WarpFile release.
+
+## 1. Design goals
 
 WFP/0.1 prioritizes:
 
-simplicity;
+- explicit binary framing;
+- deterministic parsing;
+- streaming without loading entire files into memory;
+- bounded payload sizes;
+- integrity verification;
+- implementation portability;
+- clear separation between discovery and file transfer.
 
-explicit framing;
+WFP/0.1 currently does **not** provide:
 
-deterministic parsing;
+- encryption;
+- peer authentication;
+- identity verification;
+- NAT traversal;
+- relay transport;
+- resumable transfers;
+- multiplexing;
+- compression;
+- multiple files in one TCP session.
 
-streaming without loading entire files into memory;
+## 2. Byte order
 
-integrity verification;
+All multi-byte integer fields use **big-endian** byte order, also known as network byte order.
 
-implementation portability.
+## 3. Frame format
 
-WFP/0.1 does not attempt to provide:
-
-encryption;
-
-authentication;
-
-NAT traversal;
-
-peer discovery;
-
-resumable transfers;
-
-multiplexing;
-
-compression;
-
-multiple simultaneous files.
-
-These features belong to future versions.
-
-2. Byte order
-
-All multi-byte integer values use big-endian byte order, also known as network byte order.
-
-3. Connection model
-
-A WFP/0.1 session transfers exactly one file.
-
-The sender initiates the TCP connection. The receiver listens for incoming connections.
-
-Normal lifecycle:
-
-SENDER                                      RECEIVER
-   │                                            │
-   │ ───────────── HELLO ─────────────────────> │
-   │ <────────── HELLO_ACK ──────────────────── │
-   │                                            │
-   │ ───────────── OFFER ─────────────────────> │
-   │ <──────────── ACCEPT ───────────────────── │
-   │                                            │
-   │ ───────────── DATA ──────────────────────> │
-   │ ───────────── DATA ──────────────────────> │
-   │ ───────────── DATA ──────────────────────> │
-   │                  ...                       │
-   │                                            │
-   │ ──────────── COMPLETE ───────────────────> │
-   │ <─────────── VERIFIED ──────────────────── │
-   │                                            │
-   │                  close                     │
-
-Either peer may send ERROR when a protocol failure occurs.
-
-The sender may send CANCEL before the transfer completes.
-
-4. Frame format
-
-Every WFP message is encoded as a frame.
+Every WFP message uses the same frame format.
 
 The fixed header is 12 bytes.
 
+```text
 Offset    Size    Field
 ------    ----    ----------------
 0         4       Magic
@@ -93,15 +56,17 @@ Offset    Size    Field
 6         2       Flags
 8         4       Payload Length
 12        N       Payload
+```
 
 Visual representation:
 
+```text
 +----------------------+ 0
 | Magic                | 4 bytes
 +----------------------+
 | Version              | 1 byte
 +----------------------+
-| Type                 | 1 byte
+| Message Type         | 1 byte
 +----------------------+
 | Flags                | 2 bytes
 +----------------------+
@@ -109,54 +74,64 @@ Visual representation:
 +----------------------+ 12
 | Payload              | N bytes
 +----------------------+
+```
 
-4.1 Magic
+### 3.1 Magic
 
-Magic bytes:
+The magic bytes are:
 
+```text
 57 46 50 00
+```
 
 ASCII representation:
 
+```text
 W F P \0
+```
 
-A frame with an invalid magic value must be rejected.
+Frames with an invalid magic value must be rejected.
 
-4.2 Version
+### 3.2 Version
 
 WFP/0.1 uses:
 
+```text
 0x01
+```
 
-4.3 Flags
+### 3.3 Flags
 
-The flags field is reserved for future protocol extensions.
+The flags field is currently reserved.
 
-For WFP/0.1:
+WFP/0.1 uses:
 
-flags = 0x0000
+```text
+0x0000
+```
 
-A receiver should reject unsupported non-zero flags.
+### 3.4 Payload length
 
-4.4 Payload length
+Payload Length is an unsigned 32-bit integer.
 
-Unsigned 32-bit integer.
+The general maximum WFP frame payload is:
 
-Represents the number of payload bytes immediately following the header.
-
-Implementations must validate this value before allocating memory.
-
-WFP/0.1 defines a general maximum frame payload of:
-
+```text
 1 MiB
+```
 
-DATA frames have a more restrictive maximum:
+DATA frames have a stricter maximum:
 
+```text
 64 KiB
 65536 bytes
+```
 
-5. Message types
+Implementations must validate payload lengths before allocating or accepting data.
 
+## 4. Message types
+
+```text
 Value    Name
 -----    ---------
 0x01     HELLO
@@ -173,330 +148,523 @@ Value    Name
 
 0x40     CANCEL
 
+0x50     DISCOVER
+0x51     ANNOUNCE
+
 0xFF     ERROR
+```
 
-Unknown message types must not be interpreted as another known message.
+Unknown message types must be rejected.
 
-In WFP/0.1, receiving an unsupported message type is a protocol error.
+`ERROR` is currently recognized as a message type, but WFP/0.1 does not yet define or implement a stable structured ERROR payload.
 
-6. HELLO
+## 5. TCP file-transfer model
+
+A single TCP connection transfers one file.
+
+The receiver process may remain running and accept multiple sequential connections, but each TCP session carries one transfer.
+
+Normal lifecycle:
+
+```text
+Sender                                      Receiver
+  |                                            |
+  | ---------------- HELLO -----------------> |
+  | <------------- HELLO_ACK ---------------- |
+  |                                            |
+  | ---------------- OFFER -----------------> |
+  | <--------------- ACCEPT ----------------- |
+  |                                            |
+  | ---------------- DATA ------------------> |
+  | ---------------- DATA ------------------> |
+  |                   ...                      |
+  |                                            |
+  | -------------- COMPLETE ----------------> |
+  | <-------------- VERIFIED ---------------- |
+  |                                            |
+  |                   close                    |
+```
+
+The receiver may send `REJECT` after `OFFER`.
+
+The sender may send `CANCEL` before transfer completion.
+
+## 6. HELLO
 
 Message type:
 
+```text
 0x01
+```
 
 Payload:
 
+```text
 Offset    Size    Field
-------    ----    ------------------
+------    ----    ----------------
 0         1       Protocol version
+```
 
 For WFP/0.1:
 
+```text
 01
+```
 
-Purpose: the sender announces the WFP version it intends to use.
+The sender uses HELLO to announce the protocol version it intends to use.
 
-7. HELLO_ACK
+## 7. HELLO_ACK
 
 Message type:
 
+```text
 0x02
+```
 
 Payload:
 
+```text
 Offset    Size    Field
-------    ----    ------------------
+------    ----    ----------------
 0         1       Selected version
+```
 
 For WFP/0.1:
 
+```text
 01
+```
 
-If the receiver cannot support the requested version, it should send ERROR and close the connection.
+The current reference implementation expects the peer to use the same WFP version.
 
-8. OFFER
+## 8. OFFER
 
 Message type:
 
+```text
 0x10
+```
 
 Payload:
 
-Offset    Size        Field
-------    ----------  ----------------
-0         2           Filename length
-2         N           Filename
-2 + N     8           File size
+```text
+Offset    Size    Field
+------    ----    ----------------
+0         2       Filename length
+2         N       Filename
+2 + N     8       File size
+```
 
 Filename length:
 
+```text
 u16
+```
 
 Filename encoding:
 
+```text
 UTF-8
+```
 
 File size:
 
+```text
 u64
+```
 
-The filename must contain only the file name itself.
+Only the basename of the file may be offered.
 
-Valid example:
+Valid:
 
+```text
 photo.png
+```
 
-Invalid examples:
+Invalid:
 
+```text
 C:\Users\User\photo.png
 ../../photo.png
 /home/user/photo.png
+```
 
-Receivers must treat incoming filenames as untrusted input.
+Incoming filenames are untrusted input.
 
-Absolute paths and path traversal sequences must never be honored.
+The receiver must not honor absolute paths, directory separators or traversal attempts supplied by the sender.
 
-9. ACCEPT
+## 9. ACCEPT
 
 Message type:
 
+```text
 0x11
-
-Payload: empty.
-
-An ACCEPT indicates that the receiver is ready to receive file data.
-
-10. REJECT
-
-Message type:
-
-0x12
+```
 
 Payload:
 
+```text
+empty
+```
+
+ACCEPT indicates that the receiver has prepared the destination and is ready for DATA frames.
+
+## 10. REJECT
+
+Message type:
+
+```text
+0x12
+```
+
+Payload:
+
+```text
 Offset    Size    Field
 ------    ----    ----------------
 0         2       Reason code
 2         2       Message length
-4         N       Message
+4         N       UTF-8 message
+```
 
-Message encoding: UTF-8.
+Current reason codes:
 
-Initial reason codes:
+```text
+0x0001    FILE_EXISTS
+0x0002    UNSAFE_FILENAME
+0x0003    CANNOT_PREPARE_DESTINATION
+```
 
-0x0001    User rejected transfer
-0x0002    Invalid filename
-0x0003    File too large
-0x0004    Insufficient storage
-0xFFFF    Unspecified reason
+The message is diagnostic text.
 
-11. DATA
+Protocol logic should rely on the numeric reason code rather than parsing the human-readable message.
+
+## 11. DATA
 
 Message type:
 
+```text
 0x20
+```
 
-Payload: raw file bytes.
+Payload:
+
+```text
+raw file bytes
+```
 
 Maximum payload:
 
+```text
 65536 bytes
+```
 
-No sequence number is required in WFP/0.1 because TCP already guarantees:
+WFP/0.1 does not include DATA sequence numbers because the current transfer transport is TCP, which already provides ordered reliable byte delivery.
 
-ordered delivery;
+The receiver writes DATA payloads sequentially.
 
-reliable delivery;
+Both peers update their BLAKE3 state while processing file data.
 
-duplicate suppression.
-
-The receiver writes the payload sequentially to the output file.
-
-Both peers update their BLAKE3 state while processing the file stream.
-
-12. COMPLETE
+## 12. COMPLETE
 
 Message type:
 
+```text
 0x30
+```
 
 Payload:
 
+```text
 32-byte BLAKE3 digest
+```
 
-The sender sends COMPLETE after all DATA frames have been transmitted.
+The sender sends COMPLETE after all file bytes have been transmitted.
 
-The hash represents the complete original file.
+The digest represents the complete original file.
 
-13. VERIFIED
+## 13. VERIFIED
 
 Message type:
 
+```text
 0x31
-
-Payload: empty.
-
-The receiver sends VERIFIED only when:
-
-the number of received file bytes equals the announced file size;
-
-the locally calculated BLAKE3 digest matches the digest contained in COMPLETE.
-
-After receiving VERIFIED, the sender may consider the transfer successful.
-
-14. CANCEL
-
-Message type:
-
-0x40
-
-Payload: empty in WFP/0.1.
-
-Indicates that the sender intentionally aborted the transfer.
-
-The receiver should remove incomplete output files unless explicitly configured otherwise.
-
-15. ERROR
-
-Message type:
-
-0xFF
+```
 
 Payload:
 
-Offset    Size    Field
-------    ----    ----------------
-0         2       Error code
-2         2       Message length
-4         N       Message
+```text
+empty
+```
 
-Initial error codes:
+The receiver sends VERIFIED only after:
 
-0x0001    Invalid frame
-0x0002    Invalid magic
-0x0003    Unsupported version
-0x0004    Unsupported message
-0x0005    Invalid state
-0x0006    Invalid payload
-0x0007    Integrity failure
-0x0008    I/O failure
-0xFFFF    Internal error
+- the total received byte count equals the file size announced in OFFER;
+- the locally calculated BLAKE3 digest matches the digest received in COMPLETE.
 
-Error messages are UTF-8 and intended for diagnostic purposes.
+Only after receiving VERIFIED may the sender consider the transfer successful.
 
-Protocol logic must rely on the numeric error code rather than parsing the text.
+## 14. CANCEL
 
-16. Sender state machine
+Message type:
 
-CONNECTED
-    │
-    ▼
-HELLO_SENT
-    │
-    ▼
-NEGOTIATED
-    │
-    ▼
-OFFER_SENT
-    │
-    ▼
-ACCEPTED
-    │
-    ▼
-TRANSFERRING
-    │
-    ▼
-COMPLETE_SENT
-    │
-    ▼
-VERIFIED
-    │
-    ▼
-DONE
+```text
+0x40
+```
 
-Receiving a message that is invalid for the current state is a protocol error.
+Payload:
 
-17. Receiver state machine
+```text
+empty
+```
 
-CONNECTED
-    │
-    ▼
-NEGOTIATED
-    │
-    ▼
-OFFER_RECEIVED
-    │
-    ▼
-ACCEPTED
-    │
-    ▼
-RECEIVING
-    │
-    ▼
-VERIFYING
-    │
-    ▼
-DONE
+CANCEL indicates an intentional sender-side cancellation.
 
-18. File integrity
+The current sender sends CANCEL when the user interrupts an active transfer with `Ctrl+C`.
 
-WarpFile uses BLAKE3 for file integrity verification.
+The current receiver removes the incomplete `.part` file after cancellation.
 
-Hashing occurs while data is streamed.
+## 15. Partial-file behavior
+
+Incoming data is written to:
+
+```text
+<filename>.part
+```
+
+The `.part` file is renamed to the final filename only after successful size and BLAKE3 verification.
+
+Current WFP/0.1 behavior removes incomplete partial files after transfer failure or cancellation.
+
+Persistent resumable partial files are planned for a future protocol extension.
+
+## 16. BLAKE3 integrity
+
+Hashing happens during streaming.
 
 Sender:
 
-read chunk
-    │
-    ├── update BLAKE3
-    │
-    └── send DATA
+```text
+File
+ |
+ v
+chunk --------> DATA
+ |
+ +------------> BLAKE3
+```
 
 Receiver:
 
-receive DATA
-    │
-    ├── update BLAKE3
-    │
-    └── write file
+```text
+DATA
+ |
+ v
+chunk --------> File
+ |
+ +------------> BLAKE3
+```
 
-At the end:
+This avoids performing a second full-file read solely for integrity verification.
 
-sender hash == receiver hash
+## 17. Discovery model
 
-must be true before the receiver sends VERIFIED.
+WarpFile discovery uses WFP frames over UDP.
 
-19. Security
+Default discovery port:
 
-WFP/0.1 provides:
+```text
+42070/UDP
+```
 
-no encryption;
+A discovering peer sends `DISCOVER`.
 
-no peer authentication;
+A WarpFile receiver responds with `ANNOUNCE`.
 
-no identity verification.
+Discovery does not establish a transfer session by itself.
 
-Therefore WFP/0.1 must only be used on trusted networks during development.
+The ANNOUNCE response tells the discovering peer which TCP port is accepting file transfers.
 
-Future versions will introduce authenticated and encrypted sessions.
+Typical flow:
 
-Cryptographic primitives will use established cryptographic libraries and algorithms.
+```text
+Discoverer                                  Receiver
+    |                                          |
+    | ------------- DISCOVER ----------------> |
+    | <------------ ANNOUNCE ----------------- |
+    |                                          |
+```
 
-WarpFile will not design custom cryptographic algorithms.
+## 18. DISCOVER
 
-20. Transport
+Message type:
 
-The reference WFP/0.1 implementation uses TCP.
+```text
+0x50
+```
 
-Default development port:
+Payload:
 
-42069
+```text
+empty
+```
 
-The port is not considered permanently reserved by the protocol and may change before stable release.
+A valid DISCOVER frame asks another host whether a WarpFile receiver is available.
 
-21. Compatibility
+Malformed frames, non-DISCOVER frames and DISCOVER frames with non-empty payloads are ignored by the discovery responder.
+
+## 19. ANNOUNCE
+
+Message type:
+
+```text
+0x51
+```
+
+Payload:
+
+```text
+Offset        Size    Field
+------        ----    ----------------
+0             2       Device name length
+2             N       Device name
+2 + N         2       TCP transfer port
+```
+
+Device name length:
+
+```text
+u16
+```
+
+Device name encoding:
+
+```text
+UTF-8
+```
+
+TCP transfer port:
+
+```text
+u16
+```
+
+Port zero is invalid.
+
+Example semantic announcement:
+
+```text
+Device name: EDBOOK
+TCP port:   42069
+```
+
+The source IP address of the UDP ANNOUNCE packet combined with the announced TCP port produces the transfer address.
+
+Example:
+
+```text
+100.68.8.15 + 42069
+        |
+        v
+100.68.8.15:42069
+```
+
+## 20. Discovery providers
+
+The WFP discovery messages are independent from the mechanism used to find candidate IP addresses.
+
+The current reference implementation uses two candidate providers.
+
+### 20.1 Local network discovery
+
+WarpFile enumerates local IPv4 interfaces and calculates directed broadcast addresses from each address and subnet mask.
+
+It sends WFP DISCOVER to those network broadcasts.
+
+Loopback, unspecified, link-local and `/32` addresses are not used as broadcast targets.
+
+Responses originating from the local machine are filtered to avoid self-discovery.
+
+### 20.2 Tailscale-assisted discovery
+
+When the `tailscale` CLI is available, WarpFile reads online Tailscale peers and treats their IPv4 addresses as discovery candidates.
+
+WarpFile does **not** assume that a Tailscale peer is a WarpFile peer.
+
+It sends a WFP DISCOVER datagram directly to each candidate.
+
+Only a peer that responds with a valid WFP ANNOUNCE becomes a discovered WarpFile device.
+
+Tailscale is optional. WarpFile continues to operate without it.
+
+## 21. Device-name resolution
+
+The CLI may use a discovered device name instead of an explicit socket address.
+
+Example:
+
+```text
+warpfile send README.md EDBOOK
+```
+
+Discovery may resolve:
+
+```text
+EDBOOK -> 100.68.8.15:42069
+```
+
+Matching is case-insensitive.
+
+If no matching device exists, resolution fails.
+
+If multiple discovered devices have the same name, the current implementation refuses to choose silently and requires the user to provide an explicit address.
+
+Automatic route selection is planned for future work.
+
+## 22. Default ports
+
+Current development defaults:
+
+```text
+TCP transfer: 42069
+UDP discovery: 42070
+```
+
+These ports are implementation defaults and are not permanently reserved protocol assignments.
+
+They may change before stable release.
+
+## 23. Security
+
+WFP/0.1 currently provides:
+
+- no encryption;
+- no peer authentication;
+- no device identity verification.
+
+Network input must be treated as untrusted.
+
+The current version should only be used in trusted development environments or over a trusted network layer.
+
+Future security work will use established cryptographic algorithms and libraries.
+
+WarpFile will not invent custom cryptographic primitives.
+
+## 24. Resume status
+
+WFP/0.1 does **not** currently support resumable transfers.
+
+If a transfer is interrupted, the current receiver removes the incomplete `.part` file.
+
+A future reliability milestone will introduce:
+
+- retained partial-file state;
+- validation of resumable partial data;
+- safe resume offsets;
+- sender seeking;
+- continued integrity verification.
+
+## 25. Compatibility
 
 WFP/0.1 is experimental.
 
-No backward compatibility is guaranteed until the protocol reaches a stable release.
+No backward compatibility guarantee exists before a stable protocol release.

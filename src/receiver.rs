@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Component, Path};
 
 use tokio::fs;
@@ -30,25 +31,33 @@ pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
 
     println!("Discovery: {device_name} on UDP 0.0.0.0:{DISCOVERY_PORT}");
 
-    let receiver = receive_once(listener, Path::new("received"));
+    let receiver = receive_loop(listener, Path::new("received"));
 
     let discovery = run_discovery_responder(&discovery_socket, &device_name, tcp_port);
 
     tokio::pin!(receiver);
-
     tokio::pin!(discovery);
 
     tokio::select! {
-        result =
-            &mut receiver =>
-        {
+        result = &mut receiver => {
             result
         }
 
-        result =
-            &mut discovery =>
-        {
+        result = &mut discovery => {
             result
+        }
+    }
+}
+
+pub async fn receive_loop(
+    listener: TcpListener,
+    destination_directory: &Path,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        let (stream, peer_address) = listener.accept().await?;
+
+        if let Err(error) = receive_connection(stream, peer_address, destination_directory).await {
+            eprintln!("Transfer from {peer_address} failed: {error}");
         }
     }
 }
@@ -57,8 +66,16 @@ pub async fn receive_once(
     listener: TcpListener,
     destination_directory: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let (mut stream, peer_address) = listener.accept().await?;
+    let (stream, peer_address) = listener.accept().await?;
 
+    receive_connection(stream, peer_address, destination_directory).await
+}
+
+async fn receive_connection(
+    mut stream: TcpStream,
+    peer_address: SocketAddr,
+    destination_directory: &Path,
+) -> Result<(), Box<dyn Error>> {
     println!("Connection from {peer_address}");
 
     let hello = read_frame(&mut stream).await?;
@@ -100,11 +117,8 @@ pub async fn receive_once(
 
     println!();
     println!("Incoming file:");
-
     println!("Name: {}", offer.filename);
-
     println!("Size: {} bytes", offer.file_size);
-
     println!();
 
     if let Err(error) = fs::create_dir_all(destination_directory).await {
@@ -213,6 +227,10 @@ pub async fn receive_once(
     println!("Sent VERIFIED");
 
     println!("Saved to {}", destination.display());
+
+    println!();
+
+    println!("Waiting for the next transfer...");
 
     Ok(())
 }
@@ -328,7 +346,6 @@ async fn send_reject(
 ) -> Result<(), Box<dyn Error>> {
     let reject = FileReject {
         code,
-
         message: message.to_string(),
     };
 

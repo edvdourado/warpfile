@@ -13,6 +13,7 @@ use crate::protocol::{
     DeviceAnnouncement, Frame, MessageType, decode_announcement, decode_frame, encode_announcement,
     encode_frame,
 };
+use crate::tailscale::online_peer_ipv4_addresses;
 
 pub const DISCOVERY_PORT: u16 = 42070;
 
@@ -83,12 +84,12 @@ pub async fn run_discovery_responder(
 pub async fn discover_devices() -> Result<Vec<DiscoveredDevice>, Box<dyn Error>> {
     let (local_addresses, broadcast_addresses) = discover_local_networks()?;
 
-    if broadcast_addresses.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no broadcast-capable IPv4 interfaces found",
-        )
-        .into());
+    let tailscale_addresses = online_peer_ipv4_addresses();
+
+    let discovery_targets = build_discovery_targets(broadcast_addresses, tailscale_addresses);
+
+    if discovery_targets.is_empty() {
+        return Ok(Vec::new());
     }
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -99,10 +100,16 @@ pub async fn discover_devices() -> Result<Vec<DiscoveredDevice>, Box<dyn Error>>
 
     let encoded_discover = encode_frame(&discover_frame)?;
 
-    for broadcast_ip in broadcast_addresses {
-        let destination = SocketAddr::from((broadcast_ip, DISCOVERY_PORT));
+    let mut sent_any = false;
 
-        socket.send_to(&encoded_discover, destination).await?;
+    for target in discovery_targets {
+        if socket.send_to(&encoded_discover, target).await.is_ok() {
+            sent_any = true;
+        }
+    }
+
+    if !sent_any {
+        return Ok(Vec::new());
     }
 
     let deadline = Instant::now() + DISCOVERY_RESPONSE_WINDOW;
@@ -122,6 +129,10 @@ pub async fn discover_devices() -> Result<Vec<DiscoveredDevice>, Box<dyn Error>>
 
         let (bytes_received, source_address) = match receive_result {
             Ok(Ok(result)) => result,
+
+            Ok(Err(error)) if is_ignorable_udp_error(&error) => {
+                continue;
+            }
 
             Ok(Err(error)) => {
                 return Err(error.into());
@@ -172,6 +183,27 @@ pub async fn discover_devices() -> Result<Vec<DiscoveredDevice>, Box<dyn Error>>
     });
 
     Ok(devices)
+}
+
+fn build_discovery_targets(
+    broadcast_addresses: Vec<Ipv4Addr>,
+    tailscale_addresses: Vec<Ipv4Addr>,
+) -> Vec<SocketAddr> {
+    let mut targets = HashSet::new();
+
+    for address in broadcast_addresses {
+        targets.insert(SocketAddr::from((address, DISCOVERY_PORT)));
+    }
+
+    for address in tailscale_addresses {
+        targets.insert(SocketAddr::from((address, DISCOVERY_PORT)));
+    }
+
+    let mut targets: Vec<SocketAddr> = targets.into_iter().collect();
+
+    targets.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+
+    targets
 }
 
 fn discover_local_networks() -> Result<(HashSet<Ipv4Addr>, Vec<Ipv4Addr>), Box<dyn Error>> {
@@ -230,6 +262,13 @@ fn is_local_source(source_ip: IpAddr, local_addresses: &HashSet<Ipv4Addr>) -> bo
 
         IpAddr::V6(_) => false,
     }
+}
+
+fn is_ignorable_udp_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn validate_discover_frame(frame: &Frame) -> Result<(), Box<dyn Error>> {
@@ -322,5 +361,26 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20,)),
             &local_addresses,
         ));
+    }
+
+    #[test]
+    fn ignores_udp_connection_reset() {
+        let error = io::Error::new(io::ErrorKind::ConnectionReset, "peer has no UDP listener");
+
+        assert!(is_ignorable_udp_error(&error,));
+    }
+
+    #[test]
+    fn ignores_udp_connection_refused() {
+        let error = io::Error::new(io::ErrorKind::ConnectionRefused, "peer refused UDP traffic");
+
+        assert!(is_ignorable_udp_error(&error,));
+    }
+
+    #[test]
+    fn does_not_ignore_other_udp_errors() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "permission denied");
+
+        assert!(!is_ignorable_udp_error(&error,));
     }
 }

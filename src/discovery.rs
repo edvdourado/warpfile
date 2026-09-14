@@ -201,7 +201,7 @@ fn build_discovery_targets(
 
     let mut targets: Vec<SocketAddr> = targets.into_iter().collect();
 
-    targets.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+    targets.sort_by_key(|left| left.to_string());
 
     targets
 }

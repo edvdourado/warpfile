@@ -7,6 +7,7 @@ pub mod message;
 pub mod offer;
 pub mod reject;
 pub mod resume;
+pub mod transfer_id;
 
 pub use decoder::{DecodeError, decode_frame};
 
@@ -28,3 +29,5 @@ pub use resume::{
     BLAKE3_HASH_LENGTH, RESUME_PAYLOAD_LENGTH, ResumeError, ResumeRequest, decode_resume,
     encode_resume,
 };
+
+pub use transfer_id::{TRANSFER_ID_LENGTH, TransferId};

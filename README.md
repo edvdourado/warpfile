@@ -599,4 +599,4 @@ WarpFile is experimental.
 
 Protocol details, CLI behavior and internal architecture may change without backward compatibility before the first stable release.
 
-The current development branch extends the `0.1.0-alpha.1` release with verified resumable-transfer support.
+The current alpha release is `0.1.0-alpha.2`, adding verified resumable-transfer support introduced after `0.1.0-alpha.1`.

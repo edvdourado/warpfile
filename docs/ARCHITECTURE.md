@@ -1,7 +1,7 @@
 # WarpFile Architecture
 
 **Status:** Experimental
-**Reference state:** development after `0.1.0-alpha.1`
+**Reference state:** `v0.1.0-alpha.2`
 
 This document describes the current architecture of the WarpFile reference implementation.
 

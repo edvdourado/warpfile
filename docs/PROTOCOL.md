@@ -2,7 +2,7 @@
 
 **Status:** Experimental
 **Protocol version:** 0.1
-**Reference implementation:** WarpFile development branch after `0.1.0-alpha.1`
+**Reference implementation:** WarpFile `v0.1.0-alpha.2`
 
 WFP is the application-layer protocol used by WarpFile.
 

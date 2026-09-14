@@ -12,8 +12,8 @@ use crate::discovery::{DISCOVERY_PORT, local_device_name, run_discovery_responde
 use crate::progress::ProgressTracker;
 use crate::protocol::frame::WFP_VERSION;
 use crate::protocol::{
-    FileReject, Frame, MessageType, RejectCode, decode_offer, encode_reject, read_frame,
-    write_frame,
+    FileReject, Frame, MessageType, ProtocolIoError, RejectCode, decode_offer, encode_reject,
+    read_frame, write_frame,
 };
 
 pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
@@ -204,7 +204,15 @@ async fn receive_connection(
         Ok(bytes_received) => bytes_received,
 
         Err(error) => {
-            let _ = fs::remove_file(&partial_destination).await;
+            if should_preserve_partial(error.as_ref()) {
+                println!();
+                println!(
+                    "Transfer interrupted by connection loss; partial file preserved at {}",
+                    partial_destination.display()
+                );
+            } else {
+                let _ = fs::remove_file(&partial_destination).await;
+            }
 
             return Err(error);
         }
@@ -337,6 +345,23 @@ async fn receive_file_data(
     progress.finish();
 
     Ok(bytes_received)
+}
+
+fn should_preserve_partial(error: &(dyn Error + 'static)) -> bool {
+    let Some(protocol_error) = error.downcast_ref::<ProtocolIoError>() else {
+        return false;
+    };
+
+    let ProtocolIoError::Io(io_error) = protocol_error else {
+        return false;
+    };
+
+    matches!(
+        io_error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
 }
 
 async fn send_reject(

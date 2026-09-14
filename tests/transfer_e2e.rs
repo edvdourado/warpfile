@@ -184,7 +184,7 @@ async fn rejects_file_when_destination_already_exists() {
 }
 
 #[tokio::test]
-async fn removes_partial_file_when_sender_disconnects() {
+async fn preserves_partial_file_when_sender_disconnects() {
     let temp = tempdir().unwrap();
 
     let destination_directory = temp.path().join("received");
@@ -202,7 +202,9 @@ async fn removes_partial_file_when_sender_disconnects() {
 
         send_offer_and_wait_for_accept(&mut stream, "interrupted.bin", 100_000).await;
 
-        let data = Frame::new(MessageType::Data, vec![0xAB; 4096]);
+        let partial_data = vec![0xAB; 4096];
+
+        let data = Frame::new(MessageType::Data, partial_data);
 
         write_frame(&mut stream, &data).await.unwrap();
 
@@ -226,8 +228,16 @@ async fn removes_partial_file_when_sender_disconnects() {
     let partial_path = destination_directory.join("interrupted.bin.part");
 
     assert!(
-        !partial_path.exists(),
-        "partial file remained after the sender disconnected"
+        partial_path.exists(),
+        "partial file was removed after a recoverable connection loss"
+    );
+
+    let partial_data = fs::read(&partial_path).unwrap();
+
+    assert_eq!(
+        partial_data,
+        vec![0xAB; 4096],
+        "preserved partial file does not contain the bytes received before disconnection"
     );
 }
 

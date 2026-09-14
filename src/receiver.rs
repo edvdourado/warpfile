@@ -12,8 +12,12 @@ use crate::discovery::{DISCOVERY_PORT, local_device_name, run_discovery_responde
 use crate::progress::ProgressTracker;
 use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
 use crate::protocol::{
-    FileReject, Frame, MessageType, ProtocolIoError, RejectCode, ResumeRequest, decode_offer,
-    encode_reject, encode_resume, read_frame, write_frame,
+    FileOffer, FileReject, Frame, MessageType, ProtocolIoError, RejectCode, ResumeRequest,
+    decode_offer, encode_reject, encode_resume, read_frame, write_frame,
+};
+use crate::transfer_metadata::{
+    TransferMetadata, TransferState, read_transfer_metadata, remove_transfer_metadata,
+    write_transfer_metadata,
 };
 
 struct PreparedTransfer {
@@ -160,7 +164,7 @@ async fn receive_connection(
         .into());
     }
 
-    let prepared = prepare_transfer(&mut stream, &partial_destination, offer.file_size).await?;
+    let prepared = prepare_transfer(&mut stream, &partial_destination, &offer).await?;
 
     let transfer_result = receive_file_data(
         &mut stream,
@@ -178,11 +182,11 @@ async fn receive_connection(
             if should_preserve_partial(error.as_ref()) {
                 println!();
                 println!(
-                    "Transfer interrupted by connection loss; partial file preserved at {}",
+                    "Transfer interrupted by connection loss; partial state preserved at {}",
                     partial_destination.display()
                 );
             } else {
-                let _ = fs::remove_file(&partial_destination).await;
+                let _ = discard_partial_state(&partial_destination).await;
             }
 
             return Err(error);
@@ -190,9 +194,15 @@ async fn receive_connection(
     };
 
     if let Err(error) = fs::rename(&partial_destination, &destination).await {
-        let _ = fs::remove_file(&partial_destination).await;
+        let _ = discard_partial_state(&partial_destination).await;
 
         return Err(error.into());
+    }
+
+    if let Err(error) = remove_transfer_metadata(&partial_destination).await {
+        eprintln!(
+            "Warning: file was committed but transfer metadata could not be removed: {error}"
+        );
     }
 
     println!("Received {bytes_received} bytes");
@@ -217,13 +227,15 @@ async fn receive_connection(
 async fn prepare_transfer(
     stream: &mut TcpStream,
     partial_destination: &Path,
-    expected_size: u64,
+    offer: &FileOffer,
 ) -> Result<PreparedTransfer, Box<dyn Error>> {
+    let expected_metadata = transfer_metadata_for_offer(offer);
+
     if !fs::try_exists(partial_destination).await? {
-        return prepare_fresh_transfer(stream, partial_destination).await;
+        return prepare_fresh_transfer(stream, partial_destination, &expected_metadata).await;
     }
 
-    let metadata = match fs::metadata(partial_destination).await {
+    let partial_metadata = match fs::metadata(partial_destination).await {
         Ok(metadata) => metadata,
 
         Err(error) => {
@@ -238,7 +250,7 @@ async fn prepare_transfer(
         }
     };
 
-    if !metadata.is_file() {
+    if !partial_metadata.is_file() {
         send_reject(
             stream,
             RejectCode::CannotPrepareDestination,
@@ -253,10 +265,10 @@ async fn prepare_transfer(
         .into());
     }
 
-    let partial_size = metadata.len();
+    let partial_size = partial_metadata.len();
 
-    if partial_size == 0 || partial_size > expected_size {
-        if let Err(error) = fs::remove_file(partial_destination).await {
+    if partial_size == 0 || partial_size > offer.file_size {
+        if let Err(error) = discard_partial_state(partial_destination).await {
             send_reject(
                 stream,
                 RejectCode::CannotPrepareDestination,
@@ -264,11 +276,36 @@ async fn prepare_transfer(
             )
             .await?;
 
-            return Err(error.into());
+            return Err(error);
         }
 
-        return prepare_fresh_transfer(stream, partial_destination).await;
+        return prepare_fresh_transfer(stream, partial_destination, &expected_metadata).await;
     }
+
+    let stored_metadata_matches = match read_transfer_metadata(partial_destination).await {
+        Ok(stored_metadata) => {
+            if stored_metadata == expected_metadata {
+                println!("Existing partial belongs to transfer {}", offer.transfer_id);
+
+                true
+            } else {
+                println!(
+                    "Existing partial metadata does not match transfer {}; prefix proof required",
+                    offer.transfer_id
+                );
+
+                false
+            }
+        }
+
+        Err(error) => {
+            println!(
+                "Existing partial metadata is unavailable or invalid ({error}); prefix proof required"
+            );
+
+            false
+        }
+    };
 
     let hasher = match hash_partial_file(partial_destination, partial_size).await {
         Ok(hasher) => hasher,
@@ -298,7 +335,7 @@ async fn prepare_transfer(
 
     if let Err(error) = write_frame(stream, &resume).await {
         if !should_preserve_partial(&error) {
-            let _ = fs::remove_file(partial_destination).await;
+            let _ = discard_partial_state(partial_destination).await;
         }
 
         return Err(error.into());
@@ -311,7 +348,7 @@ async fn prepare_transfer(
 
         Err(error) => {
             if !should_preserve_partial(&error) {
-                let _ = fs::remove_file(partial_destination).await;
+                let _ = discard_partial_state(partial_destination).await;
             }
 
             return Err(error.into());
@@ -321,7 +358,7 @@ async fn prepare_transfer(
     match response.message_type {
         MessageType::Accept => {
             if !response.payload.is_empty() {
-                let _ = fs::remove_file(partial_destination).await;
+                let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -333,13 +370,22 @@ async fn prepare_transfer(
             let current_size = fs::metadata(partial_destination).await?.len();
 
             if current_size != partial_size {
-                let _ = fs::remove_file(partial_destination).await;
+                let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "partial file changed while resume was being negotiated",
                 )
                 .into());
+            }
+
+            if !stored_metadata_matches {
+                write_transfer_metadata(partial_destination, &expected_metadata).await?;
+
+                println!(
+                    "Adopted verified partial for transfer {}",
+                    offer.transfer_id
+                );
             }
 
             let output = OpenOptions::new()
@@ -358,7 +404,7 @@ async fn prepare_transfer(
 
         MessageType::Restart => {
             if !response.payload.is_empty() {
-                let _ = fs::remove_file(partial_destination).await;
+                let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -369,7 +415,7 @@ async fn prepare_transfer(
 
             println!("Sender rejected the partial file; restarting from byte 0");
 
-            if let Err(error) = fs::remove_file(partial_destination).await {
+            if let Err(error) = discard_partial_state(partial_destination).await {
                 send_reject(
                     stream,
                     RejectCode::CannotPrepareDestination,
@@ -377,15 +423,15 @@ async fn prepare_transfer(
                 )
                 .await?;
 
-                return Err(error.into());
+                return Err(error);
             }
 
-            prepare_fresh_transfer(stream, partial_destination).await
+            prepare_fresh_transfer(stream, partial_destination, &expected_metadata).await
         }
 
         MessageType::Cancel => {
             if !response.payload.is_empty() {
-                let _ = fs::remove_file(partial_destination).await;
+                let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -394,13 +440,13 @@ async fn prepare_transfer(
                 .into());
             }
 
-            let _ = fs::remove_file(partial_destination).await;
+            let _ = discard_partial_state(partial_destination).await;
 
             Err(io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled by sender").into())
         }
 
         _ => {
-            let _ = fs::remove_file(partial_destination).await;
+            let _ = discard_partial_state(partial_destination).await;
 
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -414,7 +460,19 @@ async fn prepare_transfer(
 async fn prepare_fresh_transfer(
     stream: &mut TcpStream,
     partial_destination: &Path,
+    metadata: &TransferMetadata,
 ) -> Result<PreparedTransfer, Box<dyn Error>> {
+    if let Err(error) = remove_transfer_metadata(partial_destination).await {
+        send_reject(
+            stream,
+            RejectCode::CannotPrepareDestination,
+            "receiver could not clear stale transfer metadata",
+        )
+        .await?;
+
+        return Err(error.into());
+    }
+
     let output = match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -435,16 +493,32 @@ async fn prepare_fresh_transfer(
         }
     };
 
+    if let Err(error) = write_transfer_metadata(partial_destination, metadata).await {
+        drop(output);
+
+        let _ = discard_partial_state(partial_destination).await;
+
+        send_reject(
+            stream,
+            RejectCode::CannotPrepareDestination,
+            "receiver could not persist transfer metadata",
+        )
+        .await?;
+
+        return Err(error.into());
+    }
+
     let accept = Frame::new(MessageType::Accept, Vec::new());
 
     if let Err(error) = write_frame(stream, &accept).await {
         drop(output);
 
-        let _ = fs::remove_file(partial_destination).await;
+        let _ = discard_partial_state(partial_destination).await;
 
         return Err(error.into());
     }
 
+    println!("Persisted transfer metadata");
     println!("Sent ACCEPT");
 
     Ok(PreparedTransfer {
@@ -452,6 +526,31 @@ async fn prepare_fresh_transfer(
         bytes_received: 0,
         hasher: blake3::Hasher::new(),
     })
+}
+
+fn transfer_metadata_for_offer(offer: &FileOffer) -> TransferMetadata {
+    TransferMetadata {
+        transfer_id: offer.transfer_id,
+        filename: offer.filename.clone(),
+        file_size: offer.file_size,
+        state: TransferState::Partial,
+    }
+}
+
+async fn discard_partial_state(partial_destination: &Path) -> Result<(), Box<dyn Error>> {
+    match fs::remove_file(partial_destination).await {
+        Ok(()) => {}
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+        Err(error) => {
+            return Err(error.into());
+        }
+    }
+
+    remove_transfer_metadata(partial_destination).await?;
+
+    Ok(())
 }
 
 async fn hash_partial_file(

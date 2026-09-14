@@ -375,6 +375,7 @@ name = "warpfile"
 version = "0.1.0-alpha.2"
 dependencies = [
  "blake3",
+ "getrandom",
  "if-addrs",
  "serde_json",
  "tempfile",

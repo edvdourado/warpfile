@@ -6,6 +6,14 @@ pub const TRANSFER_ID_LENGTH: usize = 16;
 pub struct TransferId([u8; TRANSFER_ID_LENGTH]);
 
 impl TransferId {
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0u8; TRANSFER_ID_LENGTH];
+
+        getrandom::fill(&mut bytes)?;
+
+        Ok(Self(bytes))
+    }
+
     pub const fn from_bytes(bytes: [u8; TRANSFER_ID_LENGTH]) -> Self {
         Self(bytes)
     }
@@ -32,6 +40,13 @@ impl fmt::Display for TransferId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generates_transfer_id() {
+        let transfer_id = TransferId::generate().unwrap();
+
+        assert_eq!(transfer_id.as_bytes().len(), TRANSFER_ID_LENGTH);
+    }
 
     #[test]
     fn preserves_transfer_id_bytes() {

@@ -2,10 +2,12 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use tokio::time::sleep;
 
 use crate::progress::ProgressTracker;
 use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
@@ -13,6 +15,9 @@ use crate::protocol::{
     FileOffer, Frame, MessageType, ProtocolIoError, ResumeRequest, decode_reject, decode_resume,
     encode_offer, read_frame, write_frame,
 };
+
+const MAX_SEND_ATTEMPTS: usize = 3;
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 enum SendAttemptError {
@@ -27,6 +32,13 @@ impl SendAttemptError {
         E: Error + 'static,
     {
         Self::Permanent(Box::new(error))
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            SendAttemptError::RetryableConnect(_) | SendAttemptError::RetryableProtocol(_)
+        )
     }
 }
 
@@ -84,9 +96,61 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
     println!("File: {filename}");
     println!("Size: {file_size} bytes");
 
-    send_once(path, &filename, file_size, address)
-        .await
-        .map_err(|error| Box::new(error) as Box<dyn Error>)
+    let mut attempt = 1usize;
+
+    loop {
+        match send_once(path, &filename, file_size, address).await {
+            Ok(()) => {
+                return Ok(());
+            }
+
+            Err(error) if error.is_retryable() && attempt < MAX_SEND_ATTEMPTS => {
+                println!();
+                println!(
+                    "Transfer attempt {attempt} failed with a recoverable network error: {error}"
+                );
+                println!("Retrying in {} second(s)...", RETRY_DELAY.as_secs());
+
+                wait_before_retry().await?;
+
+                attempt += 1;
+
+                println!();
+                println!("Retry attempt {attempt} of {MAX_SEND_ATTEMPTS}");
+            }
+
+            Err(error) => {
+                if error.is_retryable() {
+                    println!();
+                    println!(
+                        "Transfer failed after {attempt} attempts due to a recoverable network error"
+                    );
+                }
+
+                return Err(Box::new(error));
+            }
+        }
+    }
+}
+
+async fn wait_before_retry() -> Result<(), Box<dyn Error>> {
+    tokio::select! {
+        _ = sleep(RETRY_DELAY) => {
+            Ok(())
+        }
+
+        signal_result = tokio::signal::ctrl_c() => {
+            signal_result?;
+
+            Err(
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "transfer cancelled by user",
+                )
+                .into(),
+            )
+        }
+    }
 }
 
 async fn send_once(

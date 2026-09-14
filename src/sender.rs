@@ -38,6 +38,16 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
 
     println!("File: {filename}");
     println!("Size: {file_size} bytes");
+
+    send_once(path, &filename, file_size, address).await
+}
+
+async fn send_once(
+    path: &Path,
+    filename: &str,
+    file_size: u64,
+    address: &str,
+) -> Result<(), Box<dyn Error>> {
     println!("Connecting to {address}");
 
     let mut stream = TcpStream::connect(address).await?;
@@ -63,7 +73,7 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
     println!("WFP handshake successful");
 
     let offer = FileOffer {
-        filename,
+        filename: filename.to_string(),
         file_size,
     };
 

@@ -1,11 +1,19 @@
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use crate::protocol::{TRANSFER_ID_LENGTH, TransferId};
 
 pub const TRANSFER_METADATA_FORMAT_VERSION: u64 = 1;
+
+const TRANSFER_METADATA_SUFFIX: &str = ".warpmeta";
+const TRANSFER_METADATA_TEMP_SUFFIX: &str = ".tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferState {
@@ -30,6 +38,7 @@ pub struct TransferMetadata {
 
 #[derive(Debug)]
 pub enum TransferMetadataError {
+    Io(io::Error),
     Json(serde_json::Error),
     RootNotObject,
     MissingField(&'static str),
@@ -42,6 +51,10 @@ pub enum TransferMetadataError {
 impl fmt::Display for TransferMetadataError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TransferMetadataError::Io(error) => {
+                write!(formatter, "transfer metadata I/O error: {error}")
+            }
+
             TransferMetadataError::Json(error) => {
                 write!(formatter, "invalid transfer metadata JSON: {error}")
             }
@@ -85,9 +98,16 @@ impl fmt::Display for TransferMetadataError {
 impl Error for TransferMetadataError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            TransferMetadataError::Io(error) => Some(error),
             TransferMetadataError::Json(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<io::Error> for TransferMetadataError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -95,6 +115,106 @@ impl From<serde_json::Error> for TransferMetadataError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
     }
+}
+
+pub fn transfer_metadata_path(partial_path: &Path) -> PathBuf {
+    append_suffix(partial_path, TRANSFER_METADATA_SUFFIX)
+}
+
+pub async fn write_transfer_metadata(
+    partial_path: &Path,
+    metadata: &TransferMetadata,
+) -> Result<(), TransferMetadataError> {
+    let metadata_path = transfer_metadata_path(partial_path);
+
+    let temporary_path = transfer_metadata_temporary_path(partial_path);
+
+    let encoded = encode_transfer_metadata(metadata)?;
+
+    /*
+     * A previous crash may have left a stale
+     * .warpmeta.tmp behind.
+     *
+     * It is never considered valid metadata,
+     * so it is safe to discard before starting
+     * a new write.
+     */
+    remove_if_exists(&temporary_path).await?;
+
+    let write_result = async {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .await?;
+
+        file.write_all(&encoded).await?;
+
+        file.flush().await?;
+
+        /*
+         * flush() moves buffered bytes toward
+         * the operating system.
+         *
+         * sync_all() asks the operating system
+         * to persist the file contents before
+         * we make this metadata visible under
+         * its final filename.
+         */
+        file.sync_all().await?;
+
+        drop(file);
+
+        /*
+         * Windows does not reliably allow a
+         * rename to replace an existing target.
+         *
+         * Remove the old metadata first, then
+         * promote the fully written temporary
+         * file.
+         *
+         * If the process dies in this small
+         * window, the metadata may be missing,
+         * but the .part remains recoverable by
+         * verified prefix adoption.
+         */
+        remove_if_exists_io(&metadata_path).await?;
+
+        fs::rename(&temporary_path, &metadata_path).await?;
+
+        Ok::<(), io::Error>(())
+    }
+    .await;
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path).await;
+
+        return Err(TransferMetadataError::Io(error));
+    }
+
+    Ok(())
+}
+
+pub async fn read_transfer_metadata(
+    partial_path: &Path,
+) -> Result<TransferMetadata, TransferMetadataError> {
+    let metadata_path = transfer_metadata_path(partial_path);
+
+    let bytes = fs::read(metadata_path).await?;
+
+    decode_transfer_metadata(&bytes)
+}
+
+pub async fn remove_transfer_metadata(partial_path: &Path) -> Result<(), TransferMetadataError> {
+    let metadata_path = transfer_metadata_path(partial_path);
+
+    let temporary_path = transfer_metadata_temporary_path(partial_path);
+
+    remove_if_exists(&metadata_path).await?;
+
+    remove_if_exists(&temporary_path).await?;
+
+    Ok(())
 }
 
 pub fn encode_transfer_metadata(
@@ -163,6 +283,7 @@ pub fn decode_transfer_metadata(bytes: &[u8]) -> Result<TransferMetadata, Transf
 
     let state = match state_text {
         "partial" => TransferState::Partial,
+
         other => {
             return Err(TransferMetadataError::UnsupportedState(other.to_string()));
         }
@@ -174,6 +295,36 @@ pub fn decode_transfer_metadata(bytes: &[u8]) -> Result<TransferMetadata, Transf
         file_size,
         state,
     })
+}
+
+fn transfer_metadata_temporary_path(partial_path: &Path) -> PathBuf {
+    let metadata_path = transfer_metadata_path(partial_path);
+
+    append_suffix(&metadata_path, TRANSFER_METADATA_TEMP_SUFFIX)
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value: OsString = path.as_os_str().to_os_string();
+
+    value.push(suffix);
+
+    PathBuf::from(value)
+}
+
+async fn remove_if_exists(path: &Path) -> Result<(), TransferMetadataError> {
+    remove_if_exists_io(path).await?;
+
+    Ok(())
+}
+
+async fn remove_if_exists_io(path: &Path) -> Result<(), io::Error> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(error),
+    }
 }
 
 fn parse_transfer_id(text: &str) -> Result<TransferId, TransferMetadataError> {
@@ -212,6 +363,8 @@ const fn decode_hex_digit(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    use tempfile::tempdir;
+
     fn test_metadata() -> TransferMetadata {
         TransferMetadata {
             transfer_id: TransferId::from_bytes([
@@ -220,6 +373,18 @@ mod tests {
             ]),
             filename: "arquivo.bin".to_string(),
             file_size: 123_456_789,
+            state: TransferState::Partial,
+        }
+    }
+
+    fn replacement_metadata() -> TransferMetadata {
+        TransferMetadata {
+            transfer_id: TransferId::from_bytes([
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+                0x1E, 0x1F,
+            ]),
+            filename: "arquivo.bin".to_string(),
+            file_size: 987_654_321,
             state: TransferState::Partial,
         }
     }
@@ -306,5 +471,115 @@ mod tests {
             TransferMetadataError::UnsupportedState(ref state)
                 if state == "teleported"
         ));
+    }
+
+    #[test]
+    fn derives_metadata_path_from_partial_path() {
+        let partial_path = Path::new("received").join("video.mkv.part");
+
+        let metadata_path = transfer_metadata_path(&partial_path);
+
+        assert_eq!(
+            metadata_path,
+            Path::new("received").join("video.mkv.part.warpmeta")
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_and_reads_transfer_metadata_file() {
+        let temp = tempdir().unwrap();
+
+        let partial_path = temp.path().join("arquivo.bin.part");
+
+        let original = test_metadata();
+
+        write_transfer_metadata(&partial_path, &original)
+            .await
+            .unwrap();
+
+        let metadata_path = transfer_metadata_path(&partial_path);
+
+        assert!(metadata_path.exists(), "metadata file was not created");
+
+        let loaded = read_transfer_metadata(&partial_path).await.unwrap();
+
+        assert_eq!(loaded, original);
+    }
+
+    #[tokio::test]
+    async fn replaces_existing_transfer_metadata_file() {
+        let temp = tempdir().unwrap();
+
+        let partial_path = temp.path().join("arquivo.bin.part");
+
+        let first = test_metadata();
+
+        let replacement = replacement_metadata();
+
+        write_transfer_metadata(&partial_path, &first)
+            .await
+            .unwrap();
+
+        write_transfer_metadata(&partial_path, &replacement)
+            .await
+            .unwrap();
+
+        let loaded = read_transfer_metadata(&partial_path).await.unwrap();
+
+        assert_eq!(loaded, replacement);
+    }
+
+    #[tokio::test]
+    async fn removes_transfer_metadata_file_and_stale_temporary_file() {
+        let temp = tempdir().unwrap();
+
+        let partial_path = temp.path().join("arquivo.bin.part");
+
+        let metadata = test_metadata();
+
+        write_transfer_metadata(&partial_path, &metadata)
+            .await
+            .unwrap();
+
+        let metadata_path = transfer_metadata_path(&partial_path);
+
+        let temporary_path = transfer_metadata_temporary_path(&partial_path);
+
+        fs::write(&temporary_path, b"stale temporary metadata")
+            .await
+            .unwrap();
+
+        assert!(metadata_path.exists());
+
+        assert!(temporary_path.exists());
+
+        remove_transfer_metadata(&partial_path).await.unwrap();
+
+        assert!(
+            !metadata_path.exists(),
+            "metadata file remained after removal"
+        );
+
+        assert!(
+            !temporary_path.exists(),
+            "temporary metadata file remained after removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_corrupted_transfer_metadata_file() {
+        let temp = tempdir().unwrap();
+
+        let partial_path = temp.path().join("arquivo.bin.part");
+
+        let metadata_path = transfer_metadata_path(&partial_path);
+
+        fs::write(&metadata_path, b"{ this is not valid JSON")
+            .await
+            .unwrap();
+
+        let error = read_transfer_metadata(&partial_path).await.unwrap_err();
+
+        assert!(matches!(error, TransferMetadataError::Json(_)));
     }
 }

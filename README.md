@@ -4,7 +4,7 @@
 
 It transfers files directly between devices using **WFP (WarpFile Protocol)**, its own binary application-layer protocol, without requiring WarpFile cloud storage or permanent user accounts.
 
-The current prototype supports integrity-verified TCP transfers, persistent receiving, automatic device discovery across local networks and Tailscale, and sending files by device name.
+The current prototype supports integrity-verified and resumable TCP transfers, persistent receiving, automatic device discovery across local networks and Tailscale, and sending files by device name.
 
 > WarpFile is under active development and is not yet intended for untrusted networks.
 
@@ -17,15 +17,21 @@ WarpFile currently supports:
 - 64 KiB DATA frames;
 - incremental BLAKE3 integrity verification;
 - file offer acceptance and structured rejection;
-- transfer cancellation with `Ctrl+C`;
-- cleanup of incomplete `.part` files;
+- explicit transfer cancellation with `Ctrl+C`;
+- `.part` files for incomplete incoming transfers;
+- preservation of partial files after recoverable connection loss;
+- verified resumable transfers using byte offsets and BLAKE3 prefix hashes;
+- automatic restart from byte zero when retained partial data does not match the source;
+- avoidance of retransmitting already validated file prefixes;
+- resume from arbitrary byte offsets rather than chunk boundaries;
+- zero DATA retransmission when the receiver already has the complete validated file contents;
 - persistent receivers that can accept multiple sequential transfers;
 - UDP peer discovery with WFP `DISCOVER` / `ANNOUNCE`;
 - discovery across IPv4 local network interfaces;
 - optional Tailscale-assisted peer discovery;
 - device-name resolution;
 - direct `IP:port` transfers as a fallback;
-- unit and end-to-end tests covering protocol, discovery, cancellation, corruption, cleanup and real transfer flows.
+- unit and end-to-end tests covering protocol, discovery, cancellation, corruption, recovery and real resume flows.
 
 ## Example
 
@@ -99,7 +105,7 @@ WarpFile sends its own WFP `DISCOVER` message to each candidate, and only device
 
 ## Transfer flow
 
-A successful WFP/0.1 file transfer currently looks like this:
+A fresh WFP/0.1 file transfer looks like this:
 
 ```text
 Sender                                      Receiver
@@ -121,7 +127,139 @@ Sender                                      Receiver
 
 The sender calculates a BLAKE3 digest while streaming the file.
 
-The receiver calculates the same digest while writing the incoming data and only sends `VERIFIED` when the received file size and BLAKE3 digest are both correct.
+The receiver calculates the same digest while writing incoming data and only sends `VERIFIED` when the received file size and BLAKE3 digest are both correct.
+
+## Resumable transfers
+
+Unexpected connection loss does not automatically destroy useful received data.
+
+If a transfer is interrupted by a recoverable network failure, the receiver retains:
+
+```text
+<filename>.part
+```
+
+When the same filename is offered again, the receiver may propose a resume state:
+
+```text
+Sender                                      Receiver
+  |                                            |
+  | ---------------- OFFER -----------------> |
+  |                                            |
+  | <--------------- RESUME ----------------- |
+  |          offset + prefix hash              |
+  |                                            |
+  | validate local source prefix               |
+  |                                            |
+  | ---------------- ACCEPT ----------------> |
+  |                                            |
+  | -------- DATA from resume offset --------> |
+  |                   ...                      |
+  |                                            |
+  | -------------- COMPLETE ----------------> |
+  | <-------------- VERIFIED ---------------- |
+```
+
+`RESUME` does not mean that the sender blindly trusts an offset.
+
+The receiver sends:
+
+```text
+resume byte offset
++
+BLAKE3 hash of the retained prefix
+```
+
+The sender reads and hashes exactly the same prefix from its source file.
+
+Continuation is accepted only when both prefix hashes match.
+
+If they do not match:
+
+```text
+Sender                                      Receiver
+  |                                            |
+  | <--------------- RESUME ----------------- |
+  |                                            |
+  | --------------- RESTART ----------------> |
+  |                                            |
+  |                      discard stale .part   |
+  |                                            |
+  | <--------------- ACCEPT ----------------- |
+  |                                            |
+  | ------------ DATA from byte 0 ----------> |
+```
+
+This protects against accidentally combining data from different files that happen to share the same filename or size.
+
+### Resume uses byte offsets
+
+Resume positions are not tied to 64 KiB DATA-frame boundaries.
+
+For example, a transfer may safely resume from:
+
+```text
+123457 bytes
+```
+
+as long as the BLAKE3 digest of bytes:
+
+```text
+[0, 123457)
+```
+
+matches on both peers.
+
+This keeps resume independent from current and future chunk-sizing strategies.
+
+### Already-complete partial files
+
+A connection may disappear after the receiver has obtained every file byte but before the final `COMPLETE` / `VERIFIED` exchange finishes.
+
+If the receiver later proposes:
+
+```text
+resume offset == complete file size
+```
+
+and the full retained prefix matches the source, the sender does not need to retransmit any DATA payload.
+
+It can proceed directly to `COMPLETE`.
+
+## Partial-file behavior
+
+Incoming files are written to:
+
+```text
+<filename>.part
+```
+
+The final filename is created only after complete size and BLAKE3 verification succeeds.
+
+Different failure types intentionally have different behavior.
+
+Unexpected recoverable connection loss:
+
+```text
+retain .part
+â†’ offer verified resume later
+```
+
+Explicit `CANCEL`:
+
+```text
+remove .part
+```
+
+Invalid final BLAKE3, impossible transfer state or protocol failure:
+
+```text
+remove .part
+```
+
+A zero-byte `.part` contains no useful resumable data and is discarded before starting a fresh transfer.
+
+A `.part` larger than the file size announced by the sender cannot be a valid prefix and is also discarded.
 
 ## Architecture
 
@@ -142,14 +280,17 @@ CLI
                  |
                  +-- framing
                  +-- encoding / decoding
-                 +-- message payloads
+                 +-- transfer payloads
+                 +-- resume negotiation
                  |
                  +-- TCP / UDP I/O
 ```
 
 The transfer layer does not need to know whether an address came from LAN discovery, Tailscale discovery or explicit user input.
 
-This separation is intentional so additional connectivity mechanisms can be introduced later without rewriting the file transfer protocol.
+This separation is intentional so additional connectivity mechanisms can be introduced later without rewriting file-transfer semantics.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the implementation architecture.
 
 ## WarpFile Protocol
 
@@ -183,6 +324,7 @@ Current message families include:
 HELLO / HELLO_ACK
 
 OFFER / ACCEPT / REJECT
+RESUME / RESTART
 
 DATA
 
@@ -205,9 +347,7 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the evolving protocol specificati
 
 WarpFile already protects transfers against several failure cases.
 
-Incomplete files are written using a `.part` file and are not promoted to the final destination until integrity verification succeeds.
-
-Transfers detect:
+Transfers detect or handle:
 
 - unexpected disconnection;
 - explicit cancellation;
@@ -216,9 +356,56 @@ Transfers detect:
 - invalid BLAKE3 digest;
 - unsafe filenames;
 - existing destination files;
-- malformed WFP frames.
+- malformed WFP frames;
+- stale partial-file contents;
+- impossible resume offsets;
+- empty or oversized partial-file state.
 
-Resumable transfers are the next major reliability milestone.
+Verified resume adds a second integrity checkpoint before continuation.
+
+For a resume offset `X`:
+
+```text
+Receiver:
+BLAKE3(.part bytes 0..X)
+
+Sender:
+BLAKE3(source bytes 0..X)
+```
+
+The transfer continues from `X` only when those values match.
+
+Final `COMPLETE` / `VERIFIED` still verifies the resulting complete file.
+
+## Current resume limitations
+
+Resume is functional, but the current implementation remains intentionally simple.
+
+It currently does not provide:
+
+- automatic sender reconnect after a failure;
+- automatic retry scheduling;
+- persistent sender-side transfer tracking;
+- persisted BLAKE3 checkpoints;
+- directory-transfer manifests;
+- simultaneous multi-client receiving.
+
+After an unexpected failure, the user currently starts the send operation again.
+
+The receiver then discovers the retained `.part` state and negotiates resume through WFP.
+
+Retained prefixes must currently be reread locally on both peers to reconstruct BLAKE3 state.
+
+For example:
+
+```text
+100 GiB source
+8 GiB already retained
+```
+
+may require both peers to read and hash those 8 GiB locally again, but only the remaining 92 GiB needs to cross the network.
+
+Future hash checkpoints may reduce this local reread cost.
 
 ## Security
 
@@ -226,11 +413,15 @@ Resumable transfers are the next major reliability milestone.
 
 The current implementation should therefore only be used in trusted development environments or over a trusted network layer.
 
+BLAKE3 prefix hashes used during resume prove content equality for the proposed prefix.
+
+They do **not** prove peer identity and must not be treated as authentication.
+
 WarpFile will not design custom cryptographic algorithms. Future authenticated and encrypted sessions will use established cryptographic primitives and libraries.
 
 ## Roadmap
 
-### M0 — First Byte
+### M0 â€” First Byte
 
 Complete.
 
@@ -240,7 +431,7 @@ Complete.
 - `HELLO`;
 - `HELLO_ACK`.
 
-### M1 — First File
+### M1 â€” First File
 
 Complete.
 
@@ -253,10 +444,10 @@ Complete.
 - `COMPLETE`;
 - `VERIFIED`;
 - explicit cancellation;
-- partial-file cleanup;
+- partial-file handling;
 - end-to-end transfer tests.
 
-### M2 — Zero Config
+### M2 â€” Zero Config
 
 Complete for the current prototype.
 
@@ -269,19 +460,34 @@ Complete for the current prototype.
 - persistent receiver;
 - transfer by device name.
 
-### M3 — Reliable Transfer
+### M3 â€” Reliable Transfer
 
-In progress / next.
+In progress.
 
-- resumable transfers;
-- retained and validated partial files;
-- safe resume offsets;
+Implemented:
+
+- retained partial files after recoverable connection loss;
+- verified resume negotiation;
+- BLAKE3 prefix validation;
+- byte-offset resume;
+- `RESUME`;
+- `RESTART`;
+- suffix-only retransmission;
+- recovery after real TCP connection loss;
+- stale partial detection;
+- zero-DATA completion when all file bytes are already present;
+- end-to-end resume coverage.
+
+Still planned within the broader reliability milestone:
+
+- automatic reconnect and retry policy;
 - improved chunk management;
-- retry and recovery behavior;
+- persistent transfer metadata;
+- hash checkpoints;
 - directory transfer design;
 - improved path selection.
 
-### M4 — Distribution
+### M4 â€” Distribution
 
 Planned.
 
@@ -292,18 +498,59 @@ Planned.
 - broader documentation;
 - performance benchmarks.
 
+## Testing
+
+WarpFile uses unit tests and end-to-end tests with real local TCP and UDP sockets.
+
+Current coverage includes:
+
+```text
+protocol framing and validation
+OFFER / REJECT payloads
+RESUME encoding and decoding
+BLAKE3 integrity
+normal transfers
+empty files
+cancellation
+connection loss
+partial retention
+prefix mismatch and RESTART
+suffix-only resume
+100% partial resume with zero DATA retransmission
+recovery across two TCP connections
+empty and oversized partial states
+persistent receiver behavior
+LAN discovery
+Tailscale parsing
+device-name resolution
+```
+
+At the time this development state was documented, the suite contains:
+
+```text
+72 passing tests
+0 failures
+```
+
 ## Performance philosophy
 
 WarpFile is intended to become performance-oriented, but it will not claim to be faster than other tools without reproducible benchmarks.
 
+A central principle is:
+
+> Never transfer a byte that does not need to be transferred.
+
+Current resume behavior already applies that principle by avoiding retransmission of validated prefixes.
+
 Future optimization work includes:
 
 - minimizing unnecessary copies;
-- one-pass streaming and hashing;
+- zero-copy transfer paths where practical;
 - adaptive chunks;
 - pipelining;
 - selective compression;
 - deduplication;
+- batching;
 - automatic path selection;
 - multi-source transfers.
 
@@ -351,3 +598,5 @@ Tailscale is optional and is not required for LAN transfers.
 WarpFile is experimental.
 
 Protocol details, CLI behavior and internal architecture may change without backward compatibility before the first stable release.
+
+The current development branch extends the `0.1.0-alpha.1` release with verified resumable-transfer support.

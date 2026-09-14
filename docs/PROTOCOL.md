@@ -1,8 +1,8 @@
-# WarpFile Protocol — WFP/0.1
+# WarpFile Protocol ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â WFP/0.1
 
 **Status:** Experimental
 **Protocol version:** 0.1
-**Reference implementation:** WarpFile `0.1.0-alpha.1`
+**Reference implementation:** WarpFile development branch after `0.1.0-alpha.1`
 
 WFP is the application-layer protocol used by WarpFile.
 
@@ -22,6 +22,8 @@ WFP/0.1 prioritizes:
 - streaming without loading entire files into memory;
 - bounded payload sizes;
 - integrity verification;
+- verified resumable transfers;
+- avoiding retransmission of already validated file data;
 - implementation portability;
 - clear separation between discovery and file transfer.
 
@@ -32,7 +34,6 @@ WFP/0.1 currently does **not** provide:
 - identity verification;
 - NAT traversal;
 - relay transport;
-- resumable transfers;
 - multiplexing;
 - compression;
 - multiple files in one TCP session.
@@ -140,6 +141,8 @@ Value    Name
 0x10     OFFER
 0x11     ACCEPT
 0x12     REJECT
+0x13     RESUME
+0x14     RESTART
 
 0x20     DATA
 
@@ -164,7 +167,7 @@ A single TCP connection transfers one file.
 
 The receiver process may remain running and accept multiple sequential connections, but each TCP session carries one transfer.
 
-Normal lifecycle:
+A fresh transfer normally follows:
 
 ```text
 Sender                                      Receiver
@@ -183,6 +186,47 @@ Sender                                      Receiver
   | <-------------- VERIFIED ---------------- |
   |                                            |
   |                   close                    |
+```
+
+If the receiver has retained usable partial data, the negotiation may instead follow:
+
+```text
+Sender                                      Receiver
+  |                                            |
+  | ---------------- HELLO -----------------> |
+  | <------------- HELLO_ACK ---------------- |
+  |                                            |
+  | ---------------- OFFER -----------------> |
+  | <--------------- RESUME ----------------- |
+  |          offset + prefix hash              |
+  |                                            |
+  | validates local prefix                     |
+  |                                            |
+  | ---------------- ACCEPT ----------------> |
+  |                                            |
+  | -------- DATA from resume offset --------> |
+  |                   ...                      |
+  |                                            |
+  | -------------- COMPLETE ----------------> |
+  | <-------------- VERIFIED ---------------- |
+```
+
+If the sender determines that the retained receiver prefix does not match the source file:
+
+```text
+Sender                                      Receiver
+  |                                            |
+  | ---------------- OFFER -----------------> |
+  | <--------------- RESUME ----------------- |
+  |                                            |
+  | --------------- RESTART ----------------> |
+  |                                            |
+  |                      discard stale .part   |
+  |                                            |
+  | <--------------- ACCEPT ----------------- |
+  |                                            |
+  | ------------ DATA from byte 0 ----------> |
+  |                   ...                      |
 ```
 
 The receiver may send `REJECT` after `OFFER`.
@@ -307,7 +351,17 @@ Payload:
 empty
 ```
 
-ACCEPT indicates that the receiver has prepared the destination and is ready for DATA frames.
+ACCEPT is used in two negotiation states.
+
+After `OFFER`, a receiver may send ACCEPT to indicate that a fresh destination has been prepared and the sender should begin at byte zero.
+
+After `RESUME`, the sender sends ACCEPT when:
+
+- the requested offset is valid for the source file;
+- the sender has hashed its local prefix up to that offset;
+- the sender's prefix digest matches the digest supplied by the receiver.
+
+In that state ACCEPT means that the sender agrees to continue from the proposed resume offset.
 
 ## 10. REJECT
 
@@ -339,7 +393,93 @@ The message is diagnostic text.
 
 Protocol logic should rely on the numeric reason code rather than parsing the human-readable message.
 
-## 11. DATA
+## 11. RESUME
+
+Message type:
+
+```text
+0x13
+```
+
+Payload:
+
+```text
+Offset    Size    Field
+------    ----    ----------------
+0         8       Resume offset
+8         32      BLAKE3 prefix digest
+```
+
+Total payload size:
+
+```text
+40 bytes
+```
+
+Resume offset:
+
+```text
+u64
+```
+
+The offset represents the exact number of file bytes already retained by the receiver.
+
+It is a byte offset, not a DATA-frame or chunk number.
+
+This allows resume points to remain independent from DATA frame sizing and future chunk-management changes.
+
+The BLAKE3 prefix digest represents exactly:
+
+```text
+file bytes [0, offset)
+```
+
+Before sending RESUME, the receiver hashes the retained `.part` file.
+
+The sender then reads and hashes exactly the same prefix from the source file.
+
+If the hashes match, the sender sends ACCEPT and continues from that offset.
+
+If they do not match, the sender sends RESTART.
+
+A valid resume offset may equal the total file size.
+
+In that case, if the prefix digest matches the complete source file, no DATA frames need to be retransmitted. The sender may proceed directly to COMPLETE.
+
+## 12. RESTART
+
+Message type:
+
+```text
+0x14
+```
+
+Payload:
+
+```text
+empty
+```
+
+RESTART is sent by the sender after RESUME when the proposed partial state cannot safely be used.
+
+Typical reasons include:
+
+- the resume offset exceeds the source file size;
+- the sender's local prefix digest differs from the receiver's prefix digest.
+
+After RESTART, the receiver discards the stale partial state, prepares a fresh `.part` file and sends ACCEPT.
+
+The sender then starts DATA transmission from byte zero.
+
+RESTART means:
+
+```text
+discard this resume state and restart the same transfer
+```
+
+It is distinct from CANCEL, which aborts the transfer.
+
+## 13. DATA
 
 Message type:
 
@@ -363,9 +503,13 @@ WFP/0.1 does not include DATA sequence numbers because the current transfer tran
 
 The receiver writes DATA payloads sequentially.
 
+For fresh transfers, DATA begins at byte zero.
+
+For accepted resumed transfers, DATA begins at the negotiated resume offset.
+
 Both peers update their BLAKE3 state while processing file data.
 
-## 12. COMPLETE
+## 14. COMPLETE
 
 Message type:
 
@@ -379,11 +523,11 @@ Payload:
 32-byte BLAKE3 digest
 ```
 
-The sender sends COMPLETE after all file bytes have been transmitted.
+The sender sends COMPLETE after all file bytes have been processed.
 
-The digest represents the complete original file.
+The digest represents the complete original file, including any prefix that was not retransmitted during a resumed transfer.
 
-## 13. VERIFIED
+## 15. VERIFIED
 
 Message type:
 
@@ -399,12 +543,12 @@ empty
 
 The receiver sends VERIFIED only after:
 
-- the total received byte count equals the file size announced in OFFER;
+- the total retained plus newly received byte count equals the file size announced in OFFER;
 - the locally calculated BLAKE3 digest matches the digest received in COMPLETE.
 
 Only after receiving VERIFIED may the sender consider the transfer successful.
 
-## 14. CANCEL
+## 16. CANCEL
 
 Message type:
 
@@ -424,7 +568,9 @@ The current sender sends CANCEL when the user interrupts an active transfer with
 
 The current receiver removes the incomplete `.part` file after cancellation.
 
-## 15. Partial-file behavior
+CANCEL therefore does not request later resume.
+
+## 17. Partial-file behavior
 
 Incoming data is written to:
 
@@ -434,13 +580,51 @@ Incoming data is written to:
 
 The `.part` file is renamed to the final filename only after successful size and BLAKE3 verification.
 
-Current WFP/0.1 behavior removes incomplete partial files after transfer failure or cancellation.
+The current reference behavior distinguishes recoverable connection loss from invalid or intentionally aborted transfer state.
 
-Persistent resumable partial files are planned for a future protocol extension.
+Unexpected recoverable connection loss:
 
-## 16. BLAKE3 integrity
+```text
+connection lost
+      |
+      v
+retain <filename>.part
+      |
+      v
+offer verified resume on next matching transfer
+```
 
-Hashing happens during streaming.
+Explicit cancellation:
+
+```text
+CANCEL
+  |
+  v
+remove .part
+```
+
+Integrity or protocol failure:
+
+```text
+invalid state
+     |
+     v
+remove .part
+```
+
+When a new OFFER arrives and an existing partial file is usable:
+
+1. the receiver reads its current length;
+2. the receiver hashes the retained bytes;
+3. the receiver sends RESUME with the byte offset and BLAKE3 prefix digest.
+
+A zero-length `.part` provides no useful resume state and is discarded before starting a fresh transfer.
+
+A `.part` larger than the file size announced in OFFER is impossible as a valid prefix and is discarded before starting a fresh transfer.
+
+## 18. BLAKE3 integrity and resume
+
+Fresh transfers hash the file while streaming.
 
 Sender:
 
@@ -464,9 +648,85 @@ chunk --------> File
  +------------> BLAKE3
 ```
 
-This avoids performing a second full-file read solely for integrity verification.
+A resumed transfer additionally rebuilds BLAKE3 state from the retained prefix.
 
-## 17. Discovery model
+Receiver:
+
+```text
+existing .part
+      |
+      v
+read prefix
+      |
+      +------> BLAKE3 state
+      |
+      +------> RESUME prefix digest
+```
+
+Sender:
+
+```text
+source prefix
+      |
+      v
+read locally
+      |
+      +------> BLAKE3 state
+      |
+      +------> compare with RESUME digest
+```
+
+If the prefix digests match, both peers retain their BLAKE3 state and continue feeding only the remaining bytes into the same logical file digest.
+
+Conceptually:
+
+```text
+BLAKE3(prefix)
+      |
+      v
+continue with suffix
+      |
+      v
+BLAKE3(complete file)
+```
+
+The already validated prefix is read locally to rebuild hash state but is not retransmitted over the network.
+
+The current implementation therefore avoids a second complete-file pre-hash before starting a normal transfer while still supporting verified resume.
+
+Future optimizations may persist hash checkpoints so very large retained prefixes do not need to be fully re-read on each resume attempt.
+
+## 19. Resume safety properties
+
+WFP/0.1 does not trust a partial file based only on:
+
+- filename;
+- announced file size;
+- partial length.
+
+Two different files may have the same filename and size.
+
+Resume therefore verifies the exact retained prefix using BLAKE3 before accepting continuation.
+
+For a proposed offset `X`:
+
+```text
+Receiver:
+BLAKE3(receiver .part bytes 0..X)
+
+Sender:
+BLAKE3(source bytes 0..X)
+```
+
+Continuation is accepted only when those digests match.
+
+A mismatch causes RESTART rather than blind continuation.
+
+The final COMPLETE / VERIFIED exchange still verifies the complete resulting file.
+
+Resume verification provides integrity of the retained prefix, but it does not provide peer authentication or protection against a malicious network peer.
+
+## 20. Discovery model
 
 WarpFile discovery uses WFP frames over UDP.
 
@@ -494,7 +754,7 @@ Discoverer                                  Receiver
     |                                          |
 ```
 
-## 18. DISCOVER
+## 21. DISCOVER
 
 Message type:
 
@@ -512,7 +772,7 @@ A valid DISCOVER frame asks another host whether a WarpFile receiver is availabl
 
 Malformed frames, non-DISCOVER frames and DISCOVER frames with non-empty payloads are ignored by the discovery responder.
 
-## 19. ANNOUNCE
+## 22. ANNOUNCE
 
 Message type:
 
@@ -568,13 +828,13 @@ Example:
 100.68.8.15:42069
 ```
 
-## 20. Discovery providers
+## 23. Discovery providers
 
 The WFP discovery messages are independent from the mechanism used to find candidate IP addresses.
 
 The current reference implementation uses two candidate providers.
 
-### 20.1 Local network discovery
+### 23.1 Local network discovery
 
 WarpFile enumerates local IPv4 interfaces and calculates directed broadcast addresses from each address and subnet mask.
 
@@ -584,7 +844,7 @@ Loopback, unspecified, link-local and `/32` addresses are not used as broadcast 
 
 Responses originating from the local machine are filtered to avoid self-discovery.
 
-### 20.2 Tailscale-assisted discovery
+### 23.2 Tailscale-assisted discovery
 
 When the `tailscale` CLI is available, WarpFile reads online Tailscale peers and treats their IPv4 addresses as discovery candidates.
 
@@ -596,7 +856,7 @@ Only a peer that responds with a valid WFP ANNOUNCE becomes a discovered WarpFil
 
 Tailscale is optional. WarpFile continues to operate without it.
 
-## 21. Device-name resolution
+## 24. Device-name resolution
 
 The CLI may use a discovered device name instead of an explicit socket address.
 
@@ -620,7 +880,7 @@ If multiple discovered devices have the same name, the current implementation re
 
 Automatic route selection is planned for future work.
 
-## 22. Default ports
+## 25. Default ports
 
 Current development defaults:
 
@@ -633,7 +893,7 @@ These ports are implementation defaults and are not permanently reserved protoco
 
 They may change before stable release.
 
-## 23. Security
+## 26. Security
 
 WFP/0.1 currently provides:
 
@@ -645,26 +905,31 @@ Network input must be treated as untrusted.
 
 The current version should only be used in trusted development environments or over a trusted network layer.
 
+Resume prefix hashes are integrity checks, not authentication.
+
 Future security work will use established cryptographic algorithms and libraries.
 
 WarpFile will not invent custom cryptographic primitives.
 
-## 24. Resume status
+## 27. Current resume limitations
 
-WFP/0.1 does **not** currently support resumable transfers.
+The current verified resume design intentionally remains simple.
 
-If a transfer is interrupted, the current receiver removes the incomplete `.part` file.
+Current limitations include:
 
-A future reliability milestone will introduce:
+- no automatic reconnect loop in the sender;
+- no persistent sender-side transfer database;
+- no persisted BLAKE3 hash checkpoints;
+- retained prefixes must currently be re-read locally to rebuild BLAKE3 state;
+- one file is still transferred per TCP connection;
+- resume state is based on the receiver's `.part` file rather than a multi-file transfer manifest.
 
-- retained partial-file state;
-- validation of resumable partial data;
-- safe resume offsets;
-- sender seeking;
-- continued integrity verification.
+These limitations affect performance and orchestration, not the integrity requirement for an accepted resume offset.
 
-## 25. Compatibility
+## 28. Compatibility
 
 WFP/0.1 is experimental.
+
+The addition and behavior of RESUME and RESTART are part of the current experimental WFP/0.1 development state.
 
 No backward compatibility guarantee exists before a stable protocol release.

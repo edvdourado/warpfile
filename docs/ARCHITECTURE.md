@@ -1,7 +1,7 @@
 # WarpFile Architecture
 
 **Status:** Experimental
-**Reference release:** `0.1.0-alpha.1`
+**Reference state:** development after `0.1.0-alpha.1`
 
 This document describes the current architecture of the WarpFile reference implementation.
 
@@ -15,7 +15,8 @@ WarpFile should remain:
 - streaming-oriented;
 - memory-efficient;
 - testable;
-- transport-extensible.
+- transport-extensible;
+- recoverable after connection loss.
 
 A central design principle is separation of responsibilities.
 
@@ -24,6 +25,8 @@ File-transfer code should not need to know how a peer address was discovered.
 Discovery code should not implement file-transfer semantics.
 
 Protocol encoding should remain separate from CLI behavior.
+
+Resume behavior should be an explicit WFP protocol feature rather than an implicit filesystem shortcut.
 
 ## 2. Current high-level architecture
 
@@ -59,33 +62,46 @@ Protocol encoding should remain separate from CLI behavior.
              file transfer     discovery
 ```
 
+The transfer layer operates on a concrete socket address.
+
+It does not need to know whether that address came from:
+
+- explicit user input;
+- LAN discovery;
+- Tailscale-assisted discovery;
+- a future connectivity provider.
+
 ## 3. Current source layout
 
 ```text
 src/
-├── main.rs
-├── lib.rs
-├── destination.rs
-├── discovery.rs
-├── progress.rs
-├── receiver.rs
-├── sender.rs
-├── tailscale.rs
-└── protocol/
-    ├── mod.rs
-    ├── frame.rs
-    ├── message.rs
-    ├── encoder.rs
-    ├── decoder.rs
-    ├── io.rs
-    ├── offer.rs
-    ├── reject.rs
-    └── discovery.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ main.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ lib.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ destination.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ discovery.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ progress.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ receiver.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ sender.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ tailscale.rs
+Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ protocol/
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ mod.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ frame.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ message.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ encoder.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ decoder.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ io.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ offer.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ reject.rs
+    Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ resume.rs
+    Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ discovery.rs
 
 tests/
-├── discovery_e2e.rs
-├── receiver_persistent_e2e.rs
-└── transfer_e2e.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ discovery_e2e.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ receiver_persistent_e2e.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ resume_receiver_edge_e2e.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ resume_recovery_e2e.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ resume_sender_e2e.rs
+Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ transfer_e2e.rs
 ```
 
 ## 4. `main.rs`
@@ -187,7 +203,7 @@ when the Tailscale CLI is available.
 
 It extracts online IPv4 peer addresses.
 
-Those addresses are treated only as **candidate discovery targets**.
+Those addresses are treated only as candidate discovery targets.
 
 ```text
 Tailscale peer
@@ -217,22 +233,125 @@ Responsibilities include:
 - connect to the destination;
 - perform HELLO / HELLO_ACK negotiation;
 - send OFFER;
-- handle ACCEPT or structured REJECT;
-- stream file data;
+- handle ACCEPT, REJECT or RESUME;
+- validate resumable prefixes;
+- send ACCEPT when a proposed resume state is valid;
+- send RESTART when a proposed resume state is unusable;
+- stream only missing file data after an accepted resume;
 - update BLAKE3 incrementally;
 - update progress reporting;
 - send CANCEL after user interruption;
 - send COMPLETE;
 - wait for VERIFIED.
 
-The sender does not need to know whether the destination came from:
+### 8.1 Fresh transfer
 
-- an explicit IP address;
-- LAN discovery;
-- Tailscale-assisted discovery;
-- a future connectivity provider.
+For a fresh transfer:
 
-This separation is important for future automatic path selection.
+```text
+OFFER
+  |
+  v
+ACCEPT
+  |
+  v
+read source from byte 0
+  |
+  +----> BLAKE3
+  |
+  +----> DATA
+```
+
+### 8.2 Resume negotiation
+
+When the receiver sends RESUME:
+
+```text
+RESUME
+  |
+  +-- offset
+  |
+  +-- BLAKE3 prefix digest
+```
+
+the sender reads exactly the requested source prefix.
+
+Example:
+
+```text
+source file
+
+0 ---------------- X ---------------- total
+        local read
+```
+
+The sender updates a BLAKE3 hasher while reading that prefix.
+
+It then compares:
+
+```text
+BLAKE3(local source bytes 0..X)
+
+vs
+
+BLAKE3(receiver .part bytes 0..X)
+```
+
+If they match:
+
+```text
+send ACCEPT
+     |
+     v
+continue reading at X
+     |
+     +----> DATA
+     |
+     +----> same BLAKE3 state
+```
+
+No explicit seek is required in the current implementation because reading the prefix naturally leaves the file cursor at the requested offset.
+
+If the hashes differ:
+
+```text
+send RESTART
+     |
+     v
+wait for receiver ACCEPT
+     |
+     v
+reopen source file
+     |
+     v
+start from byte 0
+```
+
+The sender also sends RESTART if the receiver proposes an offset beyond the source file size.
+
+### 8.3 Resume and network traffic
+
+A validated prefix is read locally but is not retransmitted.
+
+For example:
+
+```text
+file size:      400,000 bytes
+resume offset:  123,457 bytes
+
+network DATA after resume:
+
+400,000 - 123,457
+= 276,543 bytes
+```
+
+If the receiver already has the complete correct file contents in `.part`:
+
+```text
+resume offset == file size
+```
+
+then the sender may send zero DATA bytes and proceed directly to COMPLETE after validating the full prefix.
 
 ## 9. `receiver.rs`
 
@@ -266,17 +385,160 @@ Responsibilities include:
 - perform WFP negotiation;
 - validate incoming filenames;
 - reject unsafe or conflicting destinations;
-- create `.part` files;
+- inspect existing `.part` files;
+- classify partial state as fresh, resumable or unusable;
+- rebuild BLAKE3 state from retained prefixes;
+- send RESUME with offset and prefix digest;
+- handle ACCEPT, RESTART and CANCEL during resume negotiation;
+- append new DATA after an accepted resume;
 - receive DATA frames;
 - update BLAKE3 incrementally;
-- verify size and hash;
-- atomically promote the partial file after validation;
-- clean partial files after current failure cases;
+- verify final size and hash;
+- promote the partial file after validation;
+- preserve partial data after recoverable connection loss;
+- remove partial data after cancellation or invalid transfer state;
 - return to the accept loop after a client error.
 
 A failed client transfer therefore does not terminate the whole receiver process.
 
-## 10. Discovery and receiver concurrency
+## 10. Partial-file state machine
+
+Incoming files use:
+
+```text
+filename.part
+```
+
+The receiver never exposes the final filename before complete size and BLAKE3 verification.
+
+Conceptually:
+
+```text
+                     OFFER
+                       |
+                       v
+              final file exists?
+                 /          \
+               yes          no
+                |            |
+             REJECT          v
+                         .part exists?
+                         /          \
+                       no           yes
+                       |             |
+                       v             v
+                 fresh transfer   inspect size
+                                     |
+                         +-----------+-----------+
+                         |                       |
+                      usable                 unusable
+                         |                       |
+                         v                       v
+                    hash .part              discard .part
+                         |                       |
+                         v                       v
+                     RESUME                fresh ACCEPT
+```
+
+A partial file is currently considered unusable if:
+
+```text
+partial size == 0
+```
+
+or:
+
+```text
+partial size > announced file size
+```
+
+A non-empty partial file no larger than the announced file is proposed to the sender through RESUME.
+
+The sender is responsible for validating that the retained bytes actually match its source file.
+
+## 11. Recoverable connection loss
+
+Unexpected connection loss is treated differently from explicit cancellation.
+
+Recoverable network failure:
+
+```text
+DATA received
+     |
+     v
+connection disappears
+     |
+     v
+preserve .part
+```
+
+The current implementation recognizes selected underlying I/O failures as recoverable connection loss.
+
+The preserved file becomes a resume candidate on a later transfer attempt.
+
+This does not mean it is automatically trusted.
+
+The prefix must still pass BLAKE3 verification against the sender's current source file.
+
+## 12. Explicit cancellation
+
+During an active send, the sender listens for `Ctrl+C`.
+
+When cancellation is requested:
+
+```text
+Ctrl+C
+  |
+  v
+finish current frame boundary
+  |
+  v
+send CANCEL
+  |
+  v
+sender exits
+```
+
+The implementation avoids intentionally interrupting a DATA frame halfway through writing it to the TCP stream.
+
+The receiver handles CANCEL as an explicit abort and removes the current `.part`.
+
+Therefore:
+
+```text
+connection loss
+Ã¢â€ â€™ retain partial
+
+CANCEL
+Ã¢â€ â€™ remove partial
+```
+
+This distinction is intentional.
+
+## 13. Invalid transfer state
+
+Partial state is not retained after failures that make the data untrustworthy.
+
+Examples include:
+
+- invalid final BLAKE3 digest;
+- impossible received size;
+- malformed transfer protocol state;
+- invalid CANCEL payload;
+- unexpected WFP message during transfer.
+
+Conceptually:
+
+```text
+suspicious / invalid state
+          |
+          v
+      remove .part
+```
+
+Resume should recover network interruption, not preserve known-invalid data.
+
+## 14. Discovery and receiver concurrency
 
 A running receiver serves two independent functions:
 
@@ -292,7 +554,9 @@ The receiver orchestration keeps both active.
 
 This allows a receiver to remain discoverable while waiting for or processing sequential file transfers.
 
-## 11. `progress.rs`
+Transfer sessions are currently processed sequentially rather than concurrently.
+
+## 15. `progress.rs`
 
 `progress.rs` provides transfer progress output.
 
@@ -308,20 +572,23 @@ Progress rendering is throttled rather than redrawn on every transferred chunk.
 
 It also ensures an interrupted progress line is terminated cleanly before error text is printed.
 
-## 12. Protocol module
+For a resumed transfer, the current sender and receiver progress trackers operate on the remaining transfer portion rather than pretending that already retained bytes are being transferred again.
+
+## 16. Protocol module
 
 The `protocol` directory contains WFP-specific encoding and validation.
 
 ```text
 protocol/
-├── frame.rs
-├── message.rs
-├── encoder.rs
-├── decoder.rs
-├── io.rs
-├── offer.rs
-├── reject.rs
-└── discovery.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ frame.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ message.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ encoder.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ decoder.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ io.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ offer.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ reject.rs
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ resume.rs
+Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ discovery.rs
 ```
 
 ### `frame.rs`
@@ -355,15 +622,23 @@ Current message types:
 ```text
 HELLO
 HELLO_ACK
+
 OFFER
 ACCEPT
 REJECT
+RESUME
+RESTART
+
 DATA
+
 COMPLETE
 VERIFIED
+
 CANCEL
+
 DISCOVER
 ANNOUNCE
+
 ERROR
 ```
 
@@ -414,6 +689,14 @@ exact payload bytes
 
 before returning one complete frame.
 
+It preserves the distinction between:
+
+- underlying I/O failures;
+- frame decoding failures;
+- frame encoding failures.
+
+That distinction is useful when deciding whether an interrupted partial transfer may be retained.
+
 ### `offer.rs`
 
 Encodes and decodes OFFER payloads:
@@ -436,6 +719,33 @@ UNSAFE_FILENAME
 CANNOT_PREPARE_DESTINATION
 ```
 
+### `resume.rs`
+
+Encodes and decodes RESUME payloads.
+
+Current structure:
+
+```text
+ResumeRequest {
+    offset: u64,
+    prefix_hash: [u8; 32]
+}
+```
+
+Wire payload:
+
+```text
+8-byte big-endian offset
++
+32-byte BLAKE3 prefix digest
+=
+40 bytes
+```
+
+The protocol represents resume positions as byte offsets rather than chunk numbers.
+
+This keeps resume independent from current or future DATA chunk sizing.
+
 ### `discovery.rs`
 
 Encodes and decodes ANNOUNCE payloads.
@@ -449,7 +759,7 @@ TCP transfer port
 
 DISCOVER itself uses an empty payload.
 
-## 13. Streaming model
+## 17. Streaming model
 
 WarpFile must not load complete files into memory.
 
@@ -473,13 +783,15 @@ File
  +-- ...
 ```
 
-Memory usage should therefore remain roughly bounded regardless of total file size.
+Memory use therefore remains approximately bounded with respect to transfer size.
 
 A very large file should not require memory proportional to its total size.
 
-## 14. Integrity model
+## 18. Integrity model
 
-BLAKE3 is updated during streaming.
+BLAKE3 is the current file-integrity mechanism.
+
+For a fresh transfer:
 
 Sender:
 
@@ -499,57 +811,105 @@ Network --> chunk ------+
 
 The final digest is transferred in COMPLETE.
 
-The receiver sends VERIFIED only when its independently calculated digest matches.
+The receiver sends VERIFIED only when its independently calculated digest matches and the byte count is correct.
 
-## 15. Partial files
+## 19. Resume integrity model
 
-Incoming files use a temporary path:
+Resume requires both peers to reconstruct hash state for the retained prefix.
+
+Receiver:
 
 ```text
 filename.part
+      |
+      v
+read retained prefix
+      |
+      +----> BLAKE3 state
+      |
+      +----> prefix digest in RESUME
 ```
 
-The final destination name does not appear until verification succeeds.
-
-Current behavior:
+Sender:
 
 ```text
-receive DATA
-    |
-    v
-filename.part
-    |
-    +-- failure ------> remove
-    |
-    +-- verified -----> rename to filename
+source file
+      |
+      v
+read same prefix
+      |
+      +----> BLAKE3 state
+      |
+      +----> compare digest
 ```
 
-Resume support will intentionally change part of this model by retaining validated partial data across recoverable interruptions.
-
-## 16. Cancellation
-
-During an active send, the sender listens for `Ctrl+C`.
-
-When cancellation is requested:
+If equal:
 
 ```text
-Ctrl+C
-  |
-  v
-finish current frame boundary
-  |
-  v
-send CANCEL
-  |
-  v
-sender exits
+prefix BLAKE3 state
+        |
+        v
+continue with new DATA
+        |
+        v
+complete-file BLAKE3
 ```
 
-The implementation avoids interrupting a DATA frame halfway through writing it to the TCP stream.
+This provides two integrity checks:
 
-The receiver handles CANCEL as an explicit interrupted transfer and cleans the current partial file.
+```text
+resume stage:
+verify retained prefix
 
-## 17. Testing strategy
+completion stage:
+verify complete resulting file
+```
+
+Filename, file size and partial length alone are not sufficient proof that a `.part` belongs to the current source file.
+
+## 20. Resume performance model
+
+The current design avoids retransmitting validated network data but does require local rereads of retained prefixes.
+
+Example:
+
+```text
+100 GiB file
+8 GiB retained .part
+```
+
+Current resume requires:
+
+Receiver:
+
+```text
+read/hash 8 GiB locally
+```
+
+Sender:
+
+```text
+read/hash 8 GiB locally
+```
+
+Network:
+
+```text
+transmit only remaining 92 GiB
+```
+
+This is intentionally correct before being maximally optimized.
+
+Future improvements may persist:
+
+- BLAKE3 checkpoints;
+- chunk hashes;
+- transfer metadata;
+- manifests.
+
+Those could reduce the amount of retained prefix that must be reread locally.
+
+## 21. Testing strategy
 
 WarpFile uses both unit and end-to-end tests.
 
@@ -560,6 +920,7 @@ Unit tests cover components such as:
 - payload validation;
 - offer parsing;
 - rejection parsing;
+- resume payload encoding and decoding;
 - discovery announcements;
 - interface broadcast calculations;
 - Tailscale JSON parsing;
@@ -573,15 +934,73 @@ Current E2E coverage includes:
 - complete file transfer;
 - empty files;
 - destination conflicts;
-- sender disconnects;
+- unexpected sender disconnection;
+- retained partial files;
 - corrupted hashes;
 - explicit cancellation;
 - UDP discovery;
-- multiple sequential transfers through a persistent receiver.
+- multiple sequential transfers through a persistent receiver;
+- receiver-generated RESUME negotiation;
+- sender validation of resume prefixes;
+- RESTART after mismatched prefixes;
+- transfer of only the missing suffix;
+- complete `.part` state with zero DATA retransmission;
+- recovery after a real TCP connection loss;
+- empty partial state;
+- oversized impossible partial state;
+- real sender and real receiver resume flow.
 
-This is intentional: protocol code is tested both as isolated logic and as actual asynchronous network behavior.
+The current suite contains 72 passing tests at the time this architecture state was documented.
 
-## 18. Async runtime
+## 22. Resume recovery test model
+
+One important integration test does not fabricate the receiver's `.part` file manually.
+
+Instead:
+
+```text
+first TCP connection
+      |
+      v
+real receiver
+      |
+      v
+receive 123,457 bytes
+      |
+      v
+connection disappears
+      |
+      v
+.part survives
+```
+
+Then:
+
+```text
+second TCP connection
+      |
+      v
+real run_sender()
+      |
+      v
+real receiver
+      |
+      v
+RESUME
+      |
+      v
+prefix verification
+      |
+      v
+only missing suffix transferred
+      |
+      v
+VERIFIED
+```
+
+Using an offset that is not aligned to 64 KiB demonstrates that resume is byte-position based rather than chunk-number based.
+
+## 23. Async runtime
 
 WarpFile uses Tokio.
 
@@ -599,7 +1018,7 @@ The current receiver handles sequential file transfers rather than simultaneous 
 
 Correctness currently takes priority over maximum throughput.
 
-## 19. Platform independence
+## 24. Platform independence
 
 Core transfer and WFP logic should avoid unnecessary operating-system-specific behavior.
 
@@ -611,7 +1030,7 @@ Platform-specific connectivity integrations should remain isolated behind dedica
 
 Tailscale integration is one example.
 
-## 20. Security boundaries
+## 25. Security boundaries
 
 All network input is untrusted.
 
@@ -625,14 +1044,20 @@ The implementation validates:
 - UTF-8 fields;
 - filename safety;
 - announced file sizes;
+- resume offsets;
+- resume prefix hashes;
 - actual received byte count;
-- BLAKE3 integrity.
+- final BLAKE3 integrity.
 
 Sender-provided filesystem paths are never accepted as destination paths.
 
 WFP/0.1 currently does not provide encryption or authenticated peer identity.
 
-## 21. Route selection
+Resume hashes prove content equality for a prefix.
+
+They do not prove peer identity and are not a replacement for authentication.
+
+## 26. Route selection
 
 WarpFile can currently discover the same conceptual machine through different connectivity paths.
 
@@ -658,52 +1083,51 @@ Future route selection may evaluate:
 
 The selection mechanism should be based on measured or meaningful connectivity information rather than hard-coded assumptions.
 
-## 22. Future resume architecture
+## 27. Current resume limitations
 
-The next major reliability milestone is resumable transfer.
+Resume is functional, but the current implementation intentionally remains simple.
 
-Current behavior:
+Current limitations include:
+
+- no automatic reconnect loop;
+- no automatic retry scheduler;
+- no persistent sender-side transfer database;
+- no persistent transfer identity;
+- no BLAKE3 checkpoint cache;
+- retained prefixes are reread to rebuild hash state;
+- one file per TCP transfer session;
+- no directory-transfer manifest;
+- sequential rather than concurrent receiver sessions.
+
+A user currently retries a failed transfer by invoking the send operation again.
+
+The receiver then proposes the retained state through RESUME.
+
+## 28. Future reliability work
+
+Possible next reliability improvements include:
 
 ```text
-disconnect
-    |
-    v
-delete .part
-    |
-    v
-restart from byte 0
+automatic reconnect
+        |
+        v
+retry policy
+        |
+        v
+persistent transfer metadata
+        |
+        v
+hash checkpoints
+        |
+        v
+improved chunk management
 ```
 
-Future target behavior:
+Directory transfers will require additional design because a directory is a collection of multiple file states rather than one byte stream.
 
-```text
-disconnect
-    |
-    v
-retain validated partial state
-    |
-    v
-reconnect
-    |
-    v
-negotiate safe offset
-    |
-    v
-continue missing data
-```
+Resume should remain protocol-driven and explicitly testable.
 
-This will require coordinated changes to:
-
-- WFP messages;
-- partial-file persistence;
-- sender file seeking;
-- hash state strategy;
-- safe chunk boundaries;
-- failure classification.
-
-It should be implemented as an explicit protocol feature rather than as an implicit filesystem trick.
-
-## 23. Future WorldLink integration
+## 29. Future WorldLink integration
 
 WarpFile is intentionally being built before WorldLink.
 
@@ -731,7 +1155,7 @@ Potential functionality that may eventually be extracted includes:
 
 File-transfer semantics remain WarpFile responsibilities.
 
-## 24. Engineering principle
+## 30. Engineering principle
 
 WarpFile prefers:
 

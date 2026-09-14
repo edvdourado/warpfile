@@ -88,6 +88,82 @@ async fn sender_accepts_matching_resume_and_sends_only_suffix() {
 }
 
 #[tokio::test]
+async fn sender_sends_no_data_when_receiver_already_has_full_file() {
+    let temp = tempdir().unwrap();
+
+    let source_directory = temp.path().join("source");
+
+    fs::create_dir_all(&source_directory).unwrap();
+
+    let source_path = source_directory.join("complete-partial.bin");
+
+    let original_data: Vec<u8> = (0..200_000)
+        .map(|index| ((index * 19) % 251) as u8)
+        .collect();
+
+    fs::write(&source_path, &original_data).unwrap();
+
+    let full_hash = blake3::hash(&original_data);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let address = listener.local_addr().unwrap();
+
+    let address_string = address.to_string();
+
+    let source_path_string = source_path.to_string_lossy().into_owned();
+
+    let fake_receiver = async {
+        let (mut stream, _peer) = listener.accept().await.unwrap();
+
+        receive_sender_handshake(&mut stream).await;
+
+        let offer = receive_offer(&mut stream).await;
+
+        assert_eq!(offer.filename, "complete-partial.bin");
+
+        assert_eq!(offer.file_size, original_data.len() as u64);
+
+        let request = ResumeRequest {
+            offset: original_data.len() as u64,
+
+            prefix_hash: *full_hash.as_bytes(),
+        };
+
+        let resume = Frame::new(MessageType::Resume, encode_resume(&request));
+
+        write_frame(&mut stream, &resume).await.unwrap();
+
+        let accept = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(accept.message_type, MessageType::Accept);
+
+        assert!(accept.payload.is_empty());
+
+        let (transferred, complete_hash) = receive_transfer_frames(&mut stream).await;
+
+        assert!(
+            transferred.is_empty(),
+            "sender retransmitted file content even though the receiver already had every byte"
+        );
+
+        assert_eq!(complete_hash, full_hash.as_bytes().to_vec());
+
+        send_verified(&mut stream).await;
+    };
+
+    let sender = run_sender(&source_path_string, &address_string);
+
+    let (_, sender_result) = tokio::join!(fake_receiver, sender);
+
+    assert!(
+        sender_result.is_ok(),
+        "sender failed full-file resume: {:?}",
+        sender_result.err()
+    );
+}
+
+#[tokio::test]
 async fn sender_restarts_when_resume_prefix_does_not_match() {
     let temp = tempdir().unwrap();
 

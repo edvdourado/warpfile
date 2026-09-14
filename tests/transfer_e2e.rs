@@ -4,7 +4,9 @@ use tempfile::tempdir;
 use tokio::net::{TcpListener, TcpStream};
 
 use warpfile::protocol::frame::WFP_VERSION;
-use warpfile::protocol::{FileOffer, Frame, MessageType, encode_offer, read_frame, write_frame};
+use warpfile::protocol::{
+    FileOffer, Frame, MessageType, decode_resume, encode_offer, read_frame, write_frame,
+};
 
 use warpfile::receiver::receive_once;
 use warpfile::sender::run_sender;
@@ -363,6 +365,179 @@ async fn removes_partial_file_when_sender_cancels() {
     );
 }
 
+#[tokio::test]
+async fn resumes_existing_partial_when_sender_accepts_resume() {
+    let temp = tempdir().unwrap();
+
+    let destination_directory = temp.path().join("received");
+
+    fs::create_dir_all(&destination_directory).unwrap();
+
+    let partial_path = destination_directory.join("resumable.bin.part");
+
+    let prefix = vec![0x11; 4096];
+
+    let suffix = vec![0x22; 6000];
+
+    let mut complete_data = prefix.clone();
+
+    complete_data.extend_from_slice(&suffix);
+
+    fs::write(&partial_path, &prefix).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let address = listener.local_addr().unwrap();
+
+    let receiver = receive_once(listener, &destination_directory);
+
+    let fake_sender = async {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+
+        perform_handshake(&mut stream).await;
+
+        send_offer(&mut stream, "resumable.bin", complete_data.len() as u64).await;
+
+        let resume_frame = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(resume_frame.message_type, MessageType::Resume);
+
+        let resume = decode_resume(&resume_frame.payload).unwrap();
+
+        assert_eq!(resume.offset, prefix.len() as u64);
+
+        assert_eq!(resume.prefix_hash, *blake3::hash(&prefix).as_bytes());
+
+        let accept = Frame::new(MessageType::Accept, Vec::new());
+
+        write_frame(&mut stream, &accept).await.unwrap();
+
+        let data = Frame::new(MessageType::Data, suffix.clone());
+
+        write_frame(&mut stream, &data).await.unwrap();
+
+        let digest = blake3::hash(&complete_data);
+
+        let complete = Frame::new(MessageType::Complete, digest.as_bytes().to_vec());
+
+        write_frame(&mut stream, &complete).await.unwrap();
+
+        let verified = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(verified.message_type, MessageType::Verified);
+
+        assert!(verified.payload.is_empty());
+    };
+
+    let (receiver_result, _) = tokio::join!(receiver, fake_sender);
+
+    assert!(
+        receiver_result.is_ok(),
+        "receiver failed to resume: {:?}",
+        receiver_result.err()
+    );
+
+    let final_path = destination_directory.join("resumable.bin");
+
+    let received = fs::read(final_path).unwrap();
+
+    assert_eq!(received, complete_data);
+
+    assert!(
+        !partial_path.exists(),
+        "partial file remained after successful resumed transfer"
+    );
+}
+
+#[tokio::test]
+async fn restarts_from_zero_when_sender_rejects_resume() {
+    let temp = tempdir().unwrap();
+
+    let destination_directory = temp.path().join("received");
+
+    fs::create_dir_all(&destination_directory).unwrap();
+
+    let partial_path = destination_directory.join("restart.bin.part");
+
+    let stale_partial = vec![0xAA; 4096];
+
+    fs::write(&partial_path, &stale_partial).unwrap();
+
+    let new_data: Vec<u8> = (0..10_000).map(|index| (index % 251) as u8).collect();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let address = listener.local_addr().unwrap();
+
+    let receiver = receive_once(listener, &destination_directory);
+
+    let fake_sender = async {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+
+        perform_handshake(&mut stream).await;
+
+        send_offer(&mut stream, "restart.bin", new_data.len() as u64).await;
+
+        let resume_frame = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(resume_frame.message_type, MessageType::Resume);
+
+        let resume = decode_resume(&resume_frame.payload).unwrap();
+
+        assert_eq!(resume.offset, stale_partial.len() as u64);
+
+        assert_eq!(
+            resume.prefix_hash,
+            *blake3::hash(&stale_partial,).as_bytes()
+        );
+
+        let restart = Frame::new(MessageType::Restart, Vec::new());
+
+        write_frame(&mut stream, &restart).await.unwrap();
+
+        let accept = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(accept.message_type, MessageType::Accept);
+
+        assert!(accept.payload.is_empty());
+
+        let data = Frame::new(MessageType::Data, new_data.clone());
+
+        write_frame(&mut stream, &data).await.unwrap();
+
+        let digest = blake3::hash(&new_data);
+
+        let complete = Frame::new(MessageType::Complete, digest.as_bytes().to_vec());
+
+        write_frame(&mut stream, &complete).await.unwrap();
+
+        let verified = read_frame(&mut stream).await.unwrap();
+
+        assert_eq!(verified.message_type, MessageType::Verified);
+
+        assert!(verified.payload.is_empty());
+    };
+
+    let (receiver_result, _) = tokio::join!(receiver, fake_sender);
+
+    assert!(
+        receiver_result.is_ok(),
+        "receiver failed after RESTART: {:?}",
+        receiver_result.err()
+    );
+
+    let final_path = destination_directory.join("restart.bin");
+
+    let received = fs::read(final_path).unwrap();
+
+    assert_eq!(received, new_data);
+
+    assert!(
+        !partial_path.exists(),
+        "stale partial remained after restarted transfer"
+    );
+}
+
 async fn perform_handshake(stream: &mut TcpStream) {
     let hello = Frame::new(MessageType::Hello, vec![WFP_VERSION]);
 
@@ -375,7 +550,7 @@ async fn perform_handshake(stream: &mut TcpStream) {
     assert_eq!(hello_ack.payload, vec![WFP_VERSION]);
 }
 
-async fn send_offer_and_wait_for_accept(stream: &mut TcpStream, filename: &str, file_size: u64) {
+async fn send_offer(stream: &mut TcpStream, filename: &str, file_size: u64) {
     let offer = FileOffer {
         filename: filename.to_string(),
         file_size,
@@ -386,6 +561,10 @@ async fn send_offer_and_wait_for_accept(stream: &mut TcpStream, filename: &str, 
     let offer_frame = Frame::new(MessageType::Offer, offer_payload);
 
     write_frame(stream, &offer_frame).await.unwrap();
+}
+
+async fn send_offer_and_wait_for_accept(stream: &mut TcpStream, filename: &str, file_size: u64) {
+    send_offer(stream, filename, file_size).await;
 
     let accept = read_frame(stream).await.unwrap();
 

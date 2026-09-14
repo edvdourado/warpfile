@@ -5,16 +5,22 @@ use std::path::{Component, Path};
 
 use tokio::fs;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::discovery::{DISCOVERY_PORT, local_device_name, run_discovery_responder};
 use crate::progress::ProgressTracker;
-use crate::protocol::frame::WFP_VERSION;
+use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
 use crate::protocol::{
-    FileReject, Frame, MessageType, ProtocolIoError, RejectCode, decode_offer, encode_reject,
-    read_frame, write_frame,
+    FileReject, Frame, MessageType, ProtocolIoError, RejectCode, ResumeRequest, decode_offer,
+    encode_reject, encode_resume, read_frame, write_frame,
 };
+
+struct PreparedTransfer {
+    output: fs::File,
+    bytes_received: u64,
+    hasher: blake3::Hasher,
+}
 
 pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
     println!("WarpFile Receiver");
@@ -153,52 +159,16 @@ async fn receive_connection(
         .into());
     }
 
-    if fs::try_exists(&partial_destination).await? {
-        if let Err(error) = fs::remove_file(&partial_destination).await {
-            send_reject(
-                &mut stream,
-                RejectCode::CannotPrepareDestination,
-                "receiver could not remove an old partial file",
-            )
-            .await?;
+    let prepared = prepare_transfer(&mut stream, &partial_destination, offer.file_size).await?;
 
-            return Err(error.into());
-        }
-    }
-
-    let output = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&partial_destination)
-        .await
-    {
-        Ok(file) => file,
-
-        Err(error) => {
-            send_reject(
-                &mut stream,
-                RejectCode::CannotPrepareDestination,
-                "receiver could not create the destination file",
-            )
-            .await?;
-
-            return Err(error.into());
-        }
-    };
-
-    let accept = Frame::new(MessageType::Accept, Vec::new());
-
-    if let Err(error) = write_frame(&mut stream, &accept).await {
-        drop(output);
-
-        let _ = fs::remove_file(&partial_destination).await;
-
-        return Err(error.into());
-    }
-
-    println!("Sent ACCEPT");
-
-    let transfer_result = receive_file_data(&mut stream, output, offer.file_size).await;
+    let transfer_result = receive_file_data(
+        &mut stream,
+        prepared.output,
+        offer.file_size,
+        prepared.bytes_received,
+        prepared.hasher,
+    )
+    .await;
 
     let bytes_received = match transfer_result {
         Ok(bytes_received) => bytes_received,
@@ -243,16 +213,303 @@ async fn receive_connection(
     Ok(())
 }
 
+async fn prepare_transfer(
+    stream: &mut TcpStream,
+    partial_destination: &Path,
+    expected_size: u64,
+) -> Result<PreparedTransfer, Box<dyn Error>> {
+    if !fs::try_exists(partial_destination).await? {
+        return prepare_fresh_transfer(stream, partial_destination).await;
+    }
+
+    let metadata = match fs::metadata(partial_destination).await {
+        Ok(metadata) => metadata,
+
+        Err(error) => {
+            send_reject(
+                stream,
+                RejectCode::CannotPrepareDestination,
+                "receiver could not inspect the partial file",
+            )
+            .await?;
+
+            return Err(error.into());
+        }
+    };
+
+    if !metadata.is_file() {
+        send_reject(
+            stream,
+            RejectCode::CannotPrepareDestination,
+            "partial destination is not a regular file",
+        )
+        .await?;
+
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial destination is not a regular file",
+        )
+        .into());
+    }
+
+    let partial_size = metadata.len();
+
+    if partial_size == 0 || partial_size > expected_size {
+        if let Err(error) = fs::remove_file(partial_destination).await {
+            send_reject(
+                stream,
+                RejectCode::CannotPrepareDestination,
+                "receiver could not replace an unusable partial file",
+            )
+            .await?;
+
+            return Err(error.into());
+        }
+
+        return prepare_fresh_transfer(stream, partial_destination).await;
+    }
+
+    let hasher = match hash_partial_file(partial_destination, partial_size).await {
+        Ok(hasher) => hasher,
+
+        Err(error) => {
+            send_reject(
+                stream,
+                RejectCode::CannotPrepareDestination,
+                "receiver could not verify the existing partial file",
+            )
+            .await?;
+
+            return Err(error);
+        }
+    };
+
+    let prefix_digest = hasher.clone().finalize();
+
+    let resume_request = ResumeRequest {
+        offset: partial_size,
+        prefix_hash: *prefix_digest.as_bytes(),
+    };
+
+    let resume_payload = encode_resume(&resume_request);
+
+    let resume = Frame::new(MessageType::Resume, resume_payload);
+
+    if let Err(error) = write_frame(stream, &resume).await {
+        if !should_preserve_partial(&error) {
+            let _ = fs::remove_file(partial_destination).await;
+        }
+
+        return Err(error.into());
+    }
+
+    println!("Sent RESUME (offset: {partial_size} bytes)");
+
+    let response = match read_frame(stream).await {
+        Ok(response) => response,
+
+        Err(error) => {
+            if !should_preserve_partial(&error) {
+                let _ = fs::remove_file(partial_destination).await;
+            }
+
+            return Err(error.into());
+        }
+    };
+
+    match response.message_type {
+        MessageType::Accept => {
+            if !response.payload.is_empty() {
+                let _ = fs::remove_file(partial_destination).await;
+
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ACCEPT payload must be empty",
+                )
+                .into());
+            }
+
+            let current_size = fs::metadata(partial_destination).await?.len();
+
+            if current_size != partial_size {
+                let _ = fs::remove_file(partial_destination).await;
+
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "partial file changed while resume was being negotiated",
+                )
+                .into());
+            }
+
+            let output = OpenOptions::new()
+                .append(true)
+                .open(partial_destination)
+                .await?;
+
+            println!("Resume accepted at byte {partial_size}");
+
+            Ok(PreparedTransfer {
+                output,
+                bytes_received: partial_size,
+                hasher,
+            })
+        }
+
+        MessageType::Restart => {
+            if !response.payload.is_empty() {
+                let _ = fs::remove_file(partial_destination).await;
+
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RESTART payload must be empty",
+                )
+                .into());
+            }
+
+            println!("Sender rejected the partial file; restarting from byte 0");
+
+            if let Err(error) = fs::remove_file(partial_destination).await {
+                send_reject(
+                    stream,
+                    RejectCode::CannotPrepareDestination,
+                    "receiver could not discard the rejected partial file",
+                )
+                .await?;
+
+                return Err(error.into());
+            }
+
+            prepare_fresh_transfer(stream, partial_destination).await
+        }
+
+        MessageType::Cancel => {
+            if !response.payload.is_empty() {
+                let _ = fs::remove_file(partial_destination).await;
+
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CANCEL payload must be empty",
+                )
+                .into());
+            }
+
+            let _ = fs::remove_file(partial_destination).await;
+
+            Err(io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled by sender").into())
+        }
+
+        _ => {
+            let _ = fs::remove_file(partial_destination).await;
+
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected ACCEPT, RESTART, or CANCEL after RESUME",
+            )
+            .into())
+        }
+    }
+}
+
+async fn prepare_fresh_transfer(
+    stream: &mut TcpStream,
+    partial_destination: &Path,
+) -> Result<PreparedTransfer, Box<dyn Error>> {
+    let output = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(partial_destination)
+        .await
+    {
+        Ok(file) => file,
+
+        Err(error) => {
+            send_reject(
+                stream,
+                RejectCode::CannotPrepareDestination,
+                "receiver could not create the destination file",
+            )
+            .await?;
+
+            return Err(error.into());
+        }
+    };
+
+    let accept = Frame::new(MessageType::Accept, Vec::new());
+
+    if let Err(error) = write_frame(stream, &accept).await {
+        drop(output);
+
+        let _ = fs::remove_file(partial_destination).await;
+
+        return Err(error.into());
+    }
+
+    println!("Sent ACCEPT");
+
+    Ok(PreparedTransfer {
+        output,
+        bytes_received: 0,
+        hasher: blake3::Hasher::new(),
+    })
+}
+
+async fn hash_partial_file(
+    partial_destination: &Path,
+    expected_size: u64,
+) -> Result<blake3::Hasher, Box<dyn Error>> {
+    let mut file = fs::File::open(partial_destination).await?;
+
+    let mut hasher = blake3::Hasher::new();
+
+    let mut buffer = vec![0u8; MAX_DATA_PAYLOAD_LENGTH];
+
+    let mut bytes_hashed: u64 = 0;
+
+    loop {
+        let bytes_read = file.read(&mut buffer).await?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+
+        bytes_hashed = bytes_hashed.checked_add(bytes_read as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "partial byte count overflow")
+        })?;
+    }
+
+    if bytes_hashed != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial file changed while it was being hashed",
+        )
+        .into());
+    }
+
+    Ok(hasher)
+}
+
 async fn receive_file_data(
     stream: &mut TcpStream,
     mut output: fs::File,
     expected_size: u64,
+    initial_bytes_received: u64,
+    mut hasher: blake3::Hasher,
 ) -> Result<u64, Box<dyn Error>> {
-    let mut hasher = blake3::Hasher::new();
+    if initial_bytes_received > expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resume offset exceeds the announced file size",
+        )
+        .into());
+    }
 
-    let mut bytes_received: u64 = 0;
+    let mut bytes_received = initial_bytes_received;
 
-    let mut progress = ProgressTracker::new("Receiving", expected_size);
+    let remaining_size = expected_size - initial_bytes_received;
+
+    let mut progress = ProgressTracker::new("Receiving", remaining_size);
 
     let sender_hash = loop {
         let frame = read_frame(stream).await?;
@@ -361,6 +618,8 @@ fn should_preserve_partial(error: &(dyn Error + 'static)) -> bool {
         io::ErrorKind::UnexpectedEof
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
     )
 }
 

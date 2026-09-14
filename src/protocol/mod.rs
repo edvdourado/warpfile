@@ -6,6 +6,7 @@ pub mod io;
 pub mod message;
 pub mod offer;
 pub mod reject;
+pub mod resume;
 
 pub use decoder::{DecodeError, decode_frame};
 
@@ -22,3 +23,8 @@ pub use message::MessageType;
 pub use offer::{FileOffer, OfferError, decode_offer, encode_offer};
 
 pub use reject::{FileReject, RejectCode, RejectError, decode_reject, encode_reject};
+
+pub use resume::{
+    BLAKE3_HASH_LENGTH, RESUME_PAYLOAD_LENGTH, ResumeError, ResumeRequest, decode_resume,
+    encode_resume,
+};

@@ -1,3 +1,4 @@
+pub mod completion_receipt;
 pub mod destination;
 pub mod discovery;
 pub mod progress;

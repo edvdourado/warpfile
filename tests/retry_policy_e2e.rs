@@ -136,6 +136,80 @@ async fn sender_does_not_retry_permanent_receiver_reject() {
     );
 }
 
+#[tokio::test]
+async fn sender_does_not_retry_when_verified_confirmation_is_lost() {
+    let temp = tempdir().unwrap();
+
+    let source_directory = temp.path().join("source");
+
+    fs::create_dir_all(&source_directory).unwrap();
+
+    let source_path = source_directory.join("lost-verified.bin");
+
+    let original_data: Vec<u8> = (0..200_000)
+        .map(|index| ((index * 29) % 251) as u8)
+        .collect();
+
+    fs::write(&source_path, &original_data).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let address = listener.local_addr().unwrap().to_string();
+
+    let source_path_string = source_path.to_string_lossy().into_owned();
+
+    let fake_receiver = async {
+        let (mut stream, _peer) = listener.accept().await.unwrap();
+
+        receive_sender_handshake(&mut stream).await;
+
+        let offer = receive_offer(&mut stream).await;
+
+        assert_eq!(offer.filename, "lost-verified.bin");
+        assert_eq!(offer.file_size, original_data.len() as u64);
+
+        let accept = Frame::new(MessageType::Accept, Vec::new());
+
+        write_frame(&mut stream, &accept).await.unwrap();
+
+        let (received, complete_hash) = receive_until_complete(&mut stream).await;
+
+        assert_eq!(received, original_data);
+
+        let expected_hash = blake3::hash(&original_data);
+
+        assert_eq!(complete_hash, expected_hash.as_bytes().to_vec());
+
+        // Simulate the case where COMPLETE reached the receiver,
+        // but the connection disappears before VERIFIED reaches
+        // the sender.
+        drop(stream);
+
+        let second_connection = timeout(NO_EXTRA_CONNECTION_WINDOW, listener.accept()).await;
+
+        assert!(
+            second_connection.is_err(),
+            "sender retried after COMPLETE even though completion status was ambiguous"
+        );
+    };
+
+    let sender = run_sender(&source_path_string, &address);
+
+    let (_, sender_result) = timeout(Duration::from_secs(5), async {
+        tokio::join!(fake_receiver, sender)
+    })
+    .await
+    .expect("lost VERIFIED test timed out");
+
+    let sender_error =
+        sender_result.expect_err("sender unexpectedly reported success without VERIFIED");
+
+    assert!(
+        sender_error.to_string().contains("status is unknown"),
+        "sender did not report ambiguous completion status: {sender_error}"
+    );
+}
+
 async fn receive_sender_handshake(stream: &mut TcpStream) {
     let hello = read_frame(stream).await.unwrap();
 
@@ -153,4 +227,28 @@ async fn receive_offer(stream: &mut TcpStream) -> warpfile::protocol::FileOffer 
     assert_eq!(offer_frame.message_type, MessageType::Offer);
 
     decode_offer(&offer_frame.payload).unwrap()
+}
+
+async fn receive_until_complete(stream: &mut TcpStream) -> (Vec<u8>, Vec<u8>) {
+    let mut received = Vec::new();
+
+    loop {
+        let frame = read_frame(stream).await.unwrap();
+
+        match frame.message_type {
+            MessageType::Data => {
+                received.extend_from_slice(&frame.payload);
+            }
+
+            MessageType::Complete => {
+                assert_eq!(frame.payload.len(), 32);
+
+                return (received, frame.payload);
+            }
+
+            other => {
+                panic!("unexpected message while waiting for COMPLETE: {other:?}");
+            }
+        }
+    }
 }

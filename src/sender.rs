@@ -23,6 +23,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 enum SendAttemptError {
     RetryableConnect(io::Error),
     RetryableProtocol(ProtocolIoError),
+    AmbiguousCompletion(ProtocolIoError),
     Permanent(Box<dyn Error>),
 }
 
@@ -53,6 +54,13 @@ impl fmt::Display for SendAttemptError {
                 write!(formatter, "{error}")
             }
 
+            SendAttemptError::AmbiguousCompletion(error) => {
+                write!(
+                    formatter,
+                    "connection lost while finalizing transfer; receiver status is unknown: {error}"
+                )
+            }
+
             SendAttemptError::Permanent(error) => {
                 write!(formatter, "{error}")
             }
@@ -65,6 +73,7 @@ impl Error for SendAttemptError {
         match self {
             SendAttemptError::RetryableConnect(error) => Some(error),
             SendAttemptError::RetryableProtocol(error) => Some(error),
+            SendAttemptError::AmbiguousCompletion(error) => Some(error),
             SendAttemptError::Permanent(error) => Some(error.as_ref()),
         }
     }
@@ -372,13 +381,13 @@ async fn send_once(
 
     write_frame(&mut stream, &complete)
         .await
-        .map_err(classify_protocol_error)?;
+        .map_err(classify_finalization_error)?;
 
     println!("Sent COMPLETE");
 
     let response = read_frame(&mut stream)
         .await
-        .map_err(classify_protocol_error)?;
+        .map_err(classify_finalization_error)?;
 
     if response.message_type != MessageType::Verified {
         return Err(SendAttemptError::permanent(io::Error::new(
@@ -553,6 +562,19 @@ fn classify_protocol_error(error: ProtocolIoError) -> SendAttemptError {
 
     if retryable {
         SendAttemptError::RetryableProtocol(error)
+    } else {
+        SendAttemptError::Permanent(Box::new(error))
+    }
+}
+
+fn classify_finalization_error(error: ProtocolIoError) -> SendAttemptError {
+    let completion_is_ambiguous = match &error {
+        ProtocolIoError::Io(io_error) => is_retryable_network_kind(io_error.kind()),
+        ProtocolIoError::Decode(_) | ProtocolIoError::Encode(_) => false,
+    };
+
+    if completion_is_ambiguous {
+        SendAttemptError::AmbiguousCompletion(error)
     } else {
         SendAttemptError::Permanent(Box::new(error))
     }

@@ -4,7 +4,9 @@ use tempfile::tempdir;
 use tokio::net::{TcpListener, TcpStream};
 
 use warpfile::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
-use warpfile::protocol::{FileOffer, Frame, MessageType, encode_offer, read_frame, write_frame};
+use warpfile::protocol::{
+    FileOffer, Frame, MessageType, TransferId, encode_offer, read_frame, write_frame,
+};
 
 use warpfile::receiver::receive_once;
 use warpfile::sender::run_sender;
@@ -162,6 +164,7 @@ async fn perform_handshake(stream: &mut TcpStream) {
 
 async fn send_offer_and_wait_for_accept(stream: &mut TcpStream, filename: &str, file_size: u64) {
     let offer = FileOffer {
+        transfer_id: test_transfer_id(),
         filename: filename.to_string(),
         file_size,
     };
@@ -177,4 +180,11 @@ async fn send_offer_and_wait_for_accept(stream: &mut TcpStream, filename: &str, 
     assert_eq!(response.message_type, MessageType::Accept);
 
     assert!(response.payload.is_empty());
+}
+
+fn test_transfer_id() -> TransferId {
+    TransferId::from_bytes([
+        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E,
+        0x2F,
+    ])
 }

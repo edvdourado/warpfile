@@ -1,7 +1,7 @@
 use super::message::MessageType;
 
 pub const WFP_MAGIC: [u8; 4] = *b"WFP\0";
-pub const WFP_VERSION: u8 = 0x01;
+pub const WFP_VERSION: u8 = 0x02;
 
 pub const HEADER_LENGTH: usize = 12;
 

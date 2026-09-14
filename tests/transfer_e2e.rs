@@ -5,7 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use warpfile::protocol::frame::WFP_VERSION;
 use warpfile::protocol::{
-    FileOffer, Frame, MessageType, decode_resume, encode_offer, read_frame, write_frame,
+    FileOffer, Frame, MessageType, TransferId, decode_resume, encode_offer, read_frame, write_frame,
 };
 
 use warpfile::receiver::receive_once;
@@ -486,10 +486,7 @@ async fn restarts_from_zero_when_sender_rejects_resume() {
 
         assert_eq!(resume.offset, stale_partial.len() as u64);
 
-        assert_eq!(
-            resume.prefix_hash,
-            *blake3::hash(&stale_partial,).as_bytes()
-        );
+        assert_eq!(resume.prefix_hash, *blake3::hash(&stale_partial).as_bytes());
 
         let restart = Frame::new(MessageType::Restart, Vec::new());
 
@@ -552,6 +549,7 @@ async fn perform_handshake(stream: &mut TcpStream) {
 
 async fn send_offer(stream: &mut TcpStream, filename: &str, file_size: u64) {
     let offer = FileOffer {
+        transfer_id: test_transfer_id(),
         filename: filename.to_string(),
         file_size,
     };
@@ -571,4 +569,11 @@ async fn send_offer_and_wait_for_accept(stream: &mut TcpStream, filename: &str, 
     assert_eq!(accept.message_type, MessageType::Accept);
 
     assert!(accept.payload.is_empty());
+}
+
+fn test_transfer_id() -> TransferId {
+    TransferId::from_bytes([
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
+        0x3F,
+    ])
 }

@@ -12,8 +12,8 @@ use tokio::time::sleep;
 use crate::progress::ProgressTracker;
 use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
 use crate::protocol::{
-    FileOffer, Frame, MessageType, ProtocolIoError, ResumeRequest, decode_reject, decode_resume,
-    encode_offer, read_frame, write_frame,
+    FileOffer, Frame, MessageType, ProtocolIoError, ResumeRequest, TransferId, decode_reject,
+    decode_resume, encode_offer, read_frame, write_frame,
 };
 
 const MAX_SEND_ATTEMPTS: usize = 3;
@@ -102,13 +102,18 @@ pub async fn run_sender(file_path: &str, address: &str) -> Result<(), Box<dyn Er
 
     let file_size = metadata.len();
 
+    let transfer_id = TransferId::generate().map_err(|error| {
+        io::Error::other(format!("failed to generate transfer identity: {error}"))
+    })?;
+
     println!("File: {filename}");
     println!("Size: {file_size} bytes");
+    println!("Transfer ID: {transfer_id}");
 
     let mut attempt = 1usize;
 
     loop {
-        match send_once(path, &filename, file_size, address).await {
+        match send_once(path, &filename, file_size, transfer_id, address).await {
             Ok(()) => {
                 return Ok(());
             }
@@ -166,6 +171,7 @@ async fn send_once(
     path: &Path,
     filename: &str,
     file_size: u64,
+    transfer_id: TransferId,
     address: &str,
 ) -> Result<(), SendAttemptError> {
     println!("Connecting to {address}");
@@ -182,7 +188,7 @@ async fn send_once(
         .await
         .map_err(classify_protocol_error)?;
 
-    println!("Sent HELLO (WFP/0.1)");
+    println!("Sent HELLO (WFP/0.2)");
 
     let response = read_frame(&mut stream)
         .await
@@ -205,6 +211,7 @@ async fn send_once(
     println!("WFP handshake successful");
 
     let offer = FileOffer {
+        transfer_id,
         filename: filename.to_string(),
         file_size,
     };

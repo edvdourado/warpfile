@@ -94,13 +94,13 @@ async fn receive_connection(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HELLO version").into());
     }
 
-    println!("Received HELLO (WFP/0.1)");
+    println!("Received HELLO (WFP/0.2)");
 
     let hello_ack = Frame::new(MessageType::HelloAck, vec![WFP_VERSION]);
 
     write_frame(&mut stream, &hello_ack).await?;
 
-    println!("Sent HELLO_ACK (WFP/0.1)");
+    println!("Sent HELLO_ACK (WFP/0.2)");
 
     let offer_frame = read_frame(&mut stream).await?;
 
@@ -123,6 +123,7 @@ async fn receive_connection(
 
     println!();
     println!("Incoming file:");
+    println!("Transfer ID: {}", offer.transfer_id);
     println!("Name: {}", offer.filename);
     println!("Size: {} bytes", offer.file_size);
     println!();

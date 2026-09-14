@@ -43,6 +43,8 @@ async fn sender_reconnects_and_resumes_after_connection_loss() {
         assert_eq!(first_offer.filename, "automatic-reconnect.bin");
         assert_eq!(first_offer.file_size, original_data.len() as u64);
 
+        let first_transfer_id = first_offer.transfer_id;
+
         let accept = Frame::new(MessageType::Accept, Vec::new());
 
         write_frame(&mut first_stream, &accept).await.unwrap();
@@ -68,6 +70,11 @@ async fn sender_reconnects_and_resumes_after_connection_loss() {
 
         assert_eq!(second_offer.filename, "automatic-reconnect.bin");
         assert_eq!(second_offer.file_size, original_data.len() as u64);
+
+        assert_eq!(
+            second_offer.transfer_id, first_transfer_id,
+            "sender generated a different transfer identity after reconnect"
+        );
 
         let prefix_hash = blake3::hash(&retained);
 

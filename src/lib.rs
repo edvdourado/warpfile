@@ -5,3 +5,4 @@ pub mod protocol;
 pub mod receiver;
 pub mod sender;
 pub mod tailscale;
+pub mod transfer_metadata;

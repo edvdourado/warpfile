@@ -1,7 +1,7 @@
 # WarpFile Architecture
 
 **Status:** Experimental
-**Reference state:** `v0.1.0-alpha.2`
+**Reference state:** development after `v0.1.0-alpha.2`
 
 This document describes the current architecture of the WarpFile reference implementation.
 
@@ -225,7 +225,11 @@ If Tailscale is missing, returns an error or produces invalid JSON, the provider
 
 ## 8. `sender.rs`
 
-`sender.rs` controls one outgoing file-transfer session.
+`sender.rs` controls outgoing file-transfer orchestration.
+
+`run_sender` validates the source file and applies sender-side retry policy.
+
+Each `send_once` invocation represents one independent WFP TCP transfer session.
 
 Responsibilities include:
 
@@ -242,7 +246,11 @@ Responsibilities include:
 - update progress reporting;
 - send CANCEL after user interruption;
 - send COMPLETE;
-- wait for VERIFIED.
+- wait for VERIFIED;
+- classify recoverable network failures separately from permanent failures;
+- retry selected recoverable failures with a bounded attempt policy;
+- reconnect through a new WFP session and allow normal verified resume negotiation;
+- avoid automatic retry after ambiguous COMPLETE / VERIFIED finalization.
 
 ### 8.1 Fresh transfer
 
@@ -352,6 +360,26 @@ resume offset == file size
 ```
 
 then the sender may send zero DATA bytes and proceed directly to COMPLETE after validating the full prefix.
+
+### 8.4 Automatic reconnect and retry policy
+
+The sender currently allows up to three total transfer attempts, with a one-second delay between attempts.
+
+A selected recoverable network failure before finalization causes the current TCP session to end. The sender waits, opens a new TCP connection, performs HELLO and OFFER again, and lets the receiver propose retained partial state through normal RESUME negotiation.
+
+Retry policy belongs to sender orchestration rather than to one WFP session.
+
+Permanent receiver decisions such as REJECT, protocol validation failures, local source-file failures and explicit cancellation do not trigger automatic retry.
+
+### 8.5 Ambiguous completion
+
+After COMPLETE enters finalization, connection loss before VERIFIED is not automatically retried.
+
+At that point the sender cannot determine whether COMPLETE failed to reach the receiver or whether the receiver already verified and committed the file but VERIFIED was lost.
+
+The sender therefore reports the receiver completion status as unknown.
+
+Automatic reconciliation of this state would require additional protocol identity or status semantics, such as a transfer identifier and completion-status query.
 
 ## 9. `receiver.rs`
 
@@ -475,6 +503,8 @@ preserve .part
 The current implementation recognizes selected underlying I/O failures as recoverable connection loss.
 
 The preserved file becomes a resume candidate on a later transfer attempt.
+
+For selected recoverable sender-side network failures, the current sender automatically creates that later attempt, subject to its bounded retry policy.
 
 This does not mean it is automatically trusted.
 
@@ -948,9 +978,14 @@ Current E2E coverage includes:
 - recovery after a real TCP connection loss;
 - empty partial state;
 - oversized impossible partial state;
-- real sender and real receiver resume flow.
+- real sender and real receiver resume flow;
+- automatic sender reconnect after connection loss;
+- verified resume inside the automatically created retry session;
+- maximum retry-attempt enforcement;
+- permanent receiver REJECT without retry;
+- ambiguous COMPLETE / VERIFIED loss without retry.
 
-The current suite contains 72 passing tests at the time this architecture state was documented.
+The current suite contains 80 passing tests at the time this architecture state was documented.
 
 ## 22. Resume recovery test model
 
@@ -1089,8 +1124,7 @@ Resume is functional, but the current implementation intentionally remains simpl
 
 Current limitations include:
 
-- no automatic reconnect loop;
-- no automatic retry scheduler;
+
 - no persistent sender-side transfer database;
 - no persistent transfer identity;
 - no BLAKE3 checkpoint cache;
@@ -1099,7 +1133,7 @@ Current limitations include:
 - no directory-transfer manifest;
 - sequential rather than concurrent receiver sessions.
 
-A user currently retries a failed transfer by invoking the send operation again.
+For selected recoverable network failures, the sender automatically creates a new transfer attempt. Other failures still require explicit user action.
 
 The receiver then proposes the retained state through RESUME.
 
@@ -1108,13 +1142,10 @@ The receiver then proposes the retained state through RESUME.
 Possible next reliability improvements include:
 
 ```text
-automatic reconnect
-        |
-        v
-retry policy
-        |
-        v
 persistent transfer metadata
+        |
+        v
+transfer identity and completion reconciliation
         |
         v
 hash checkpoints

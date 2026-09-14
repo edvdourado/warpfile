@@ -2,7 +2,7 @@
 
 **Status:** Experimental
 **Protocol version:** 0.1
-**Reference implementation:** WarpFile `v0.1.0-alpha.2`
+**Reference implementation:** WarpFile development after `v0.1.0-alpha.2`
 
 WFP is the application-layer protocol used by WarpFile.
 
@@ -548,6 +548,10 @@ The receiver sends VERIFIED only after:
 
 Only after receiving VERIFIED may the sender consider the transfer successful.
 
+If the connection disappears after COMPLETE has been sent but before VERIFIED is received, the sender cannot determine from WFP/0.1 whether the receiver committed the completed file.
+
+That state is therefore ambiguous rather than a confirmed failure or confirmed success.
+
 ## 16. CANCEL
 
 Message type:
@@ -581,6 +585,14 @@ Incoming data is written to:
 The `.part` file is renamed to the final filename only after successful size and BLAKE3 verification.
 
 The current reference behavior distinguishes recoverable connection loss from invalid or intentionally aborted transfer state.
+
+WFP/0.1 itself does not define retry timing or a maximum number of transfer attempts.
+
+The current WarpFile sender implementation may start a new TCP session automatically after selected recoverable network failures that occur before final transfer confirmation. The new session performs HELLO and OFFER again and uses the normal RESUME negotiation when retained partial state exists.
+
+If connection loss occurs after COMPLETE has entered finalization but before VERIFIED is received, the current sender does not automatically start another transfer session because the receiver completion state may already have been committed.
+
+WFP/0.1 currently has no transfer identifier or completion-status query that can reconcile this ambiguous state.
 
 Unexpected recoverable connection loss:
 
@@ -917,7 +929,7 @@ The current verified resume design intentionally remains simple.
 
 Current limitations include:
 
-- no automatic reconnect loop in the sender;
+- no protocol-level completion reconciliation after ambiguous finalization;
 - no persistent sender-side transfer database;
 - no persisted BLAKE3 hash checkpoints;
 - retained prefixes must currently be re-read locally to rebuild BLAKE3 state;

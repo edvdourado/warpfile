@@ -383,14 +383,20 @@ Resume is functional, but the current implementation remains intentionally simpl
 
 It currently does not provide:
 
-- automatic sender reconnect after a failure;
-- automatic retry scheduling;
 - persistent sender-side transfer tracking;
 - persisted BLAKE3 checkpoints;
 - directory-transfer manifests;
 - simultaneous multi-client receiving.
 
-After an unexpected failure, the user currently starts the send operation again.
+For selected recoverable network failures, the sender now retries automatically.
+
+The current policy allows up to three total transfer attempts, with a one-second delay between attempts.
+
+Each retry creates a new WFP TCP session. The receiver preserves the partial file and the new session negotiates verified resume normally through OFFER / RESUME.
+
+Permanent failures such as receiver REJECT responses, invalid protocol state, local file errors and explicit user cancellation are not retried.
+
+If the connection is lost while COMPLETE is being finalized or while the sender is waiting for VERIFIED, WarpFile does not retry automatically because the receiver may already have committed the file. The sender reports that the receiver completion status is unknown.
 
 The receiver then discovers the retained `.part` state and negotiates resume through WFP.
 
@@ -476,11 +482,15 @@ Implemented:
 - recovery after real TCP connection loss;
 - stale partial detection;
 - zero-DATA completion when all file bytes are already present;
-- end-to-end resume coverage.
+- end-to-end resume coverage;
+- bounded automatic reconnect after recoverable network failures;
+- three-attempt retry policy with one-second delays;
+- automatic verified resume after reconnect;
+- permanent-error retry suppression;
+- ambiguous COMPLETE / VERIFIED finalization protection.
 
 Still planned within the broader reliability milestone:
 
-- automatic reconnect and retry policy;
 - improved chunk management;
 - persistent transfer metadata;
 - hash checkpoints;
@@ -518,6 +528,10 @@ prefix mismatch and RESTART
 suffix-only resume
 100% partial resume with zero DATA retransmission
 recovery across two TCP connections
+automatic sender reconnect and verified resume
+bounded retry policy
+permanent REJECT without retry
+ambiguous COMPLETE / VERIFIED loss without retry
 empty and oversized partial states
 persistent receiver behavior
 LAN discovery
@@ -528,7 +542,7 @@ device-name resolution
 At the time this development state was documented, the suite contains:
 
 ```text
-72 passing tests
+80 passing tests
 0 failures
 ```
 
@@ -600,3 +614,5 @@ WarpFile is experimental.
 Protocol details, CLI behavior and internal architecture may change without backward compatibility before the first stable release.
 
 The current alpha release is `0.1.0-alpha.2`, adding verified resumable-transfer support introduced after `0.1.0-alpha.1`.
+
+Development after `v0.1.0-alpha.2` additionally includes bounded automatic reconnect and retry behavior for recoverable sender-side network failures.

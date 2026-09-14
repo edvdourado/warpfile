@@ -8,6 +8,7 @@ pub enum MessageType {
     Accept = 0x11,
     Reject = 0x12,
     Resume = 0x13,
+    Restart = 0x14,
 
     Data = 0x20,
 
@@ -34,6 +35,7 @@ impl TryFrom<u8> for MessageType {
             0x11 => Ok(Self::Accept),
             0x12 => Ok(Self::Reject),
             0x13 => Ok(Self::Resume),
+            0x14 => Ok(Self::Restart),
 
             0x20 => Ok(Self::Data),
 
@@ -69,6 +71,11 @@ mod tests {
     #[test]
     fn decodes_resume_message_type() {
         assert_eq!(MessageType::try_from(0x13), Ok(MessageType::Resume));
+    }
+
+    #[test]
+    fn decodes_restart_message_type() {
+        assert_eq!(MessageType::try_from(0x14), Ok(MessageType::Restart));
     }
 
     #[test]

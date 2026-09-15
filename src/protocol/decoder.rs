@@ -189,6 +189,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_chunk_hashes_message_type_under_wfp_v02() {
+        let bytes = vec![
+            0x57,
+            0x46,
+            0x50,
+            0x00,
+            WFP_VERSION,
+            0x15,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        assert_eq!(
+            decode_frame(&bytes),
+            Err(DecodeError::UnknownMessageType(0x15))
+        );
+    }
+
+    #[test]
     fn rejects_incomplete_frame() {
         let bytes = vec![
             0x57, 0x46, 0x50, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x02,

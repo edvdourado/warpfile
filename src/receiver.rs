@@ -8,6 +8,9 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+use crate::completion_receipt::{
+    CompletionReceipt, completion_receipt_path, read_completion_receipt, write_completion_receipt,
+};
 use crate::discovery::{DISCOVERY_PORT, local_device_name, run_discovery_responder};
 use crate::progress::ProgressTracker;
 use crate::protocol::frame::{MAX_DATA_PAYLOAD_LENGTH, WFP_VERSION};
@@ -24,6 +27,11 @@ struct PreparedTransfer {
     output: fs::File,
     bytes_received: u64,
     hasher: blake3::Hasher,
+}
+
+struct CompletedTransfer {
+    bytes_received: u64,
+    blake3: [u8; 32],
 }
 
 pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
@@ -149,6 +157,18 @@ async fn receive_connection(
 
     let partial_destination = destination_directory.join(partial_name);
 
+    if reconcile_completed_transfer(
+        &mut stream,
+        destination_directory,
+        &destination,
+        &partial_destination,
+        &offer,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     if fs::try_exists(&destination).await? {
         send_reject(
             &mut stream,
@@ -175,8 +195,8 @@ async fn receive_connection(
     )
     .await;
 
-    let bytes_received = match transfer_result {
-        Ok(bytes_received) => bytes_received,
+    let completed = match transfer_result {
+        Ok(completed) => completed,
 
         Err(error) => {
             if should_preserve_partial(error.as_ref()) {
@@ -193,8 +213,36 @@ async fn receive_connection(
         }
     };
 
+    let completion_receipt = CompletionReceipt {
+        transfer_id: offer.transfer_id,
+        filename: offer.filename.clone(),
+        file_size: offer.file_size,
+        blake3: completed.blake3,
+    };
+
+    if let Err(error) = write_completion_receipt(destination_directory, &completion_receipt).await {
+        println!();
+        println!(
+            "Transfer data verified, but completion receipt could not be persisted; partial state preserved"
+        );
+
+        return Err(error.into());
+    }
+
+    println!("Persisted completion receipt");
+
+    /*
+     * Once the completion receipt exists, the partial file must
+     * not be discarded if rename fails.
+     *
+     * A later connection can verify the receipt against this
+     * complete .part and finish the commit.
+     */
     if let Err(error) = fs::rename(&partial_destination, &destination).await {
-        let _ = discard_partial_state(&partial_destination).await;
+        println!();
+        println!(
+            "Completion receipt persisted, but final rename failed; completed partial state preserved"
+        );
 
         return Err(error.into());
     }
@@ -205,21 +253,175 @@ async fn receive_connection(
         );
     }
 
-    println!("Received {bytes_received} bytes");
+    println!("Received {} bytes", completed.bytes_received);
 
     println!("BLAKE3 verification successful");
 
-    let verified = Frame::new(MessageType::Verified, Vec::new());
-
-    write_frame(&mut stream, &verified).await?;
-
-    println!("Sent VERIFIED");
+    send_verified(&mut stream).await?;
 
     println!("Saved to {}", destination.display());
 
     println!();
 
     println!("Waiting for the next transfer...");
+
+    Ok(())
+}
+
+async fn reconcile_completed_transfer(
+    stream: &mut TcpStream,
+    destination_directory: &Path,
+    destination: &Path,
+    partial_destination: &Path,
+    offer: &FileOffer,
+) -> Result<bool, Box<dyn Error>> {
+    let receipt_path = completion_receipt_path(destination_directory, offer.transfer_id);
+
+    if !fs::try_exists(&receipt_path).await? {
+        return Ok(false);
+    }
+
+    let receipt = match read_completion_receipt(destination_directory, offer.transfer_id).await {
+        Ok(receipt) => receipt,
+
+        Err(error) => {
+            send_reject(
+                stream,
+                RejectCode::CannotPrepareDestination,
+                "receiver could not read the completion receipt",
+            )
+            .await?;
+
+            return Err(error.into());
+        }
+    };
+
+    if receipt.filename != offer.filename || receipt.file_size != offer.file_size {
+        send_reject(
+            stream,
+            RejectCode::CannotPrepareDestination,
+            "transfer identity conflicts with the completion receipt",
+        )
+        .await?;
+
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer identity conflicts with the completion receipt",
+        )
+        .into());
+    }
+
+    if fs::try_exists(destination).await? {
+        if let Err(error) = verify_completed_data(destination, &receipt).await {
+            send_reject(
+                stream,
+                RejectCode::CannotPrepareDestination,
+                "completed destination does not match the completion receipt",
+            )
+            .await?;
+
+            return Err(error);
+        }
+
+        if let Err(error) = discard_partial_state(partial_destination).await {
+            eprintln!(
+                "Warning: completed transfer was verified but stale partial state could not be removed: {error}"
+            );
+        }
+
+        println!(
+            "Reconciled completed transfer {} from final file",
+            offer.transfer_id
+        );
+
+        send_verified(stream).await?;
+
+        println!("Saved to {}", destination.display());
+
+        return Ok(true);
+    }
+
+    if fs::try_exists(partial_destination).await? {
+        if let Err(error) = verify_completed_data(partial_destination, &receipt).await {
+            send_reject(
+                stream,
+                RejectCode::CannotPrepareDestination,
+                "completed partial file does not match the completion receipt",
+            )
+            .await?;
+
+            return Err(error);
+        }
+
+        if let Err(error) = fs::rename(partial_destination, destination).await {
+            return Err(error.into());
+        }
+
+        if let Err(error) = remove_transfer_metadata(partial_destination).await {
+            eprintln!(
+                "Warning: completed partial was committed but transfer metadata could not be removed: {error}"
+            );
+        }
+
+        println!(
+            "Reconciled completed transfer {} from completed partial file",
+            offer.transfer_id
+        );
+
+        send_verified(stream).await?;
+
+        println!("Saved to {}", destination.display());
+
+        return Ok(true);
+    }
+
+    send_reject(
+        stream,
+        RejectCode::CannotPrepareDestination,
+        "completion receipt exists but completed transfer data is missing",
+    )
+    .await?;
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "completion receipt exists but completed transfer data is missing",
+    )
+    .into())
+}
+
+async fn verify_completed_data(
+    path: &Path,
+    receipt: &CompletionReceipt,
+) -> Result<(), Box<dyn Error>> {
+    let metadata = fs::metadata(path).await?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "completed transfer data is not a regular file",
+        )
+        .into());
+    }
+
+    if metadata.len() != receipt.file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "completed transfer size does not match the completion receipt",
+        )
+        .into());
+    }
+
+    let hasher = hash_file_exact(path, receipt.file_size).await?;
+
+    let digest = hasher.finalize();
+
+    if digest.as_bytes() != &receipt.blake3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "completed transfer hash does not match the completion receipt",
+        )
+        .into());
+    }
 
     Ok(())
 }
@@ -307,7 +509,7 @@ async fn prepare_transfer(
         }
     };
 
-    let hasher = match hash_partial_file(partial_destination, partial_size).await {
+    let hasher = match hash_file_exact(partial_destination, partial_size).await {
         Ok(hasher) => hasher,
 
         Err(error) => {
@@ -553,11 +755,11 @@ async fn discard_partial_state(partial_destination: &Path) -> Result<(), Box<dyn
     Ok(())
 }
 
-async fn hash_partial_file(
-    partial_destination: &Path,
+async fn hash_file_exact(
+    path: &Path,
     expected_size: u64,
 ) -> Result<blake3::Hasher, Box<dyn Error>> {
-    let mut file = fs::File::open(partial_destination).await?;
+    let mut file = fs::File::open(path).await?;
 
     let mut hasher = blake3::Hasher::new();
 
@@ -575,14 +777,14 @@ async fn hash_partial_file(
         hasher.update(&buffer[..bytes_read]);
 
         bytes_hashed = bytes_hashed.checked_add(bytes_read as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "partial byte count overflow")
+            io::Error::new(io::ErrorKind::InvalidData, "file byte count overflow")
         })?;
     }
 
     if bytes_hashed != expected_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "partial file changed while it was being hashed",
+            "file changed while it was being hashed",
         )
         .into());
     }
@@ -596,7 +798,7 @@ async fn receive_file_data(
     expected_size: u64,
     initial_bytes_received: u64,
     mut hasher: blake3::Hasher,
-) -> Result<u64, Box<dyn Error>> {
+) -> Result<CompletedTransfer, Box<dyn Error>> {
     if initial_bytes_received > expected_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -679,6 +881,12 @@ async fn receive_file_data(
 
     output.flush().await?;
 
+    /*
+     * The complete partial file must be persisted before the
+     * completion receipt is allowed to become durable.
+     */
+    output.sync_all().await?;
+
     drop(output);
 
     if bytes_received != expected_size {
@@ -701,7 +909,20 @@ async fn receive_file_data(
 
     progress.finish();
 
-    Ok(bytes_received)
+    Ok(CompletedTransfer {
+        bytes_received,
+        blake3: *receiver_hash.as_bytes(),
+    })
+}
+
+async fn send_verified(stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
+    let verified = Frame::new(MessageType::Verified, Vec::new());
+
+    write_frame(stream, &verified).await?;
+
+    println!("Sent VERIFIED");
+
+    Ok(())
 }
 
 fn should_preserve_partial(error: &(dyn Error + 'static)) -> bool {

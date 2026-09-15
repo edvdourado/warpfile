@@ -4,34 +4,46 @@
 
 It transfers files directly between devices using **WFP (WarpFile Protocol)**, its own binary application-layer protocol, without requiring WarpFile cloud storage or permanent user accounts.
 
-The current prototype supports integrity-verified and resumable TCP transfers, persistent receiving, automatic device discovery across local networks and Tailscale, and sending files by device name.
+The current development version supports integrity-verified and resumable TCP transfers, persistent transfer identity, recovery across interrupted connections, completion reconciliation after lost final confirmation, persistent receivers, automatic device discovery across local networks and Tailscale, and sending files by device name.
 
 > WarpFile is under active development and is not yet intended for untrusted networks.
+
+---
 
 ## Current capabilities
 
 WarpFile currently supports:
 
-- WFP/0.1 binary framing over TCP;
+- WFP/0.2 binary framing over TCP and UDP;
 - streaming transfers without loading the entire file into memory;
 - 64 KiB DATA frames;
 - incremental BLAKE3 integrity verification;
+- 128-bit Transfer IDs for logical send jobs;
+- preservation of the same Transfer ID across automatic retries;
 - file offer acceptance and structured rejection;
 - explicit transfer cancellation with `Ctrl+C`;
 - `.part` files for incomplete incoming transfers;
-- preservation of partial files after recoverable connection loss;
+- persistent `.part.warpmeta` metadata for partial transfer identity;
+- preservation of partial state after recoverable connection loss;
 - verified resumable transfers using byte offsets and BLAKE3 prefix hashes;
+- cryptographically verified adoption of useful partial data when transfer metadata is missing, stale or belongs to another Transfer ID;
 - automatic restart from byte zero when retained partial data does not match the source;
 - avoidance of retransmitting already validated file prefixes;
-- resume from arbitrary byte offsets rather than chunk boundaries;
-- zero DATA retransmission when the receiver already has the complete validated file contents;
-- persistent receivers that can accept multiple sequential transfers;
+- resume from arbitrary byte offsets rather than DATA-frame boundaries;
+- zero DATA retransmission when the receiver already has the complete validated partial contents;
+- immutable receiver-side completion receipts;
+- automatic reconciliation when the final `VERIFIED` confirmation is lost;
+- direct `OFFER -> VERIFIED` completion reconciliation;
+- persistent receivers that can accept multiple sequential transfer sessions;
+- bounded automatic sender reconnect after selected recoverable network failures;
 - UDP peer discovery with WFP `DISCOVER` / `ANNOUNCE`;
 - discovery across IPv4 local network interfaces;
 - optional Tailscale-assisted peer discovery;
 - device-name resolution;
 - direct `IP:port` transfers as a fallback;
-- unit and end-to-end tests covering protocol, discovery, cancellation, corruption, recovery and real resume flows.
+- unit and end-to-end tests covering protocol, discovery, cancellation, corruption, resume, persistence, retry and completion reconciliation.
+
+---
 
 ## Example
 
@@ -74,6 +86,8 @@ A direct address can still be used:
 warpfile send .\README.md 100.68.8.15:42069
 ```
 
+---
+
 ## How discovery works
 
 WarpFile discovery is provider-based.
@@ -90,22 +104,26 @@ WarpFile discovery is provider-based.
               |                         |
               +------------+------------+
                            |
-                    WFP DISCOVER
+                     WFP DISCOVER
                            |
-                    WFP ANNOUNCE
+                     WFP ANNOUNCE
                            |
                   discovered device
 ```
 
 Tailscale is optional.
 
-When available, WarpFile uses Tailscale only to obtain candidate peer addresses. A Tailscale peer is **not automatically considered a WarpFile peer**.
+When available, WarpFile uses Tailscale only to obtain candidate peer addresses.
+
+A Tailscale peer is **not automatically considered a WarpFile peer**.
 
 WarpFile sends its own WFP `DISCOVER` message to each candidate, and only devices actually running WarpFile respond with `ANNOUNCE`.
 
+---
+
 ## Transfer flow
 
-A fresh WFP/0.1 file transfer looks like this:
+A fresh WFP/0.2 file transfer looks like this:
 
 ```text
 Sender                                      Receiver
@@ -114,6 +132,8 @@ Sender                                      Receiver
   | <------------- HELLO_ACK ---------------- |
   |                                            |
   | ---------------- OFFER -----------------> |
+  |        Transfer ID + file metadata         |
+  |                                            |
   | <--------------- ACCEPT ----------------- |
   |                                            |
   | ---------------- DATA ------------------> |
@@ -121,25 +141,71 @@ Sender                                      Receiver
   |                   ...                      |
   |                                            |
   | -------------- COMPLETE ----------------> |
+  |          complete BLAKE3 digest            |
+  |                                            |
   | <-------------- VERIFIED ---------------- |
   |                                            |
 ```
 
 The sender calculates a BLAKE3 digest while streaming the file.
 
-The receiver calculates the same digest while writing incoming data and only sends `VERIFIED` when the received file size and BLAKE3 digest are both correct.
+The receiver calculates the same digest while writing incoming data.
+
+Before reporting success, the receiver validates the byte count and BLAKE3 digest and persists enough completion state to recover safely if final confirmation is lost.
+
+---
+
+## Transfer identity
+
+WFP/0.2 adds a 128-bit **Transfer ID** to `OFFER`.
+
+Conceptually:
+
+```text
+logical send job
+Transfer ID = X
+      |
+      +--> TCP session 1
+      |
+      +--> TCP session 2
+      |
+      `--> TCP session 3
+```
+
+A Transfer ID identifies one logical sender operation across automatic reconnects.
+
+It is **not**:
+
+- a file-content hash;
+- peer identity;
+- authentication;
+- a secret token.
+
+The current sender generates one Transfer ID when a send operation starts and reuses that ID across its automatic retries.
+
+A sender process restart currently generates a new Transfer ID.
+
+---
 
 ## Resumable transfers
 
 Unexpected connection loss does not automatically destroy useful received data.
 
-If a transfer is interrupted by a recoverable network failure, the receiver retains:
+If a transfer is interrupted by a recoverable network failure, the receiver may preserve:
 
 ```text
 <filename>.part
+<filename>.part.warpmeta
 ```
 
-When the same filename is offered again, the receiver may propose a resume state:
+For example:
+
+```text
+video.mkv.part
+video.mkv.part.warpmeta
+```
+
+When a later `OFFER` arrives, the receiver can propose the retained prefix:
 
 ```text
 Sender                                      Receiver
@@ -174,7 +240,11 @@ The sender reads and hashes exactly the same prefix from its source file.
 
 Continuation is accepted only when both prefix hashes match.
 
-If they do not match:
+---
+
+## Restart after a mismatched prefix
+
+If the retained receiver bytes do not match the sender's source:
 
 ```text
 Sender                                      Receiver
@@ -183,7 +253,8 @@ Sender                                      Receiver
   |                                            |
   | --------------- RESTART ----------------> |
   |                                            |
-  |                      discard stale .part   |
+  |                 discard stale partial     |
+  |                 prepare fresh state       |
   |                                            |
   | <--------------- ACCEPT ----------------- |
   |                                            |
@@ -192,7 +263,9 @@ Sender                                      Receiver
 
 This protects against accidentally combining data from different files that happen to share the same filename or size.
 
-### Resume uses byte offsets
+---
+
+## Resume uses byte offsets
 
 Resume positions are not tied to 64 KiB DATA-frame boundaries.
 
@@ -202,7 +275,7 @@ For example, a transfer may safely resume from:
 123457 bytes
 ```
 
-as long as the BLAKE3 digest of bytes:
+as long as the BLAKE3 digest of:
 
 ```text
 [0, 123457)
@@ -212,9 +285,46 @@ matches on both peers.
 
 This keeps resume independent from current and future chunk-sizing strategies.
 
-### Already-complete partial files
+---
 
-A connection may disappear after the receiver has obtained every file byte but before the final `COMPLETE` / `VERIFIED` exchange finishes.
+## Partial transfer metadata
+
+The receiver persists auxiliary metadata next to incomplete files.
+
+For:
+
+```text
+video.mkv.part
+```
+
+the metadata file is:
+
+```text
+video.mkv.part.warpmeta
+```
+
+It records information such as:
+
+```text
+Transfer ID
+filename
+file size
+partial state
+```
+
+This metadata helps correlate interrupted transfer state.
+
+It is not blindly trusted.
+
+The actual `.part` bytes are still verified through BLAKE3 before resume is accepted.
+
+If metadata is missing, corrupt or belongs to a different Transfer ID, WarpFile may still recover the useful partial bytes when the sender proves that the retained prefix matches its source.
+
+---
+
+## Already-complete partial files
+
+A connection may disappear after the receiver has obtained every file byte but before final completion finishes.
 
 If the receiver later proposes:
 
@@ -222,13 +332,132 @@ If the receiver later proposes:
 resume offset == complete file size
 ```
 
-and the full retained prefix matches the source, the sender does not need to retransmit any DATA payload.
+and the full retained prefix matches the source, the sender does not retransmit DATA.
 
 It can proceed directly to `COMPLETE`.
 
+This is different from completion-receipt reconciliation, which handles a transfer whose completed state was already persisted by the receiver.
+
+---
+
+## Completion receipts
+
+After complete size and BLAKE3 verification, the receiver persists an immutable completion receipt.
+
+Receipts are stored under:
+
+```text
+<destination>/
+`-- .warpfile/
+    `-- receipts/
+        `-- <transfer-id>.json
+```
+
+Conceptually, a receipt records:
+
+```text
+Transfer ID
+filename
+file size
+complete BLAKE3
+```
+
+A completion receipt is receiver-local state.
+
+It is not transmitted over WFP.
+
+Its purpose is to answer a later question:
+
+```text
+Was this exact logical transfer already completed?
+```
+
+---
+
+## Lost VERIFIED reconciliation
+
+A particularly important failure can happen at the end of a transfer.
+
+Consider:
+
+```text
+Sender                                      Receiver
+  |                                            |
+  | -------------- COMPLETE ----------------> |
+  |                                            |
+  |                       verify complete file |
+  |                       persist receipt      |
+  |                       commit final file    |
+  |                                            |
+  X <------------- VERIFIED ----------------- |
+        connection disappears
+```
+
+The receiver may already have completed the transfer even though the sender did not receive `VERIFIED`.
+
+WFP/0.2 allows the sender to retry safely with the **same Transfer ID**.
+
+```text
+new TCP session
+
+Sender                                      Receiver
+  |                                            |
+  | ---------------- HELLO -----------------> |
+  | <------------- HELLO_ACK ---------------- |
+  |                                            |
+  | ----- OFFER with same Transfer ID ------> |
+  |                                            |
+  |                    find completion receipt |
+  |                    verify physical file    |
+  |                                            |
+  | <-------------- VERIFIED ---------------- |
+```
+
+In this state:
+
+```text
+OFFER -> VERIFIED
+```
+
+is a valid successful WFP/0.2 exchange.
+
+No DATA or COMPLETE needs to be transmitted again.
+
+---
+
+## Why receipts are not blindly trusted
+
+A receipt alone is not enough to return `VERIFIED`.
+
+During reconciliation, the receiver checks:
+
+```text
+receipt Transfer ID
+receipt filename
+receipt file size
+receipt BLAKE3
+        |
+        v
+actual physical file
+        |
+        v
+size + BLAKE3 verification
+        |
+        v
+VERIFIED
+```
+
+If the physical file is missing, altered or inconsistent with the receipt, WarpFile refuses to report successful completion.
+
+The uncommon reconciliation path therefore re-reads and hashes the completed file.
+
+Normal successful transfers still use one-pass streaming BLAKE3.
+
+---
+
 ## Partial-file behavior
 
-Incoming files are written to:
+Incoming incomplete files are written to:
 
 ```text
 <filename>.part
@@ -242,24 +471,71 @@ Unexpected recoverable connection loss:
 
 ```text
 retain .part
-â†’ offer verified resume later
+retain .part.warpmeta
+        |
+        v
+offer verified resume later
 ```
 
 Explicit `CANCEL`:
 
 ```text
-remove .part
+remove partial state
 ```
 
 Invalid final BLAKE3, impossible transfer state or protocol failure:
 
 ```text
-remove .part
+remove partial state
 ```
 
 A zero-byte `.part` contains no useful resumable data and is discarded before starting a fresh transfer.
 
 A `.part` larger than the file size announced by the sender cannot be a valid prefix and is also discarded.
+
+---
+
+## Automatic reconnect
+
+The sender currently applies a bounded retry policy for selected recoverable network failures.
+
+Current reference policy:
+
+```text
+maximum attempts: 3
+delay:            1 second
+```
+
+Each retry creates a new WFP TCP session:
+
+```text
+connect
+  |
+  v
+HELLO / HELLO_ACK
+  |
+  v
+OFFER
+```
+
+The same logical send operation reuses the same Transfer ID.
+
+If partial data exists, normal RESUME negotiation occurs.
+
+If completion had already been persisted, the receiver may answer the new OFFER directly with VERIFIED.
+
+Permanent failures are not automatically retried.
+
+Examples include:
+
+- receiver `REJECT`;
+- malformed protocol state;
+- non-transient local file errors;
+- explicit user cancellation.
+
+Retry timing and retry limits are sender implementation policy, not WFP protocol requirements.
+
+---
 
 ## Architecture
 
@@ -272,32 +548,54 @@ CLI
  |
  +-- discovery
  |    +-- LAN
- |    +-- Tailscale
+ |    `-- Tailscale
  |
  +-- sender / receiver
-          |
-          +-- WFP protocol
-                 |
-                 +-- framing
-                 +-- encoding / decoding
-                 +-- transfer payloads
-                 +-- resume negotiation
-                 |
-                 +-- TCP / UDP I/O
+ |        |
+ |        +-- partial transfer state
+ |        |
+ |        +-- completion receipts
+ |        |
+ |        `-- WFP protocol
+ |              |
+ |              +-- framing
+ |              +-- encoding / decoding
+ |              +-- Transfer ID
+ |              +-- transfer payloads
+ |              +-- resume negotiation
+ |              `-- completion reconciliation
+ |
+ `-- TCP / UDP I/O
 ```
 
 The transfer layer does not need to know whether an address came from LAN discovery, Tailscale discovery or explicit user input.
 
-This separation is intentional so additional connectivity mechanisms can be introduced later without rewriting file-transfer semantics.
+This separation allows additional connectivity mechanisms to be introduced later without rewriting file-transfer semantics.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the implementation architecture.
+
+---
 
 ## WarpFile Protocol
 
 WarpFile uses its own experimental application-layer protocol:
 
 ```text
-WFP/0.1
+WFP/0.2
+```
+
+The current package version and protocol version are independent.
+
+The latest published WarpFile alpha remains:
+
+```text
+v0.1.0-alpha.2
+```
+
+while current post-release development uses:
+
+```text
+WFP/0.2
 ```
 
 Every frame starts with a fixed 12-byte header:
@@ -337,17 +635,28 @@ DISCOVER / ANNOUNCE
 ERROR
 ```
 
+WFP/0.2 OFFER contains:
+
+```text
+16-byte Transfer ID
+u16 filename length
+UTF-8 filename
+u64 file size
+```
+
 Multi-byte integers use big-endian byte order.
 
-The general frame payload limit is 1 MiB. DATA payloads are limited to 64 KiB.
+The general frame payload limit is 1 MiB.
+
+DATA payloads are limited to 64 KiB.
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the evolving protocol specification.
 
+---
+
 ## Reliability
 
-WarpFile already protects transfers against several failure cases.
-
-Transfers detect or handle:
+WarpFile currently handles or detects:
 
 - unexpected disconnection;
 - explicit cancellation;
@@ -359,7 +668,12 @@ Transfers detect or handle:
 - malformed WFP frames;
 - stale partial-file contents;
 - impossible resume offsets;
-- empty or oversized partial-file state.
+- empty or oversized partial-file state;
+- partial metadata loss or mismatch;
+- retry-session transfer identity;
+- loss of final VERIFIED confirmation;
+- conflicting completion receipts;
+- physical files that disagree with persisted completion state.
 
 Verified resume adds a second integrity checkpoint before continuation.
 
@@ -367,40 +681,55 @@ For a resume offset `X`:
 
 ```text
 Receiver:
+
 BLAKE3(.part bytes 0..X)
 
+
 Sender:
+
 BLAKE3(source bytes 0..X)
 ```
 
 The transfer continues from `X` only when those values match.
 
-Final `COMPLETE` / `VERIFIED` still verifies the resulting complete file.
+Final `COMPLETE` / `VERIFIED` verifies the resulting complete file.
 
-## Current resume limitations
+Completion reconciliation adds another check for the rare lost-final-confirmation path:
 
-Resume is functional, but the current implementation remains intentionally simple.
+```text
+completion receipt
+        |
+        v
+actual completed file
+        |
+        v
+rehash + compare
+        |
+        v
+VERIFIED
+```
 
-It currently does not provide:
+---
 
-- persistent sender-side transfer tracking;
-- persisted BLAKE3 checkpoints;
-- directory-transfer manifests;
-- simultaneous multi-client receiving.
+## Current reliability limitations
 
-For selected recoverable network failures, the sender now retries automatically.
+The reliability layer is functional but intentionally remains simpler than the long-term WarpFile design.
 
-The current policy allows up to three total transfer attempts, with a one-second delay between attempts.
+Current limitations include:
 
-Each retry creates a new WFP TCP session. The receiver preserves the partial file and the new session negotiates verified resume normally through OFFER / RESUME.
-
-Permanent failures such as receiver REJECT responses, invalid protocol state, local file errors and explicit user cancellation are not retried.
-
-If the connection is lost while COMPLETE is being finalized or while the sender is waiting for VERIFIED, WarpFile does not retry automatically because the receiver may already have committed the file. The sender reports that the receiver completion status is unknown.
-
-The receiver then discovers the retained `.part` state and negotiates resume through WFP.
-
-Retained prefixes must currently be reread locally on both peers to reconstruct BLAKE3 state.
+- no persistent sender-side transfer database;
+- Transfer IDs survive automatic retries but not sender process restart;
+- no persisted BLAKE3 checkpoints;
+- retained prefixes must be reread locally to reconstruct hash state;
+- reconciliation rehashes completed physical files;
+- one file per TCP transfer session;
+- no directory-transfer manifest;
+- no arbitrary missing-chunk map;
+- no partial-content deduplication;
+- no receipt garbage-collection policy;
+- sequential rather than simultaneous multi-client receiving;
+- no protocol STATUS query;
+- no authenticated session.
 
 For example:
 
@@ -413,21 +742,35 @@ may require both peers to read and hash those 8 GiB locally again, but only the 
 
 Future hash checkpoints may reduce this local reread cost.
 
+---
+
 ## Security
 
-**WFP/0.1 currently provides no encryption, authentication or peer identity verification.**
+**WFP/0.2 currently provides no encryption, authenticated peer identity or authenticated device identity.**
 
-The current implementation should therefore only be used in trusted development environments or over a trusted network layer.
+The current implementation should therefore only be used in trusted development environments or over an independently trusted network layer.
 
 BLAKE3 prefix hashes used during resume prove content equality for the proposed prefix.
 
+Completion BLAKE3 verification proves equality with the expected completed content.
+
 They do **not** prove peer identity and must not be treated as authentication.
 
-WarpFile will not design custom cryptographic algorithms. Future authenticated and encrypted sessions will use established cryptographic primitives and libraries.
+Transfer IDs are correlation identifiers.
+
+They are **not** credentials or authentication tokens.
+
+Receiver-side `.warpmeta` files and completion receipts are also not cryptographic proof against an attacker who can modify the receiver filesystem.
+
+WarpFile will not design custom cryptographic algorithms.
+
+Future authenticated and encrypted sessions will use established cryptographic primitives and libraries.
+
+---
 
 ## Roadmap
 
-### M0 â€” First Byte
+### M0 — First Byte
 
 Complete.
 
@@ -437,7 +780,7 @@ Complete.
 - `HELLO`;
 - `HELLO_ACK`.
 
-### M1 â€” First File
+### M1 — First File
 
 Complete.
 
@@ -453,7 +796,7 @@ Complete.
 - partial-file handling;
 - end-to-end transfer tests.
 
-### M2 â€” Zero Config
+### M2 — Zero Config
 
 Complete for the current prototype.
 
@@ -466,7 +809,7 @@ Complete for the current prototype.
 - persistent receiver;
 - transfer by device name.
 
-### M3 â€” Reliable Transfer
+### M3 — Reliable Transfer
 
 In progress.
 
@@ -487,64 +830,99 @@ Implemented:
 - three-attempt retry policy with one-second delays;
 - automatic verified resume after reconnect;
 - permanent-error retry suppression;
-- ambiguous COMPLETE / VERIFIED finalization protection.
+- WFP/0.2 Transfer IDs;
+- Transfer ID preservation across automatic retries;
+- persistent partial-transfer metadata;
+- verified adoption of useful partial data across Transfer IDs;
+- immutable completion receipts;
+- receiver-side completion reconciliation;
+- safe retry after lost `VERIFIED`;
+- direct `OFFER -> VERIFIED` reconciliation;
+- refusal to trust completion receipts without verifying physical bytes.
 
-Still planned within the broader reliability milestone:
+Still planned within the broader reliability and transfer-efficiency milestone:
 
+- BLAKE3 checkpoints;
 - improved chunk management;
-- persistent transfer metadata;
-- hash checkpoints;
+- non-contiguous missing-range recovery;
 - directory transfer design;
+- receipt lifecycle / garbage collection;
+- persistent sender job identity where useful;
 - improved path selection.
 
-### M4 â€” Distribution
+### M4 — Distribution
 
 Planned.
 
 - verified Linux support;
 - automated CI;
-- release binaries;
+- broader release automation;
 - installation workflow;
-- broader documentation;
-- performance benchmarks.
+- reproducible performance benchmarks;
+- broader documentation and deployment validation.
+
+---
 
 ## Testing
 
 WarpFile uses unit tests and end-to-end tests with real local TCP and UDP sockets.
 
-Current coverage includes:
+Current validated suite:
+
+```text
+83 unit tests
+29 end-to-end tests
+-------------------
+112 tests total
+
+0 failures
+```
+
+Coverage includes:
 
 ```text
 protocol framing and validation
 OFFER / REJECT payloads
+WFP/0.2 Transfer ID encoding and generation
 RESUME encoding and decoding
 BLAKE3 integrity
+
 normal transfers
 empty files
 cancellation
+
 connection loss
 partial retention
+persistent partial metadata
+verified partial adoption
+metadata replacement after RESTART
+
 prefix mismatch and RESTART
 suffix-only resume
 100% partial resume with zero DATA retransmission
 recovery across two TCP connections
-automatic sender reconnect and verified resume
+
+automatic sender reconnect
+Transfer ID reuse across retries
 bounded retry policy
 permanent REJECT without retry
-ambiguous COMPLETE / VERIFIED loss without retry
-empty and oversized partial states
+
+completion receipt persistence
+receipt idempotency and conflict detection
+final-file completion reconciliation
+completed-.part reconciliation
+physical-file verification against receipts
+retry after lost VERIFIED
+direct VERIFIED after OFFER
+
 persistent receiver behavior
+
 LAN discovery
 Tailscale parsing
 device-name resolution
 ```
 
-At the time this development state was documented, the suite contains:
-
-```text
-80 passing tests
-0 failures
-```
+---
 
 ## Performance philosophy
 
@@ -554,21 +932,49 @@ A central principle is:
 
 > Never transfer a byte that does not need to be transferred.
 
-Current resume behavior already applies that principle by avoiding retransmission of validated prefixes.
+Current resume and reconciliation behavior already apply that principle by avoiding unnecessary retransmission of validated file bytes.
 
 Future optimization work includes:
 
-- minimizing unnecessary copies;
-- zero-copy transfer paths where practical;
+- BLAKE3 checkpoints;
+- chunk-oriented recovery;
 - adaptive chunks;
 - pipelining;
+- minimizing unnecessary copies;
+- platform-specific zero-copy transfer paths where practical;
 - selective compression;
-- deduplication;
-- batching;
+- content deduplication;
+- batching many small files;
 - automatic path selection;
 - multi-source transfers.
 
-Performance work will be measured using throughput, CPU usage, memory usage, protocol overhead and recovery behavior.
+Potential connectivity evolution includes:
+
+```text
+LAN direct
+    |
+    v
+IPv6 direct
+    |
+    v
+NAT traversal
+    |
+    v
+encrypted relay
+```
+
+Performance work will be measured using:
+
+- throughput;
+- CPU usage;
+- memory usage;
+- protocol overhead;
+- retransmitted bytes;
+- recovery behavior.
+
+No performance claim should be made without reproducible measurements.
+
+---
 
 ## Building from source
 
@@ -593,19 +999,33 @@ Run the test suite:
 cargo test
 ```
 
-The optimized executable is generated at:
+Run Clippy with warnings denied:
+
+```powershell
+cargo clippy --all-targets -- -D warnings
+```
+
+The optimized Windows executable is generated at:
 
 ```text
 target\release\warpfile.exe
 ```
 
+---
+
 ## Platform status
 
 Development and real multi-machine testing have currently focused on Windows.
 
-The core architecture is intended to remain portable, with Linux support as a target.
+The core architecture is intended to remain portable.
+
+Linux remains a target platform.
+
+Platform-specific performance optimizations should remain behind portable abstractions rather than leaking into WFP semantics.
 
 Tailscale is optional and is not required for LAN transfers.
+
+---
 
 ## Project status
 
@@ -613,6 +1033,22 @@ WarpFile is experimental.
 
 Protocol details, CLI behavior and internal architecture may change without backward compatibility before the first stable release.
 
-The current alpha release is `0.1.0-alpha.2`, adding verified resumable-transfer support introduced after `0.1.0-alpha.1`.
+The current published alpha release is:
 
-Development after `v0.1.0-alpha.2` additionally includes bounded automatic reconnect and retry behavior for recoverable sender-side network failures.
+```text
+v0.1.0-alpha.2
+```
+
+It introduced the verified resumable-transfer foundation developed after `v0.1.0-alpha.1`.
+
+Development after `v0.1.0-alpha.2` now additionally includes:
+
+- bounded automatic reconnect;
+- WFP/0.2;
+- persistent logical Transfer IDs;
+- persistent partial-transfer metadata;
+- immutable completion receipts;
+- completion reconciliation;
+- safe retry after lost final verification.
+
+These post-release changes are development state and do not imply that a new published alpha version already exists.

@@ -1,4 +1,5 @@
 pub mod chunk;
+pub mod chunk_manifest;
 pub mod completion_receipt;
 pub mod destination;
 pub mod discovery;

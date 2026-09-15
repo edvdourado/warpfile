@@ -137,7 +137,7 @@ async fn sender_does_not_retry_permanent_receiver_reject() {
 }
 
 #[tokio::test]
-async fn sender_does_not_retry_when_verified_confirmation_is_lost() {
+async fn sender_retries_and_reconciles_when_verified_confirmation_is_lost() {
     let temp = tempdir().unwrap();
 
     let source_directory = temp.path().join("source");
@@ -159,20 +159,22 @@ async fn sender_does_not_retry_when_verified_confirmation_is_lost() {
     let source_path_string = source_path.to_string_lossy().into_owned();
 
     let fake_receiver = async {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
+        let (mut first_stream, _peer) = listener.accept().await.unwrap();
 
-        receive_sender_handshake(&mut stream).await;
+        receive_sender_handshake(&mut first_stream).await;
 
-        let offer = receive_offer(&mut stream).await;
+        let first_offer = receive_offer(&mut first_stream).await;
 
-        assert_eq!(offer.filename, "lost-verified.bin");
-        assert_eq!(offer.file_size, original_data.len() as u64);
+        assert_eq!(first_offer.filename, "lost-verified.bin");
+        assert_eq!(first_offer.file_size, original_data.len() as u64);
+
+        let transfer_id = first_offer.transfer_id;
 
         let accept = Frame::new(MessageType::Accept, Vec::new());
 
-        write_frame(&mut stream, &accept).await.unwrap();
+        write_frame(&mut first_stream, &accept).await.unwrap();
 
-        let (received, complete_hash) = receive_until_complete(&mut stream).await;
+        let (received, complete_hash) = receive_until_complete(&mut first_stream).await;
 
         assert_eq!(received, original_data);
 
@@ -180,33 +182,63 @@ async fn sender_does_not_retry_when_verified_confirmation_is_lost() {
 
         assert_eq!(complete_hash, expected_hash.as_bytes().to_vec());
 
-        // Simulate the case where COMPLETE reached the receiver,
-        // but the connection disappears before VERIFIED reaches
-        // the sender.
-        drop(stream);
+        // COMPLETE reached the receiver, but VERIFIED is lost with the connection.
+        drop(first_stream);
 
-        let second_connection = timeout(NO_EXTRA_CONNECTION_WINDOW, listener.accept()).await;
+        let (mut second_stream, _peer) = listener.accept().await.unwrap();
+
+        receive_sender_handshake(&mut second_stream).await;
+
+        let second_offer = receive_offer(&mut second_stream).await;
+
+        assert_eq!(second_offer.filename, "lost-verified.bin");
+        assert_eq!(second_offer.file_size, original_data.len() as u64);
+        assert_eq!(
+            second_offer.transfer_id, transfer_id,
+            "sender changed transfer identity between retry sessions"
+        );
+
+        // A reconciled VERIFIED response must not require reopening or reading the source file.
+        fs::remove_file(&source_path).unwrap();
+
+        let verified = Frame::new(MessageType::Verified, Vec::new());
+
+        write_frame(&mut second_stream, &verified).await.unwrap();
+
+        let next_frame = timeout(NO_EXTRA_CONNECTION_WINDOW, read_frame(&mut second_stream)).await;
+
+        match next_frame {
+            Ok(Ok(frame)) => {
+                panic!(
+                    "sender transmitted {:?} after direct VERIFIED response to OFFER",
+                    frame.message_type
+                );
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                panic!("sender kept the reconciled transfer session open after VERIFIED");
+            }
+        }
+
+        let third_connection = timeout(NO_EXTRA_CONNECTION_WINDOW, listener.accept()).await;
 
         assert!(
-            second_connection.is_err(),
-            "sender retried after COMPLETE even though completion status was ambiguous"
+            third_connection.is_err(),
+            "sender attempted a third transfer session after reconciliation"
         );
     };
 
     let sender = run_sender(&source_path_string, &address);
 
-    let (_, sender_result) = timeout(Duration::from_secs(5), async {
+    let (_, sender_result) = timeout(Duration::from_secs(6), async {
         tokio::join!(fake_receiver, sender)
     })
     .await
-    .expect("lost VERIFIED test timed out");
-
-    let sender_error =
-        sender_result.expect_err("sender unexpectedly reported success without VERIFIED");
+    .expect("lost VERIFIED reconciliation test timed out");
 
     assert!(
-        sender_error.to_string().contains("status is unknown"),
-        "sender did not report ambiguous completion status: {sender_error}"
+        sender_result.is_ok(),
+        "sender failed to reconcile after lost VERIFIED: {sender_result:?}"
     );
 }
 

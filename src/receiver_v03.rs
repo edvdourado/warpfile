@@ -8,7 +8,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::chunk::ChunkRange;
 use crate::chunk_manifest::ChunkHash;
-use crate::chunk_state::ChunkState;
+use crate::chunk_state::{ChunkState, ChunkStateError, write_chunk_state};
 use crate::protocol::{ChunkStartV03, DataV03};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,8 +23,10 @@ pub enum ReceiverV03Error {
     PartialNotRegularFile,
     ChunkIndexOutOfRange(u64),
     ChunkAlreadyActive,
+    ChunkPendingPersistence { index: u64 },
     NonIncreasingChunkIndex { previous: u64, current: u64 },
     AlreadyVerifiedChunk(u64),
+    NoPendingVerifiedChunk,
     DataWithoutActiveChunk,
     UnexpectedDataOffset { expected: u64, actual: u64 },
     DataLengthOverflow,
@@ -32,6 +34,7 @@ pub enum ReceiverV03Error {
     DataExceedsFileSize { end: u64, file_size: u64 },
     DataCrossesChunkBoundary { end: u64, chunk_end: u64 },
     ChunkHashMismatch { index: u64 },
+    ChunkState(ChunkStateError),
 }
 
 impl fmt::Display for ReceiverV03Error {
@@ -45,6 +48,12 @@ impl fmt::Display for ReceiverV03Error {
                 write!(formatter, "chunk index is out of range: {index}")
             }
             Self::ChunkAlreadyActive => formatter.write_str("a chunk is already active"),
+            Self::ChunkPendingPersistence { index } => {
+                write!(
+                    formatter,
+                    "chunk {index} is waiting for durable persistence"
+                )
+            }
             Self::NonIncreasingChunkIndex { previous, current } => {
                 write!(
                     formatter,
@@ -56,6 +65,9 @@ impl fmt::Display for ReceiverV03Error {
                     formatter,
                     "chunk {index} already matches the receiver inventory"
                 )
+            }
+            Self::NoPendingVerifiedChunk => {
+                formatter.write_str("no verified chunk is waiting for persistence")
             }
             Self::DataWithoutActiveChunk => {
                 formatter.write_str("DATA arrived without an active chunk")
@@ -77,6 +89,7 @@ impl fmt::Display for ReceiverV03Error {
             Self::ChunkHashMismatch { index } => {
                 write!(formatter, "chunk {index} does not match its declared hash")
             }
+            Self::ChunkState(error) => write!(formatter, "WFP/0.3 chunk state error: {error}"),
         }
     }
 }
@@ -85,6 +98,7 @@ impl Error for ReceiverV03Error {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::ChunkState(error) => Some(error),
             _ => None,
         }
     }
@@ -93,6 +107,12 @@ impl Error for ReceiverV03Error {
 impl From<io::Error> for ReceiverV03Error {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<ChunkStateError> for ReceiverV03Error {
+    fn from(error: ChunkStateError) -> Self {
+        Self::ChunkState(error)
     }
 }
 
@@ -131,6 +151,7 @@ pub struct ChunkReceiverV03 {
     chunk_state: ChunkState,
     last_chunk_index: Option<u64>,
     active: Option<IncomingChunk>,
+    pending_verified: Option<VerifiedChunk>,
 }
 
 impl ChunkReceiverV03 {
@@ -139,10 +160,17 @@ impl ChunkReceiverV03 {
             chunk_state,
             last_chunk_index: None,
             active: None,
+            pending_verified: None,
         }
     }
 
     pub fn begin_chunk(&mut self, chunk_start: ChunkStartV03) -> Result<(), ReceiverV03Error> {
+        if let Some(pending) = self.pending_verified {
+            return Err(ReceiverV03Error::ChunkPendingPersistence {
+                index: pending.index,
+            });
+        }
+
         if self.active.is_some() {
             return Err(ReceiverV03Error::ChunkAlreadyActive);
         }
@@ -236,10 +264,35 @@ impl ChunkReceiverV03 {
             });
         }
 
-        let index = active.range.index;
+        let verified = VerifiedChunk {
+            index: active.range.index,
+            hash,
+        };
         let _ = self.active.take();
+        self.pending_verified = Some(verified);
 
-        Ok(Some(VerifiedChunk { index, hash }))
+        Ok(Some(verified))
+    }
+
+    pub async fn persist_verified_chunk(
+        &mut self,
+        file: &mut fs::File,
+        partial_path: &Path,
+    ) -> Result<(), ReceiverV03Error> {
+        let verified = self
+            .pending_verified
+            .ok_or(ReceiverV03Error::NoPendingVerifiedChunk)?;
+        let mut candidate = self.chunk_state.clone();
+        candidate.record_verified_chunk(verified.index, verified.hash)?;
+
+        file.flush().await?;
+        file.sync_data().await?;
+        write_chunk_state(partial_path, &candidate).await?;
+
+        self.chunk_state = candidate;
+        self.pending_verified = None;
+
+        Ok(())
     }
 }
 
@@ -251,7 +304,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     use crate::chunk::ChunkLayout;
-    use crate::chunk_state::{RecordedChunk, chunk_state_path};
+    use crate::chunk_state::{ChunkStateError, RecordedChunk, chunk_state_path, read_chunk_state};
 
     fn hash(data: &[u8]) -> ChunkHash {
         ChunkHash::from_bytes(*blake3::hash(data).as_bytes())
@@ -392,6 +445,10 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        receiver
+            .persist_verified_chunk(&mut file, &partial)
+            .await
+            .unwrap();
         assert!(matches!(
             receiver.begin_chunk(chunk_start(0, b"abcd")),
             Err(ReceiverV03Error::NonIncreasingChunkIndex {
@@ -497,6 +554,15 @@ mod tests {
             })
         );
         assert!(receiver.active.is_none());
+        assert_eq!(
+            receiver.pending_verified,
+            Some(VerifiedChunk {
+                index: 1,
+                hash: hash(b"efgh"),
+            })
+        );
+        assert!(receiver.chunk_state.recorded_chunks().is_empty());
+        assert!(!chunk_state_path(&partial).exists());
 
         file.seek(io::SeekFrom::Start(4)).await.unwrap();
         let mut bytes = [0u8; 4];
@@ -522,6 +588,159 @@ mod tests {
             receiver.begin_chunk(chunk_start(1, b"efgh")),
             Err(ReceiverV03Error::ChunkAlreadyActive)
         ));
+        assert!(receiver.pending_verified.is_none());
+        assert!(receiver.chunk_state.recorded_chunks().is_empty());
+        assert!(!chunk_state_path(&partial).exists());
+    }
+
+    #[tokio::test]
+    async fn persists_verified_chunk_before_starting_the_next_chunk() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.part");
+        let mut file = prepare_v03_partial_file(&partial, 12).await.unwrap();
+        let mut receiver = ChunkReceiverV03::new(state(
+            12,
+            4,
+            vec![RecordedChunk {
+                index: 0,
+                hash: hash(b"abcd"),
+            }],
+        ));
+
+        receiver.begin_chunk(chunk_start(1, b"efgh")).unwrap();
+        assert_eq!(
+            receiver
+                .write_data(&mut file, &data(4, b"efgh"))
+                .await
+                .unwrap(),
+            Some(VerifiedChunk {
+                index: 1,
+                hash: hash(b"efgh"),
+            })
+        );
+        assert!(matches!(
+            receiver.begin_chunk(chunk_start(2, b"ijkl")),
+            Err(ReceiverV03Error::ChunkPendingPersistence { index: 1 })
+        ));
+        assert!(receiver.active.is_none());
+        assert_eq!(receiver.chunk_state.hash(1), None);
+        assert!(!chunk_state_path(&partial).exists());
+
+        receiver
+            .persist_verified_chunk(&mut file, &partial)
+            .await
+            .unwrap();
+
+        assert!(receiver.pending_verified.is_none());
+        assert_eq!(receiver.chunk_state.hash(1), Some(hash(b"efgh")));
+        assert_eq!(
+            read_chunk_state(&partial).await.unwrap(),
+            receiver.chunk_state
+        );
+        receiver.begin_chunk(chunk_start(2, b"ijkl")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistence_replaces_divergent_hash_in_strict_sparse_order() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.part");
+        let mut file = prepare_v03_partial_file(&partial, 12).await.unwrap();
+        let mut receiver = ChunkReceiverV03::new(state(
+            12,
+            4,
+            vec![
+                RecordedChunk {
+                    index: 0,
+                    hash: hash(b"abcd"),
+                },
+                RecordedChunk {
+                    index: 1,
+                    hash: hash(b"old!"),
+                },
+                RecordedChunk {
+                    index: 2,
+                    hash: hash(b"ijkl"),
+                },
+            ],
+        ));
+
+        receiver.begin_chunk(chunk_start(1, b"efgh")).unwrap();
+        receiver
+            .write_data(&mut file, &data(4, b"efgh"))
+            .await
+            .unwrap();
+        receiver
+            .persist_verified_chunk(&mut file, &partial)
+            .await
+            .unwrap();
+
+        let expected = [
+            RecordedChunk {
+                index: 0,
+                hash: hash(b"abcd"),
+            },
+            RecordedChunk {
+                index: 1,
+                hash: hash(b"efgh"),
+            },
+            RecordedChunk {
+                index: 2,
+                hash: hash(b"ijkl"),
+            },
+        ];
+        assert_eq!(receiver.chunk_state.recorded_chunks(), expected);
+        assert_eq!(
+            read_chunk_state(&partial).await.unwrap().recorded_chunks(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_requires_pending_verified_chunk() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.part");
+        let mut file = prepare_v03_partial_file(&partial, 4).await.unwrap();
+        let mut receiver = ChunkReceiverV03::new(state(4, 4, Vec::new()));
+
+        assert!(matches!(
+            receiver.persist_verified_chunk(&mut file, &partial).await,
+            Err(ReceiverV03Error::NoPendingVerifiedChunk)
+        ));
+        assert!(receiver.chunk_state.recorded_chunks().is_empty());
+        assert!(!chunk_state_path(&partial).exists());
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_persistence_keeps_durable_progress_pending() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.part");
+        let state_path = chunk_state_path(&partial);
+        let mut file = prepare_v03_partial_file(&partial, 8).await.unwrap();
+        let mut receiver = ChunkReceiverV03::new(state(8, 4, Vec::new()));
+        receiver.begin_chunk(chunk_start(0, b"abcd")).unwrap();
+        receiver
+            .write_data(&mut file, &data(0, b"abcd"))
+            .await
+            .unwrap();
+        fs::create_dir(&state_path).await.unwrap();
+
+        assert!(matches!(
+            receiver.persist_verified_chunk(&mut file, &partial).await,
+            Err(ReceiverV03Error::ChunkState(ChunkStateError::Io(_)))
+        ));
+        assert_eq!(receiver.chunk_state.hash(0), None);
+        assert_eq!(
+            receiver.pending_verified,
+            Some(VerifiedChunk {
+                index: 0,
+                hash: hash(b"abcd"),
+            })
+        );
+        assert!(matches!(
+            receiver.begin_chunk(chunk_start(1, b"efgh")),
+            Err(ReceiverV03Error::ChunkPendingPersistence { index: 0 })
+        ));
+        assert!(state_path.is_dir());
     }
 
     #[tokio::test]

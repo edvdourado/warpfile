@@ -221,6 +221,23 @@ pub async fn read_chunk_state(partial_path: &Path) -> Result<ChunkState, ChunkSt
     decode_chunk_state(&bytes)
 }
 
+pub async fn prepare_chunk_inventory(
+    partial_path: &Path,
+    offered_layout: ChunkLayout,
+) -> Result<ChunkState, ChunkStateError> {
+    let state = match read_chunk_state(partial_path).await {
+        Ok(state) if state.layout() == offered_layout => state,
+        Ok(_) => return ChunkState::new(offered_layout, Vec::new()),
+        Err(ChunkStateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return ChunkState::new(offered_layout, Vec::new());
+        }
+        Err(ChunkStateError::Io(error)) => return Err(ChunkStateError::Io(error)),
+        Err(_) => return ChunkState::new(offered_layout, Vec::new()),
+    };
+
+    revalidate_chunk_state(partial_path, &state).await
+}
+
 pub async fn revalidate_chunk_state(
     partial_path: &Path,
     state: &ChunkState,
@@ -860,6 +877,185 @@ mod tests {
         let error = read_chunk_state(&partial_path).await.unwrap_err();
 
         assert!(matches!(error, ChunkStateError::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn preparation_returns_empty_inventory_without_a_snapshot() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let offered_layout = ChunkLayout::new(12, 4).unwrap();
+
+        fs::write(&partial_path, b"abcdefghijkl").await.unwrap();
+        let partial_before = fs::read(&partial_path).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, offered_layout)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.layout(), offered_layout);
+        assert!(prepared.recorded_chunks().is_empty());
+        assert_eq!(fs::read(&partial_path).await.unwrap(), partial_before);
+    }
+
+    #[tokio::test]
+    async fn preparation_revalidates_compatible_snapshot_records_in_order() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let data = b"abcdefghijklmnopqrst";
+        let state = state_for_chunks(data, 4, &[0, 2, 4]);
+
+        fs::write(&partial_path, data).await.unwrap();
+        write_chunk_state(&partial_path, &state).await.unwrap();
+        let partial_before = fs::read(&partial_path).await.unwrap();
+        let snapshot_before = fs::read(chunk_state_path(&partial_path)).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, state.layout())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared, state);
+        assert_eq!(fs::read(&partial_path).await.unwrap(), partial_before);
+        assert_eq!(
+            fs::read(chunk_state_path(&partial_path)).await.unwrap(),
+            snapshot_before
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_omits_physically_modified_recorded_chunks() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 1, 2]);
+
+        fs::write(&partial_path, b"abcdWXYZijkl").await.unwrap();
+        write_chunk_state(&partial_path, &state).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, state.layout())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared, state_for_chunks(b"abcdefghijkl", 4, &[0, 2]));
+    }
+
+    #[tokio::test]
+    async fn preparation_keeps_only_complete_chunks_from_a_truncated_partial() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 1, 2]);
+
+        fs::write(&partial_path, b"abcdefghij").await.unwrap();
+        write_chunk_state(&partial_path, &state).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, state.layout())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared, state_for_chunks(b"abcdefghijkl", 4, &[0, 1]));
+    }
+
+    #[tokio::test]
+    async fn preparation_returns_empty_inventory_when_partial_is_missing() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 2]);
+
+        write_chunk_state(&partial_path, &state).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, state.layout())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.layout(), state.layout());
+        assert!(prepared.recorded_chunks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preparation_rejects_snapshot_with_a_different_file_size() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 1, 2]);
+        let offered_layout = ChunkLayout::new(16, 4).unwrap();
+
+        fs::write(&partial_path, b"abcdefghijklmnop").await.unwrap();
+        write_chunk_state(&partial_path, &state).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, offered_layout)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.layout(), offered_layout);
+        assert!(prepared.recorded_chunks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preparation_rejects_snapshot_with_a_different_chunk_size() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 1, 2]);
+        let offered_layout = ChunkLayout::new(12, 3).unwrap();
+
+        fs::write(&partial_path, b"abcdefghijkl").await.unwrap();
+        write_chunk_state(&partial_path, &state).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, offered_layout)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.layout(), offered_layout);
+        assert!(prepared.recorded_chunks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preparation_ignores_malformed_snapshot_without_rewriting_it() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state_path = chunk_state_path(&partial_path);
+        let offered_layout = ChunkLayout::new(12, 4).unwrap();
+        let snapshot = b"{ this is not valid JSON";
+
+        fs::write(&partial_path, b"abcdefghijkl").await.unwrap();
+        fs::write(&state_path, snapshot).await.unwrap();
+
+        let prepared = prepare_chunk_inventory(&partial_path, offered_layout)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.layout(), offered_layout);
+        assert!(prepared.recorded_chunks().is_empty());
+        assert_eq!(fs::read(&state_path).await.unwrap(), snapshot);
+    }
+
+    #[tokio::test]
+    async fn preparation_accepts_an_empty_inventory_for_an_empty_file() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let offered_layout = ChunkLayout::new(0, 4).unwrap();
+        let state = ChunkState::new(offered_layout, Vec::new()).unwrap();
+
+        write_chunk_state(&partial_path, &state).await.unwrap();
+
+        assert_eq!(
+            prepare_chunk_inventory(&partial_path, offered_layout)
+                .await
+                .unwrap(),
+            state
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_propagates_non_not_found_snapshot_io_errors() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state_path = chunk_state_path(&partial_path);
+        let offered_layout = ChunkLayout::new(12, 4).unwrap();
+
+        fs::create_dir(&state_path).await.unwrap();
+
+        let error = prepare_chunk_inventory(&partial_path, offered_layout)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ChunkStateError::Io(_)));
     }
 
     #[tokio::test]

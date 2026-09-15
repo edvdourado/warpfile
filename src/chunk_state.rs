@@ -65,6 +65,26 @@ impl ChunkState {
 
         Some(self.chunks[position].hash)
     }
+
+    pub fn record_verified_chunk(
+        &mut self,
+        index: u64,
+        hash: ChunkHash,
+    ) -> Result<(), ChunkStateError> {
+        if self.layout.range(index).is_none() {
+            return Err(ChunkStateError::ChunkIndexOutOfRange(index));
+        }
+
+        match self
+            .chunks
+            .binary_search_by_key(&index, |chunk| chunk.index)
+        {
+            Ok(position) => self.chunks[position].hash = hash,
+            Err(position) => self.chunks.insert(position, RecordedChunk { index, hash }),
+        }
+
+        Ok(())
+    }
 }
 
 impl fmt::Display for ChunkStateError {
@@ -615,6 +635,111 @@ mod tests {
         assert_eq!(state.hash(2), Some(hash(0x22)));
         assert_eq!(state.hash(3), None);
         assert_eq!(state.hash(4), Some(hash(0xAB)));
+    }
+
+    #[test]
+    fn records_verified_chunk_into_empty_state() {
+        let layout = ChunkLayout::new(20, 4).unwrap();
+        let mut state = ChunkState::new(layout, Vec::new()).unwrap();
+
+        state.record_verified_chunk(2, hash(0x22)).unwrap();
+
+        assert_eq!(
+            state.recorded_chunks(),
+            &[RecordedChunk {
+                index: 2,
+                hash: hash(0x22)
+            }]
+        );
+    }
+
+    #[test]
+    fn records_verified_chunks_in_sorted_sparse_order() {
+        let layout = ChunkLayout::new(28, 4).unwrap();
+        let mut state = ChunkState::new(
+            layout,
+            vec![
+                RecordedChunk {
+                    index: 2,
+                    hash: hash(0x22),
+                },
+                RecordedChunk {
+                    index: 5,
+                    hash: hash(0x55),
+                },
+            ],
+        )
+        .unwrap();
+
+        state.record_verified_chunk(0, hash(0x00)).unwrap();
+        state.record_verified_chunk(3, hash(0x33)).unwrap();
+        state.record_verified_chunk(6, hash(0x66)).unwrap();
+
+        assert_eq!(
+            state.recorded_chunks(),
+            &[
+                RecordedChunk {
+                    index: 0,
+                    hash: hash(0x00)
+                },
+                RecordedChunk {
+                    index: 2,
+                    hash: hash(0x22)
+                },
+                RecordedChunk {
+                    index: 3,
+                    hash: hash(0x33)
+                },
+                RecordedChunk {
+                    index: 5,
+                    hash: hash(0x55)
+                },
+                RecordedChunk {
+                    index: 6,
+                    hash: hash(0x66)
+                },
+            ]
+        );
+        assert_eq!(state.hash(1), None);
+        assert_eq!(state.hash(4), None);
+    }
+
+    #[test]
+    fn record_verified_chunk_replaces_existing_hash_without_duplicates() {
+        let mut state = replacement_state();
+
+        state.record_verified_chunk(1, hash(0xAA)).unwrap();
+        state.record_verified_chunk(1, hash(0xAA)).unwrap();
+
+        assert_eq!(state.hash(1), Some(hash(0xAA)));
+        assert_eq!(state.recorded_chunks().len(), 2);
+        assert_eq!(state.recorded_chunks()[0].index, 1);
+    }
+
+    #[test]
+    fn record_verified_chunk_rejects_out_of_range_without_mutating_state() {
+        let mut state = sparse_state();
+        let original = state.clone();
+
+        let error = state.record_verified_chunk(5, hash(0x55)).unwrap_err();
+
+        assert!(matches!(error, ChunkStateError::ChunkIndexOutOfRange(5)));
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn record_verified_chunk_rejects_every_index_for_empty_file() {
+        let layout = ChunkLayout::new(0, 4).unwrap();
+        let mut state = ChunkState::new(layout, Vec::new()).unwrap();
+
+        for index in [0, 1, u64::MAX] {
+            assert!(matches!(
+                state.record_verified_chunk(index, hash(0x11)),
+                Err(ChunkStateError::ChunkIndexOutOfRange(value)) if value == index
+            ));
+        }
+
+        assert!(state.recorded_chunks().is_empty());
     }
 
     #[test]

@@ -5,15 +5,16 @@ use std::mem;
 use std::path::Path;
 
 use tokio::fs::{self, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 use crate::chunk::{ChunkLayout, ChunkLayoutError, ChunkRange};
 use crate::chunk_manifest::ChunkHash;
 use crate::chunk_state::{ChunkState, ChunkStateError, prepare_chunk_inventory, write_chunk_state};
-use crate::protocol::frame::MAX_PAYLOAD_LENGTH;
+use crate::protocol::frame::{FrameError, MAX_PAYLOAD_LENGTH, WFP_VERSION_V03};
 use crate::protocol::{
-    CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkStartV03, DataV03,
-    FileOfferV03, ResumeRequestV03,
+    CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkHashesError, ChunkStartV03,
+    DataV03, FileOfferV03, Frame, MessageType, ProtocolIoError, ResumeRequestV03,
+    encode_chunk_hashes, encode_resume_v03, read_frame_for_version, write_frame,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,10 +199,127 @@ pub async fn prepare_v03_partial_file(
 }
 
 pub struct PreparedReceiverV03 {
-    pub file: fs::File,
-    pub receiver: ChunkReceiverV03,
-    pub resume: ResumeRequestV03,
-    pub chunk_hash_batches: Vec<ChunkHashesBatch>,
+    file: fs::File,
+    receiver: ChunkReceiverV03,
+    resume: ResumeRequestV03,
+    chunk_hash_batches: Vec<ChunkHashesBatch>,
+}
+
+pub struct AcceptedReceiverV03 {
+    #[allow(
+        dead_code,
+        reason = "the future WFP/0.3 data phase will consume this state"
+    )]
+    file: fs::File,
+    #[allow(
+        dead_code,
+        reason = "the future WFP/0.3 data phase will consume this state"
+    )]
+    receiver: ChunkReceiverV03,
+}
+
+#[derive(Debug)]
+pub enum ReceiverV03NegotiationError {
+    Frame(FrameError),
+    ChunkHashes(ChunkHashesError),
+    Protocol(ProtocolIoError),
+    InvalidAcceptPayload(usize),
+    UnexpectedMessageType(MessageType),
+}
+
+impl fmt::Display for ReceiverV03NegotiationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Frame(error) => write!(formatter, "WFP/0.3 inventory frame error: {error}"),
+            Self::ChunkHashes(error) => {
+                write!(formatter, "WFP/0.3 chunk inventory encoding error: {error}")
+            }
+            Self::Protocol(error) => write!(formatter, "WFP/0.3 inventory I/O error: {error}"),
+            Self::InvalidAcceptPayload(length) => {
+                write!(
+                    formatter,
+                    "WFP/0.3 ACCEPT payload must be empty, received {length} bytes"
+                )
+            }
+            Self::UnexpectedMessageType(message_type) => write!(
+                formatter,
+                "expected WFP/0.3 ACCEPT after chunk inventory, received message type 0x{:02X}",
+                *message_type as u8
+            ),
+        }
+    }
+}
+
+impl Error for ReceiverV03NegotiationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Frame(error) => Some(error),
+            Self::ChunkHashes(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::InvalidAcceptPayload(_) | Self::UnexpectedMessageType(_) => None,
+        }
+    }
+}
+
+impl From<FrameError> for ReceiverV03NegotiationError {
+    fn from(error: FrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<ChunkHashesError> for ReceiverV03NegotiationError {
+    fn from(error: ChunkHashesError) -> Self {
+        Self::ChunkHashes(error)
+    }
+}
+
+impl From<ProtocolIoError> for ReceiverV03NegotiationError {
+    fn from(error: ProtocolIoError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl PreparedReceiverV03 {
+    pub async fn negotiate_inventory<S>(
+        self,
+        stream: &mut S,
+    ) -> Result<AcceptedReceiverV03, ReceiverV03NegotiationError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let resume = Frame::new_for_version(
+            WFP_VERSION_V03,
+            MessageType::Resume,
+            encode_resume_v03(&self.resume),
+        )?;
+        write_frame(stream, &resume).await?;
+
+        for batch in &self.chunk_hash_batches {
+            let frame = Frame::new_for_version(
+                WFP_VERSION_V03,
+                MessageType::ChunkHashes,
+                encode_chunk_hashes(batch)?,
+            )?;
+            write_frame(stream, &frame).await?;
+        }
+
+        let response = read_frame_for_version(stream, WFP_VERSION_V03).await?;
+        if response.message_type != MessageType::Accept {
+            return Err(ReceiverV03NegotiationError::UnexpectedMessageType(
+                response.message_type,
+            ));
+        }
+        if !response.payload.is_empty() {
+            return Err(ReceiverV03NegotiationError::InvalidAcceptPayload(
+                response.payload.len(),
+            ));
+        }
+
+        Ok(AcceptedReceiverV03 {
+            file: self.file,
+            receiver: self.receiver,
+        })
+    }
 }
 
 pub async fn prepare_receiver_v03(
@@ -411,13 +529,14 @@ mod tests {
     use super::*;
 
     use tempfile::tempdir;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, DuplexStream, duplex};
 
     use crate::chunk::ChunkLayout;
     use crate::chunk_state::{
         ChunkStateError, RecordedChunk, chunk_state_path, read_chunk_state, write_chunk_state,
     };
-    use crate::protocol::encode_chunk_hashes;
+    use crate::protocol::frame::{ACTIVE_WFP_VERSION, WFP_VERSION_V02};
+    use crate::protocol::{DecodeError, decode_chunk_hashes, decode_resume_v03};
 
     fn hash(data: &[u8]) -> ChunkHash {
         ChunkHash::from_bytes(*blake3::hash(data).as_bytes())
@@ -488,6 +607,40 @@ mod tests {
             prepared.resume.chunk_record_count,
             u64::try_from(count).unwrap()
         );
+    }
+
+    async fn read_inventory(stream: &mut DuplexStream, batch_count: usize) -> (Frame, Vec<Frame>) {
+        let resume = read_frame_for_version(stream, WFP_VERSION_V03)
+            .await
+            .unwrap();
+        let mut batches = Vec::with_capacity(batch_count);
+        for _ in 0..batch_count {
+            batches.push(
+                read_frame_for_version(stream, WFP_VERSION_V03)
+                    .await
+                    .unwrap(),
+            );
+        }
+        (resume, batches)
+    }
+
+    fn accept_frame() -> Frame {
+        Frame::new_for_version(WFP_VERSION_V03, MessageType::Accept, Vec::new()).unwrap()
+    }
+
+    async fn prepared_from_state(partial: &Path, state: ChunkState) -> PreparedReceiverV03 {
+        let file = prepare_v03_partial_file(partial, state.layout().file_size())
+            .await
+            .unwrap();
+        let chunk_record_count = u64::try_from(state.recorded_chunks().len()).unwrap();
+        let chunk_hash_batches = chunk_hash_batches(&state);
+
+        PreparedReceiverV03 {
+            file,
+            receiver: ChunkReceiverV03::new(state),
+            resume: ResumeRequestV03 { chunk_record_count },
+            chunk_hash_batches,
+        }
     }
 
     #[tokio::test]
@@ -1136,6 +1289,265 @@ mod tests {
                 index: 0,
                 hash: hash(b"z"),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiates_an_empty_inventory_with_explicit_wfp_v03_frames() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("empty.part");
+        let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let peer = async {
+            let (resume, batches) = read_inventory(&mut peer_stream, 0).await;
+            write_frame(&mut peer_stream, &accept_frame())
+                .await
+                .unwrap();
+            (resume, batches)
+        };
+        let (accepted, (resume, batches)) =
+            tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        let accepted = accepted.unwrap();
+
+        assert_eq!(ACTIVE_WFP_VERSION, WFP_VERSION_V02);
+        assert_eq!(resume.version, WFP_VERSION_V03);
+        assert_eq!(resume.message_type, MessageType::Resume);
+        assert_eq!(
+            decode_resume_v03(&resume.payload)
+                .unwrap()
+                .chunk_record_count,
+            0
+        );
+        assert!(batches.is_empty());
+        assert_eq!(accepted.file.metadata().await.unwrap().len(), 0);
+        assert!(accepted.receiver.chunk_state.recorded_chunks().is_empty());
+        assert!(accepted.receiver.active.is_none());
+        assert!(accepted.receiver.pending_verified.is_none());
+    }
+
+    #[tokio::test]
+    async fn negotiates_a_sparse_prepared_inventory_without_changing_local_state() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.part");
+        let bytes = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let layout = ChunkLayout::new(40, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(bytes, layout, &[0, 3, 9])).unwrap();
+        fs::write(&partial, bytes).await.unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let state_path = chunk_state_path(&partial);
+        let partial_before = fs::read(&partial).await.unwrap();
+        let snapshot_before = fs::read(&state_path).await.unwrap();
+        let prepared = prepare_receiver_v03(&partial, &offer(40, 4)).await.unwrap();
+        let expected_resume = prepared.resume;
+        let expected_batches = prepared.chunk_hash_batches.clone();
+        let expected_state = prepared.receiver.chunk_state.clone();
+        let (mut receiver_stream, mut peer_stream) = duplex(4096);
+
+        let peer = async {
+            let (resume, batches) = read_inventory(&mut peer_stream, expected_batches.len()).await;
+            write_frame(&mut peer_stream, &accept_frame())
+                .await
+                .unwrap();
+            (resume, batches)
+        };
+        let (accepted, (resume, batches)) =
+            tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        let accepted = accepted.unwrap();
+
+        assert_eq!(resume.version, WFP_VERSION_V03);
+        assert_eq!(resume.message_type, MessageType::Resume);
+        assert_eq!(decode_resume_v03(&resume.payload).unwrap(), expected_resume);
+        assert!(batches.iter().all(|frame| frame.version == WFP_VERSION_V03));
+        assert!(
+            batches
+                .iter()
+                .all(|frame| frame.message_type == MessageType::ChunkHashes)
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .map(|frame| decode_chunk_hashes(&frame.payload).unwrap())
+                .collect::<Vec<_>>(),
+            expected_batches
+        );
+        assert_eq!(accepted.receiver.chunk_state, expected_state);
+        assert_eq!(fs::read(&partial).await.unwrap(), partial_before);
+        assert_eq!(fs::read(&state_path).await.unwrap(), snapshot_before);
+    }
+
+    #[tokio::test]
+    async fn negotiates_multiple_prepared_batches_in_order_before_accept() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("many.part");
+        let maximum = maximum_chunk_hash_records_per_batch();
+        let records = (0..=maximum)
+            .map(|index| RecordedChunk {
+                index: u64::try_from(index).unwrap(),
+                hash: ChunkHash::from_bytes([u8::try_from(index % 256).unwrap(); 32]),
+            })
+            .collect();
+        let state = ChunkState::new(
+            ChunkLayout::new(u64::try_from(maximum + 1).unwrap(), 1).unwrap(),
+            records,
+        )
+        .unwrap();
+        let prepared = prepared_from_state(&partial, state).await;
+        let expected_resume = prepared.resume;
+        let expected_batches = prepared.chunk_hash_batches.clone();
+        assert_eq!(expected_batches.len(), 2);
+        let (mut receiver_stream, mut peer_stream) = duplex(2 * (MAX_PAYLOAD_LENGTH + 12));
+
+        let peer = async {
+            let (resume, batches) = read_inventory(&mut peer_stream, expected_batches.len()).await;
+            write_frame(&mut peer_stream, &accept_frame())
+                .await
+                .unwrap();
+            (resume, batches)
+        };
+        let (accepted, (resume, batches)) =
+            tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        let accepted = accepted.unwrap();
+
+        assert_eq!(decode_resume_v03(&resume.payload).unwrap(), expected_resume);
+        let received_batches: Vec<_> = batches
+            .iter()
+            .map(|frame| decode_chunk_hashes(&frame.payload).unwrap())
+            .collect();
+        assert_eq!(received_batches, expected_batches);
+        assert_eq!(
+            received_batches
+                .iter()
+                .map(|batch| batch.records.len())
+                .sum::<usize>(),
+            usize::try_from(expected_resume.chunk_record_count).unwrap()
+        );
+        assert_eq!(
+            accepted.file.metadata().await.unwrap().len(),
+            expected_resume.chunk_record_count
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_nonempty_accept_and_unexpected_response_types() {
+        let temp = tempdir().unwrap();
+
+        let partial = temp.path().join("nonempty-accept.part");
+        let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+        let peer = async {
+            let _ = read_inventory(&mut peer_stream, 0).await;
+            let response =
+                Frame::new_for_version(WFP_VERSION_V03, MessageType::Accept, vec![0xA5]).unwrap();
+            write_frame(&mut peer_stream, &response).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        assert!(matches!(
+            result,
+            Err(ReceiverV03NegotiationError::InvalidAcceptPayload(1))
+        ));
+
+        for message_type in [
+            MessageType::ChunkStart,
+            MessageType::Data,
+            MessageType::Complete,
+        ] {
+            let partial = temp.path().join(format!("{message_type:?}.part"));
+            let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+            let (mut receiver_stream, mut peer_stream) = duplex(1024);
+            let peer = async {
+                let _ = read_inventory(&mut peer_stream, 0).await;
+                let response =
+                    Frame::new_for_version(WFP_VERSION_V03, message_type, Vec::new()).unwrap();
+                write_frame(&mut peer_stream, &response).await.unwrap();
+            };
+            let (result, ()) =
+                tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+            assert!(matches!(
+                result,
+                Err(ReceiverV03NegotiationError::UnexpectedMessageType(actual)) if actual == message_type
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_version_decode_errors_and_eof_before_accept() {
+        let temp = tempdir().unwrap();
+
+        let partial = temp.path().join("wrong-version.part");
+        let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+        let peer = async {
+            let _ = read_inventory(&mut peer_stream, 0).await;
+            let response =
+                Frame::new_for_version(WFP_VERSION_V02, MessageType::Accept, Vec::new()).unwrap();
+            write_frame(&mut peer_stream, &response).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        assert!(matches!(
+            result,
+            Err(ReceiverV03NegotiationError::Protocol(
+                ProtocolIoError::Decode(DecodeError::UnsupportedVersion(WFP_VERSION_V02))
+            ))
+        ));
+
+        let partial = temp.path().join("malformed.part");
+        let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+        let peer = async {
+            let _ = read_inventory(&mut peer_stream, 0).await;
+            peer_stream
+                .write_all(&[b'W', b'F', b'P', 0, WFP_VERSION_V03, 0x7E, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        assert!(matches!(
+            result,
+            Err(ReceiverV03NegotiationError::Protocol(
+                ProtocolIoError::Decode(DecodeError::UnknownMessageType(0x7E))
+            ))
+        ));
+
+        let partial = temp.path().join("eof.part");
+        let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+        let peer = async {
+            let _ = read_inventory(&mut peer_stream, 0).await;
+            drop(peer_stream);
+        };
+        let (result, ()) = tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        assert!(matches!(
+            result,
+            Err(ReceiverV03NegotiationError::Protocol(ProtocolIoError::Io(error)))
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[tokio::test]
+    async fn leaves_the_frame_after_accept_for_the_next_phase() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("next-frame.part");
+        let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+        let next =
+            Frame::new_for_version(WFP_VERSION_V03, MessageType::ChunkStart, Vec::new()).unwrap();
+
+        let peer = async {
+            let _ = read_inventory(&mut peer_stream, 0).await;
+            write_frame(&mut peer_stream, &accept_frame())
+                .await
+                .unwrap();
+            write_frame(&mut peer_stream, &next).await.unwrap();
+        };
+        let (accepted, ()) = tokio::join!(prepared.negotiate_inventory(&mut receiver_stream), peer);
+        let accepted = accepted.unwrap();
+        assert!(accepted.receiver.active.is_none());
+        assert_eq!(
+            read_frame_for_version(&mut receiver_stream, WFP_VERSION_V03)
+                .await
+                .unwrap(),
+            next
         );
     }
 }

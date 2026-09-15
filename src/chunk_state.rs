@@ -7,13 +7,14 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub const CHUNK_STATE_FORMAT_VERSION: u64 = 1;
 
 const CHUNK_HASH_LENGTH: usize = 32;
 const CHUNK_STATE_SUFFIX: &str = ".warpchunks";
 const CHUNK_STATE_TEMP_SUFFIX: &str = ".tmp";
+const REVALIDATION_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordedChunk {
@@ -220,6 +221,59 @@ pub async fn read_chunk_state(partial_path: &Path) -> Result<ChunkState, ChunkSt
     decode_chunk_state(&bytes)
 }
 
+pub async fn revalidate_chunk_state(
+    partial_path: &Path,
+    state: &ChunkState,
+) -> Result<ChunkState, ChunkStateError> {
+    if state.recorded_chunks().is_empty() {
+        return ChunkState::new(state.layout(), Vec::new());
+    }
+
+    let mut file = match fs::File::open(partial_path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ChunkState::new(state.layout(), Vec::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut buffer = [0u8; REVALIDATION_BUFFER_SIZE];
+    let mut verified_chunks = Vec::with_capacity(state.recorded_chunks().len());
+
+    for recorded_chunk in state.recorded_chunks() {
+        let Some(range) = state.layout().range(recorded_chunk.index) else {
+            continue;
+        };
+
+        file.seek(io::SeekFrom::Start(range.offset)).await?;
+
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = range.length;
+
+        while remaining > 0 {
+            let read_length = usize::try_from(remaining)
+                .unwrap_or(buffer.len())
+                .min(buffer.len());
+            let bytes_read = file.read(&mut buffer[..read_length]).await?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..bytes_read]);
+            remaining -= u64::try_from(bytes_read)
+                .expect("read length must fit into u64 on supported targets");
+        }
+
+        if remaining == 0
+            && ChunkHash::from_bytes(*hasher.finalize().as_bytes()) == recorded_chunk.hash
+        {
+            verified_chunks.push(*recorded_chunk);
+        }
+    }
+
+    ChunkState::new(state.layout(), verified_chunks)
+}
+
 pub async fn remove_chunk_state(partial_path: &Path) -> Result<(), ChunkStateError> {
     let state_path = chunk_state_path(partial_path);
     let temporary_path = chunk_state_temporary_path(partial_path);
@@ -421,6 +475,29 @@ mod tests {
 
     fn hash(byte: u8) -> ChunkHash {
         ChunkHash::from_bytes([byte; CHUNK_HASH_LENGTH])
+    }
+
+    fn chunk_hash(data: &[u8]) -> ChunkHash {
+        ChunkHash::from_bytes(*blake3::hash(data).as_bytes())
+    }
+
+    fn state_for_chunks(data: &[u8], chunk_size: u64, indices: &[u64]) -> ChunkState {
+        let layout = ChunkLayout::new(u64::try_from(data.len()).unwrap(), chunk_size).unwrap();
+        let chunks = indices
+            .iter()
+            .map(|&index| {
+                let range = layout.range(index).unwrap();
+                let start = usize::try_from(range.offset).unwrap();
+                let end = usize::try_from(range.offset + range.length).unwrap();
+
+                RecordedChunk {
+                    index,
+                    hash: chunk_hash(&data[start..end]),
+                }
+            })
+            .collect();
+
+        ChunkState::new(layout, chunks).unwrap()
     }
 
     fn sparse_state() -> ChunkState {
@@ -783,5 +860,100 @@ mod tests {
         let error = read_chunk_state(&partial_path).await.unwrap_err();
 
         assert!(matches!(error, ChunkStateError::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn revalidation_keeps_matching_recorded_chunks() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let data = b"abcdefghijkl";
+        let state = state_for_chunks(data, 4, &[0, 1, 2]);
+
+        fs::write(&partial_path, data).await.unwrap();
+
+        let revalidated = revalidate_chunk_state(&partial_path, &state).await.unwrap();
+
+        assert_eq!(revalidated, state);
+    }
+
+    #[tokio::test]
+    async fn revalidation_removes_changed_recorded_chunks() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 1, 2]);
+
+        fs::write(&partial_path, b"abcdWXYZijkl").await.unwrap();
+
+        let revalidated = revalidate_chunk_state(&partial_path, &state).await.unwrap();
+        let expected = state_for_chunks(b"abcdefghijkl", 4, &[0, 2]);
+
+        assert_eq!(revalidated, expected);
+    }
+
+    #[tokio::test]
+    async fn revalidation_keeps_complete_chunks_when_partial_file_is_truncated() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 1, 2]);
+
+        fs::write(&partial_path, b"abcdefghij").await.unwrap();
+
+        let revalidated = revalidate_chunk_state(&partial_path, &state).await.unwrap();
+
+        assert_eq!(
+            revalidated.recorded_chunks(),
+            &state.recorded_chunks()[0..2]
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidation_returns_empty_state_when_partial_file_is_missing() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 2]);
+
+        let revalidated = revalidate_chunk_state(&partial_path, &state).await.unwrap();
+
+        assert_eq!(revalidated.layout(), state.layout());
+        assert!(revalidated.recorded_chunks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revalidation_preserves_sparse_ordered_records() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let data = b"abcdefghijklmnopqrst";
+        let state = state_for_chunks(data, 4, &[0, 2, 4]);
+
+        fs::write(&partial_path, data).await.unwrap();
+
+        let revalidated = revalidate_chunk_state(&partial_path, &state).await.unwrap();
+
+        assert_eq!(revalidated.recorded_chunks(), state.recorded_chunks());
+    }
+
+    #[tokio::test]
+    async fn revalidation_ignores_corruption_in_unrecorded_chunks() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let state = state_for_chunks(b"abcdefghijkl", 4, &[0, 2]);
+
+        fs::write(&partial_path, b"abcdWXYZijkl").await.unwrap();
+
+        let revalidated = revalidate_chunk_state(&partial_path, &state).await.unwrap();
+
+        assert_eq!(revalidated, state);
+    }
+
+    #[tokio::test]
+    async fn revalidation_of_empty_state_does_not_require_partial_file() {
+        let temp = tempdir().unwrap();
+        let partial_path = temp.path().join("arquivo.bin.part");
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let state = ChunkState::new(layout, Vec::new()).unwrap();
+
+        let revalidated = revalidate_chunk_state(&partial_path, &state).await.unwrap();
+
+        assert_eq!(revalidated, state);
     }
 }

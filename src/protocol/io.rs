@@ -4,13 +4,11 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::decoder::{DecodeError, decode_frame};
+use super::decoder::{DecodeError, decode_frame_for_version, validate_frame_header};
 
 use super::encoder::{EncodeError, encode_frame};
 
-use super::frame::{Frame, HEADER_LENGTH, MAX_DATA_PAYLOAD_LENGTH, MAX_PAYLOAD_LENGTH};
-
-use super::message::MessageType;
+use super::frame::{ACTIVE_WFP_VERSION, Frame, HEADER_LENGTH};
 
 #[derive(Debug)]
 pub enum ProtocolIoError {
@@ -73,45 +71,45 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Frame, ProtocolIoError>
 where
     R: AsyncRead + Unpin,
 {
+    read_frame_for_version(reader, ACTIVE_WFP_VERSION).await
+}
+
+pub async fn read_frame_for_version<R>(
+    reader: &mut R,
+    version: u8,
+) -> Result<Frame, ProtocolIoError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0u8; HEADER_LENGTH];
 
     reader.read_exact(&mut header).await?;
 
-    let payload_length =
-        u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    let frame_header = validate_frame_header(&header, version)?;
 
-    if payload_length > MAX_PAYLOAD_LENGTH {
-        return Err(DecodeError::PayloadTooLarge(payload_length).into());
-    }
-
-    let message_type = MessageType::try_from(header[5]).map_err(DecodeError::UnknownMessageType)?;
-
-    if message_type == MessageType::Data && payload_length > MAX_DATA_PAYLOAD_LENGTH {
-        return Err(DecodeError::DataPayloadTooLarge(payload_length).into());
-    }
-
-    let mut bytes = Vec::with_capacity(HEADER_LENGTH + payload_length);
+    let mut bytes = Vec::with_capacity(HEADER_LENGTH + frame_header.payload_length);
 
     bytes.extend_from_slice(&header);
 
-    if payload_length > 0 {
-        let mut payload = vec![0u8; payload_length];
+    if frame_header.payload_length > 0 {
+        let mut payload = vec![0u8; frame_header.payload_length];
 
         reader.read_exact(&mut payload).await?;
 
         bytes.extend_from_slice(&payload);
     }
 
-    Ok(decode_frame(&bytes)?)
+    Ok(decode_frame_for_version(&bytes, version)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::protocol::frame::WFP_VERSION;
+    use crate::protocol::frame::{WFP_VERSION, WFP_VERSION_V02, WFP_VERSION_V03};
+    use crate::protocol::message::MessageType;
 
-    use tokio::io::duplex;
+    use tokio::io::{AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn writes_and_reads_one_frame() {
@@ -145,5 +143,47 @@ mod tests {
         assert_eq!(received_first, first);
 
         assert_eq!(received_second, second);
+    }
+
+    #[tokio::test]
+    async fn reads_wfp_v03_only_when_explicitly_requested() {
+        let (mut side_a, mut side_b) = duplex(1024);
+        let frame =
+            Frame::new_for_version(WFP_VERSION_V03, MessageType::ChunkHashes, Vec::new()).unwrap();
+
+        write_frame(&mut side_a, &frame).await.unwrap();
+        assert_eq!(
+            read_frame_for_version(&mut side_b, WFP_VERSION_V03)
+                .await
+                .unwrap(),
+            frame
+        );
+
+        let (mut side_a, mut side_b) = duplex(1024);
+        write_frame(&mut side_a, &frame).await.unwrap();
+        assert!(matches!(
+            read_frame(&mut side_b).await,
+            Err(ProtocolIoError::Decode(DecodeError::UnsupportedVersion(
+                WFP_VERSION_V03
+            )))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_headers_before_reading_the_declared_payload() {
+        for (version, message_type, expected_error) in [
+            (0x04, 0x01, DecodeError::UnsupportedVersion(0x04)),
+            (WFP_VERSION_V02, 0x15, DecodeError::UnknownMessageType(0x15)),
+        ] {
+            let (mut writer, mut reader) = duplex(HEADER_LENGTH);
+            let header = [b'W', b'F', b'P', 0, version, message_type, 0, 0, 0, 0, 0, 1];
+            writer.write_all(&header).await.unwrap();
+            drop(writer);
+
+            let result = read_frame(&mut reader).await;
+            assert!(
+                matches!(result, Err(ProtocolIoError::Decode(error)) if error == expected_error)
+            );
+        }
     }
 }

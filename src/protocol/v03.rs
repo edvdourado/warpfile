@@ -7,7 +7,6 @@ use super::frame::{MAX_DATA_PAYLOAD_LENGTH, MAX_PAYLOAD_LENGTH};
 use super::transfer_id::{TRANSFER_ID_LENGTH, TransferId};
 
 pub const V03_RESUME_PAYLOAD_LENGTH: usize = 8;
-pub const CHUNK_HASHES_MESSAGE_TYPE: u8 = 0x15;
 pub const CHUNK_HASH_RECORD_LENGTH: usize = 40;
 pub const V03_DATA_OFFSET_LENGTH: usize = 8;
 pub const V03_MAX_DATA_BYTES: usize = MAX_DATA_PAYLOAD_LENGTH - V03_DATA_OFFSET_LENGTH;
@@ -340,11 +339,6 @@ mod tests {
 
     fn transfer_id() -> TransferId {
         TransferId::from_bytes([0x10; TRANSFER_ID_LENGTH])
-    }
-
-    #[test]
-    fn chunk_hashes_message_type_is_reserved_for_wfp_v03() {
-        assert_eq!(CHUNK_HASHES_MESSAGE_TYPE, 0x15);
     }
 
     #[test]

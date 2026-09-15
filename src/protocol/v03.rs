@@ -8,6 +8,7 @@ use super::transfer_id::{TRANSFER_ID_LENGTH, TransferId};
 
 pub const V03_RESUME_PAYLOAD_LENGTH: usize = 8;
 pub const CHUNK_HASH_RECORD_LENGTH: usize = 40;
+pub const V03_CHUNK_START_PAYLOAD_LENGTH: usize = 40;
 pub const V03_DATA_OFFSET_LENGTH: usize = 8;
 pub const V03_MAX_DATA_BYTES: usize = MAX_DATA_PAYLOAD_LENGTH - V03_DATA_OFFSET_LENGTH;
 
@@ -264,6 +265,56 @@ pub fn decode_chunk_hashes(payload: &[u8]) -> Result<ChunkHashesBatch, ChunkHash
     Ok(ChunkHashesBatch { records })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkStartV03 {
+    pub chunk_index: u64,
+    pub expected_hash: ChunkHash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkStartV03Error {
+    InvalidPayloadLength(usize),
+}
+
+impl fmt::Display for ChunkStartV03Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPayloadLength(length) => write!(
+                formatter,
+                "WFP/0.3 CHUNK_START payload must contain exactly 40 bytes, received {length}"
+            ),
+        }
+    }
+}
+
+impl Error for ChunkStartV03Error {}
+
+pub fn encode_chunk_start_v03(chunk_start: &ChunkStartV03) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(V03_CHUNK_START_PAYLOAD_LENGTH);
+    payload.extend_from_slice(&chunk_start.chunk_index.to_be_bytes());
+    payload.extend_from_slice(chunk_start.expected_hash.as_bytes());
+    payload
+}
+
+pub fn decode_chunk_start_v03(payload: &[u8]) -> Result<ChunkStartV03, ChunkStartV03Error> {
+    let bytes: [u8; V03_CHUNK_START_PAYLOAD_LENGTH] = payload
+        .try_into()
+        .map_err(|_| ChunkStartV03Error::InvalidPayloadLength(payload.len()))?;
+
+    let chunk_index = u64::from_be_bytes(
+        bytes[..8]
+            .try_into()
+            .expect("validated CHUNK_START chunk index range"),
+    );
+    let mut expected_hash = [0u8; 32];
+    expected_hash.copy_from_slice(&bytes[8..]);
+
+    Ok(ChunkStartV03 {
+        chunk_index,
+        expected_hash: ChunkHash::from_bytes(expected_hash),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataV03 {
     pub absolute_offset: u64,
@@ -493,6 +544,41 @@ mod tests {
         assert_eq!(
             decode_chunk_hashes(&u32::MAX.to_be_bytes()),
             Err(ChunkHashesError::InvalidPayloadLength)
+        );
+    }
+
+    #[test]
+    fn chunk_start_v03_round_trips_full_index_domain_and_hash() {
+        assert_eq!(V03_CHUNK_START_PAYLOAD_LENGTH, 40);
+        for chunk_start in [
+            ChunkStartV03 {
+                chunk_index: 0,
+                expected_hash: ChunkHash::from_bytes([0xA5; 32]),
+            },
+            ChunkStartV03 {
+                chunk_index: u64::MAX,
+                expected_hash: ChunkHash::from_bytes([
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+                    0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+                    0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+                ]),
+            },
+        ] {
+            let payload = encode_chunk_start_v03(&chunk_start);
+            assert_eq!(payload.len(), V03_CHUNK_START_PAYLOAD_LENGTH);
+            assert_eq!(decode_chunk_start_v03(&payload).unwrap(), chunk_start);
+        }
+    }
+
+    #[test]
+    fn chunk_start_v03_rejects_truncated_and_trailing_payloads() {
+        assert_eq!(
+            decode_chunk_start_v03(&[0; V03_CHUNK_START_PAYLOAD_LENGTH - 1]),
+            Err(ChunkStartV03Error::InvalidPayloadLength(39))
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&[0; V03_CHUNK_START_PAYLOAD_LENGTH + 1]),
+            Err(ChunkStartV03Error::InvalidPayloadLength(41))
         );
     }
 

@@ -34,9 +34,10 @@ pub use resume::{
 pub use transfer_id::{TRANSFER_ID_LENGTH, TransferId};
 
 pub use v03::{
-    CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkHashesError, DataV03,
-    DataV03Error, FileOfferV03, OfferV03Error, ResumeRequestV03, ResumeV03Error,
-    V03_DATA_OFFSET_LENGTH, V03_MAX_DATA_BYTES, V03_RESUME_PAYLOAD_LENGTH, decode_chunk_hashes,
-    decode_data_v03, decode_offer_v03, decode_resume_v03, encode_chunk_hashes, encode_data_v03,
-    encode_offer_v03, encode_resume_v03,
+    CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkHashesError, ChunkStartV03,
+    ChunkStartV03Error, DataV03, DataV03Error, FileOfferV03, OfferV03Error, ResumeRequestV03,
+    ResumeV03Error, V03_CHUNK_START_PAYLOAD_LENGTH, V03_DATA_OFFSET_LENGTH, V03_MAX_DATA_BYTES,
+    V03_RESUME_PAYLOAD_LENGTH, decode_chunk_hashes, decode_chunk_start_v03, decode_data_v03,
+    decode_offer_v03, decode_resume_v03, encode_chunk_hashes, encode_chunk_start_v03,
+    encode_data_v03, encode_offer_v03, encode_resume_v03,
 };

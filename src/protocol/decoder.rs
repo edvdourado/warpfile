@@ -270,6 +270,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_chunk_start_message_type_under_wfp_v02() {
+        let bytes = vec![
+            0x57,
+            0x46,
+            0x50,
+            0x00,
+            WFP_VERSION_V02,
+            0x16,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        assert_eq!(
+            decode_frame(&bytes),
+            Err(DecodeError::UnknownMessageType(0x16))
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_version() {
         let bytes = vec![
             0x57, 0x46, 0x50, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

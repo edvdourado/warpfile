@@ -126,4 +126,21 @@ mod tests {
             WFP_VERSION_V03
         );
     }
+
+    #[test]
+    fn constructs_chunk_start_only_for_wfp_v03() {
+        assert_eq!(
+            Frame::new_for_version(WFP_VERSION_V02, MessageType::ChunkStart, Vec::new()),
+            Err(FrameError::MessageTypeNotAllowed {
+                version: WFP_VERSION_V02,
+                message_type: MessageType::ChunkStart,
+            })
+        );
+        assert_eq!(
+            Frame::new_for_version(WFP_VERSION_V03, MessageType::ChunkStart, Vec::new())
+                .unwrap()
+                .version,
+            WFP_VERSION_V03
+        );
+    }
 }

@@ -12,6 +12,7 @@ pub enum MessageType {
     Resume = 0x13,
     Restart = 0x14,
     ChunkHashes = 0x15,
+    ChunkStart = 0x16,
 
     Data = 0x20,
 
@@ -38,6 +39,7 @@ impl MessageType {
             0x13 => Ok(Self::Resume),
             0x14 => Ok(Self::Restart),
             0x15 => Ok(Self::ChunkHashes),
+            0x16 => Ok(Self::ChunkStart),
 
             0x20 => Ok(Self::Data),
 
@@ -63,7 +65,7 @@ impl MessageType {
 
     pub(crate) fn is_allowed_in_version(self, version: u8) -> bool {
         match version {
-            WFP_VERSION_V02 => self != Self::ChunkHashes,
+            WFP_VERSION_V02 => !matches!(self, Self::ChunkHashes | Self::ChunkStart),
             WFP_VERSION_V03 => true,
             _ => false,
         }
@@ -115,6 +117,16 @@ mod tests {
         assert_eq!(
             MessageType::from_wire(WFP_VERSION_V03, 0x15),
             Ok(MessageType::ChunkHashes)
+        );
+    }
+
+    #[test]
+    fn chunk_start_is_allocated_only_for_wfp_v03() {
+        assert_eq!(MessageType::ChunkStart as u8, 0x16);
+        assert_eq!(MessageType::from_wire(WFP_VERSION_V02, 0x16), Err(0x16));
+        assert_eq!(
+            MessageType::from_wire(WFP_VERSION_V03, 0x16),
+            Ok(MessageType::ChunkStart)
         );
     }
 

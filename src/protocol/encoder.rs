@@ -140,4 +140,30 @@ mod tests {
         assert_eq!(encoded[4], WFP_VERSION_V03);
         assert_eq!(encoded[5], 0x15);
     }
+
+    #[test]
+    fn rejects_chunk_start_for_wfp_v02_and_encodes_it_for_wfp_v03() {
+        let invalid = Frame {
+            version: WFP_VERSION_V02,
+            message_type: MessageType::ChunkStart,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            encode_frame(&invalid),
+            Err(EncodeError::InvalidFrame(
+                FrameError::MessageTypeNotAllowed {
+                    version: WFP_VERSION_V02,
+                    message_type: MessageType::ChunkStart,
+                }
+            ))
+        );
+
+        let encoded = encode_frame(
+            &Frame::new_for_version(WFP_VERSION_V03, MessageType::ChunkStart, Vec::new()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(encoded[4], WFP_VERSION_V03);
+        assert_eq!(encoded[5], 0x16);
+    }
 }

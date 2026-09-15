@@ -1,15 +1,20 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::mem;
 use std::path::Path;
 
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-use crate::chunk::ChunkRange;
+use crate::chunk::{ChunkLayout, ChunkLayoutError, ChunkRange};
 use crate::chunk_manifest::ChunkHash;
-use crate::chunk_state::{ChunkState, ChunkStateError, write_chunk_state};
-use crate::protocol::{ChunkStartV03, DataV03};
+use crate::chunk_state::{ChunkState, ChunkStateError, prepare_chunk_inventory, write_chunk_state};
+use crate::protocol::frame::MAX_PAYLOAD_LENGTH;
+use crate::protocol::{
+    CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkStartV03, DataV03,
+    FileOfferV03, ResumeRequestV03,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedChunk {
@@ -116,6 +121,58 @@ impl From<ChunkStateError> for ReceiverV03Error {
     }
 }
 
+#[derive(Debug)]
+pub enum ReceiverV03PreparationError {
+    ChunkLayout(ChunkLayoutError),
+    ChunkState(ChunkStateError),
+    Receiver(ReceiverV03Error),
+    ChunkRecordCountOverflow(usize),
+}
+
+impl fmt::Display for ReceiverV03PreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChunkLayout(error) => write!(formatter, "invalid WFP/0.3 chunk layout: {error}"),
+            Self::ChunkState(error) => write!(formatter, "WFP/0.3 chunk inventory error: {error}"),
+            Self::Receiver(error) => {
+                write!(formatter, "WFP/0.3 receiver preparation error: {error}")
+            }
+            Self::ChunkRecordCountOverflow(count) => {
+                write!(formatter, "chunk record count does not fit in u64: {count}")
+            }
+        }
+    }
+}
+
+impl Error for ReceiverV03PreparationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ChunkLayout(error) => Some(error),
+            Self::ChunkState(error) => Some(error),
+            Self::Receiver(error) => Some(error),
+            Self::ChunkRecordCountOverflow(_) => None,
+        }
+    }
+}
+
+impl From<ChunkLayoutError> for ReceiverV03PreparationError {
+    fn from(error: ChunkLayoutError) -> Self {
+        Self::ChunkLayout(error)
+    }
+}
+
+impl From<ChunkStateError> for ReceiverV03PreparationError {
+    fn from(error: ChunkStateError) -> Self {
+        Self::ChunkState(error)
+    }
+}
+
+impl From<ReceiverV03Error> for ReceiverV03PreparationError {
+    fn from(error: ReceiverV03Error) -> Self {
+        Self::Receiver(error)
+    }
+}
+
 pub async fn prepare_v03_partial_file(
     partial_path: &Path,
     file_size: u64,
@@ -138,6 +195,59 @@ pub async fn prepare_v03_partial_file(
     }
 
     Ok(file)
+}
+
+pub struct PreparedReceiverV03 {
+    pub file: fs::File,
+    pub receiver: ChunkReceiverV03,
+    pub resume: ResumeRequestV03,
+    pub chunk_hash_batches: Vec<ChunkHashesBatch>,
+}
+
+pub async fn prepare_receiver_v03(
+    partial_path: &Path,
+    offer: &FileOfferV03,
+) -> Result<PreparedReceiverV03, ReceiverV03PreparationError> {
+    let layout = ChunkLayout::new(offer.file_size, offer.chunk_size)?;
+    let chunk_state = prepare_chunk_inventory(partial_path, layout).await?;
+    let file = prepare_v03_partial_file(partial_path, offer.file_size).await?;
+    let receiver = ChunkReceiverV03::new(chunk_state);
+    let chunk_record_count = receiver.chunk_state.recorded_chunks().len();
+    let chunk_record_count = u64::try_from(chunk_record_count)
+        .map_err(|_| ReceiverV03PreparationError::ChunkRecordCountOverflow(chunk_record_count))?;
+    let chunk_hash_batches = chunk_hash_batches(&receiver.chunk_state);
+
+    Ok(PreparedReceiverV03 {
+        file,
+        receiver,
+        resume: ResumeRequestV03 { chunk_record_count },
+        chunk_hash_batches,
+    })
+}
+
+fn chunk_hash_batches(chunk_state: &ChunkState) -> Vec<ChunkHashesBatch> {
+    let maximum_records = maximum_chunk_hash_records_per_batch();
+
+    chunk_state
+        .recorded_chunks()
+        .chunks(maximum_records)
+        .map(|records| ChunkHashesBatch {
+            records: records
+                .iter()
+                .map(|record| ChunkHashRecord {
+                    chunk_index: record.index,
+                    hash: record.hash,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn maximum_chunk_hash_records_per_batch() -> usize {
+    (MAX_PAYLOAD_LENGTH
+        .checked_sub(mem::size_of::<u32>())
+        .expect("WFP payload limit must accommodate a CHUNK_HASHES record count"))
+        / CHUNK_HASH_RECORD_LENGTH
 }
 
 struct IncomingChunk {
@@ -304,7 +414,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     use crate::chunk::ChunkLayout;
-    use crate::chunk_state::{ChunkStateError, RecordedChunk, chunk_state_path, read_chunk_state};
+    use crate::chunk_state::{
+        ChunkStateError, RecordedChunk, chunk_state_path, read_chunk_state, write_chunk_state,
+    };
+    use crate::protocol::encode_chunk_hashes;
 
     fn hash(data: &[u8]) -> ChunkHash {
         ChunkHash::from_bytes(*blake3::hash(data).as_bytes())
@@ -325,6 +438,255 @@ mod tests {
         DataV03 {
             absolute_offset: offset,
             data: bytes.to_vec(),
+        }
+    }
+
+    fn offer(file_size: u64, chunk_size: u64) -> FileOfferV03 {
+        FileOfferV03 {
+            transfer_id: crate::protocol::TransferId::from_bytes([0xA5; 16]),
+            filename: "archive.bin".to_string(),
+            file_size,
+            chunk_size,
+        }
+    }
+
+    fn records_for(data: &[u8], layout: ChunkLayout, indices: &[u64]) -> Vec<RecordedChunk> {
+        indices
+            .iter()
+            .map(|&index| {
+                let range = layout.range(index).unwrap();
+                let start = usize::try_from(range.offset).unwrap();
+                let end = usize::try_from(range.offset + range.length).unwrap();
+                RecordedChunk {
+                    index,
+                    hash: hash(&data[start..end]),
+                }
+            })
+            .collect()
+    }
+
+    fn advertised_records(prepared: &PreparedReceiverV03) -> Vec<ChunkHashRecord> {
+        prepared
+            .chunk_hash_batches
+            .iter()
+            .flat_map(|batch| batch.records.iter().copied())
+            .collect()
+    }
+
+    fn assert_encoded_batches_fit(prepared: &PreparedReceiverV03) {
+        let count = prepared
+            .chunk_hash_batches
+            .iter()
+            .map(|batch| {
+                let encoded = encode_chunk_hashes(batch).unwrap();
+                assert!(encoded.len() <= MAX_PAYLOAD_LENGTH);
+                batch.records.len()
+            })
+            .sum::<usize>();
+
+        assert_eq!(
+            prepared.resume.chunk_record_count,
+            u64::try_from(count).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepares_a_fresh_offer_with_an_empty_inventory() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+
+        let prepared = prepare_receiver_v03(&partial, &offer(12, 4)).await.unwrap();
+
+        assert_eq!(prepared.file.metadata().await.unwrap().len(), 12);
+        assert_eq!(prepared.resume.chunk_record_count, 0);
+        assert!(prepared.chunk_hash_batches.is_empty());
+        assert!(prepared.receiver.chunk_state.recorded_chunks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertises_the_revalidated_sparse_inventory_without_rewriting_it() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let bytes = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let layout = ChunkLayout::new(40, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(bytes, layout, &[0, 3, 9])).unwrap();
+        fs::write(&partial, bytes).await.unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let snapshot_path = chunk_state_path(&partial);
+        let snapshot_before = fs::read(&snapshot_path).await.unwrap();
+
+        let prepared = prepare_receiver_v03(&partial, &offer(40, 4)).await.unwrap();
+
+        let expected: Vec<ChunkHashRecord> = state
+            .recorded_chunks()
+            .iter()
+            .map(|record| ChunkHashRecord {
+                chunk_index: record.index,
+                hash: record.hash,
+            })
+            .collect();
+        assert_eq!(prepared.resume.chunk_record_count, 3);
+        assert_eq!(advertised_records(&prepared), expected);
+        assert_eq!(prepared.receiver.chunk_state, state);
+        assert_encoded_batches_fit(&prepared);
+        assert_eq!(fs::read(snapshot_path).await.unwrap(), snapshot_before);
+    }
+
+    #[tokio::test]
+    async fn revalidates_before_extending_a_short_partial() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let layout = ChunkLayout::new(8, 4).unwrap();
+        let state = ChunkState::new(
+            layout,
+            vec![RecordedChunk {
+                index: 1,
+                hash: hash(&[0; 4]),
+            }],
+        )
+        .unwrap();
+        fs::write(&partial, b"abcd").await.unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+
+        let prepared = prepare_receiver_v03(&partial, &offer(8, 4)).await.unwrap();
+
+        assert_eq!(prepared.file.metadata().await.unwrap().len(), 8);
+        assert_eq!(prepared.resume.chunk_record_count, 0);
+        assert!(prepared.chunk_hash_batches.is_empty());
+        assert!(prepared.receiver.chunk_state.recorded_chunks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retains_revalidated_chunks_before_truncating_a_long_partial() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let layout = ChunkLayout::new(8, 4).unwrap();
+        let state = ChunkState::new(
+            layout,
+            vec![RecordedChunk {
+                index: 0,
+                hash: hash(b"abcd"),
+            }],
+        )
+        .unwrap();
+        fs::write(&partial, b"abcdefghsurplus").await.unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+
+        let prepared = prepare_receiver_v03(&partial, &offer(8, 4)).await.unwrap();
+
+        assert_eq!(prepared.file.metadata().await.unwrap().len(), 8);
+        assert_eq!(prepared.resume.chunk_record_count, 1);
+        assert_eq!(advertised_records(&prepared)[0].chunk_index, 0);
+    }
+
+    #[tokio::test]
+    async fn omits_mismatched_or_corrupt_snapshots() {
+        let temp = tempdir().unwrap();
+
+        for (name, state) in [
+            (
+                "different-size",
+                ChunkState::new(
+                    ChunkLayout::new(16, 4).unwrap(),
+                    vec![RecordedChunk {
+                        index: 0,
+                        hash: hash(b"abcd"),
+                    }],
+                )
+                .unwrap(),
+            ),
+            (
+                "different-chunks",
+                ChunkState::new(
+                    ChunkLayout::new(12, 3).unwrap(),
+                    vec![RecordedChunk {
+                        index: 0,
+                        hash: hash(b"abc"),
+                    }],
+                )
+                .unwrap(),
+            ),
+        ] {
+            let partial = temp.path().join(format!("{name}.part"));
+            fs::write(&partial, b"abcdefghijkl").await.unwrap();
+            write_chunk_state(&partial, &state).await.unwrap();
+            let prepared = prepare_receiver_v03(&partial, &offer(12, 4)).await.unwrap();
+            assert_eq!(prepared.resume.chunk_record_count, 0);
+            assert!(prepared.chunk_hash_batches.is_empty());
+        }
+
+        let partial = temp.path().join("corrupt.part");
+        fs::write(&partial, b"abcdefghijkl").await.unwrap();
+        fs::write(chunk_state_path(&partial), b"not JSON")
+            .await
+            .unwrap();
+        let prepared = prepare_receiver_v03(&partial, &offer(12, 4)).await.unwrap();
+        assert_eq!(prepared.resume.chunk_record_count, 0);
+        assert!(prepared.chunk_hash_batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn omits_a_stale_recorded_hash() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let layout = ChunkLayout::new(4, 4).unwrap();
+        let state = ChunkState::new(
+            layout,
+            vec![RecordedChunk {
+                index: 0,
+                hash: hash(b"wxyz"),
+            }],
+        )
+        .unwrap();
+        fs::write(&partial, b"abcd").await.unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+
+        let prepared = prepare_receiver_v03(&partial, &offer(4, 4)).await.unwrap();
+
+        assert_eq!(prepared.resume.chunk_record_count, 0);
+        assert!(prepared.chunk_hash_batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepares_a_zero_length_offer_without_chunk_hash_batches() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("empty.part");
+
+        let prepared = prepare_receiver_v03(&partial, &offer(0, 4)).await.unwrap();
+
+        assert_eq!(prepared.file.metadata().await.unwrap().len(), 0);
+        assert_eq!(prepared.resume.chunk_record_count, 0);
+        assert!(prepared.chunk_hash_batches.is_empty());
+    }
+
+    #[test]
+    fn batches_at_the_codec_payload_boundary() {
+        let maximum = maximum_chunk_hash_records_per_batch();
+        let layout = ChunkLayout::new(u64::try_from(maximum + 1).unwrap(), 1).unwrap();
+        let records: Vec<RecordedChunk> = (0..=maximum)
+            .map(|index| RecordedChunk {
+                index: u64::try_from(index).unwrap(),
+                hash: ChunkHash::from_bytes([0xA5; 32]),
+            })
+            .collect();
+        let one_batch =
+            chunk_hash_batches(&ChunkState::new(layout, records[..maximum].to_vec()).unwrap());
+        let two_batches = chunk_hash_batches(&ChunkState::new(layout, records).unwrap());
+
+        assert_eq!(one_batch.len(), 1);
+        assert_eq!(one_batch[0].records.len(), maximum);
+        assert_eq!(two_batches.len(), 2);
+        assert_eq!(two_batches[0].records.len(), maximum);
+        assert_eq!(two_batches[1].records.len(), 1);
+        assert_eq!(
+            two_batches
+                .iter()
+                .map(|batch| batch.records.len())
+                .sum::<usize>(),
+            maximum + 1
+        );
+        for batch in one_batch.iter().chain(&two_batches) {
+            assert!(encode_chunk_hashes(batch).unwrap().len() <= MAX_PAYLOAD_LENGTH);
         }
     }
 

@@ -531,6 +531,37 @@ where
     Ok(scanner.finish()?)
 }
 
+pub async fn send_source_chunks_and_complete_v03<S, R>(
+    stream: &mut S,
+    scanner: &mut SourceScannerV03<R>,
+) -> Result<SourceScanSummaryV03, SenderV03TransferError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let summary = send_source_chunks_v03(stream, scanner).await?;
+    send_complete_v03(stream, summary).await?;
+
+    Ok(summary)
+}
+
+pub async fn send_complete_v03<S>(
+    stream: &mut S,
+    summary: SourceScanSummaryV03,
+) -> Result<(), SenderV03TransferError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let complete = Frame::new_for_version(
+        WFP_VERSION_V03,
+        MessageType::Complete,
+        summary.file_hash().as_bytes().to_vec(),
+    )?;
+    write_frame(stream, &complete).await?;
+
+    Ok(())
+}
+
 async fn send_transmit_chunk_v03<S>(
     stream: &mut S,
     chunk: &SourceChunkV03,
@@ -571,6 +602,8 @@ mod tests {
     use super::*;
 
     use std::io::{self, Cursor};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 
@@ -578,7 +611,8 @@ mod tests {
     use crate::protocol::frame::{ACTIVE_WFP_VERSION, WFP_VERSION_V02};
     use crate::protocol::{
         ChunkHashesBatch, DecodeError, ResumeRequestV03, V03_MAX_DATA_BYTES,
-        decode_chunk_start_v03, decode_data_v03, encode_chunk_hashes, encode_resume_v03,
+        decode_chunk_start_v03, decode_data_v03, decode_frame_for_version, encode_chunk_hashes,
+        encode_resume_v03,
     };
 
     fn layout() -> ChunkLayout {
@@ -677,6 +711,48 @@ mod tests {
                     .await
                     .unwrap(),
             );
+        }
+        frames
+    }
+
+    #[derive(Default)]
+    struct FailingWriter {
+        bytes: Vec<u8>,
+        writes_before_failure: usize,
+    }
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let writer = self.get_mut();
+            if writer.writes_before_failure == 0 {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
+            }
+            writer.writes_before_failure -= 1;
+            writer.bytes.extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn written_frames(writer: &FailingWriter) -> Vec<Frame> {
+        let mut bytes = writer.bytes.as_slice();
+        let mut frames = Vec::new();
+        while !bytes.is_empty() {
+            let payload_length = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let frame_length = 12 + payload_length;
+            frames.push(decode_frame_for_version(&bytes[..frame_length], WFP_VERSION_V03).unwrap());
+            bytes = &bytes[frame_length..];
         }
         frames
     }
@@ -1368,7 +1444,7 @@ mod tests {
                 SourceScannerV03::new(Cursor::new(source), inventory(layout, Vec::new()));
             let (mut sender, mut peer) = duplex(1024);
 
-            let result = send_source_chunks_v03(&mut sender, &mut scanner).await;
+            let result = send_source_chunks_and_complete_v03(&mut sender, &mut scanner).await;
             sender.shutdown().await.unwrap();
             let frames = read_frames(&mut peer, 2).await;
             let mut remaining = Vec::new();
@@ -1414,6 +1490,199 @@ mod tests {
             send_source_chunks_v03(&mut sender, &mut scanner).await,
             Err(SenderV03TransferError::Protocol(ProtocolIoError::Io(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn completes_after_only_transmitted_chunks_with_the_summary_hash() {
+        let data = b"abcdefghijkl".to_vec();
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let mut records = manifest_records(&data, layout, &[0, 1]);
+        records[1].hash = chunk_hash(b"wrong");
+        let mut scanner =
+            SourceScannerV03::new(Cursor::new(data.clone()), inventory(layout, records));
+        let (mut sender, mut peer) = duplex(4096);
+
+        let summary = send_source_chunks_and_complete_v03(&mut sender, &mut scanner)
+            .await
+            .unwrap();
+        sender.shutdown().await.unwrap();
+        let frames = read_frames(&mut peer, 5).await;
+
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![
+                MessageType::ChunkStart,
+                MessageType::Data,
+                MessageType::ChunkStart,
+                MessageType::Data,
+                MessageType::Complete,
+            ]
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&frames[0].payload)
+                .unwrap()
+                .chunk_index,
+            1
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&frames[2].payload)
+                .unwrap()
+                .chunk_index,
+            2
+        );
+        let complete = frames.last().unwrap();
+        assert_eq!(complete.version, WFP_VERSION_V03);
+        assert_eq!(complete.payload, summary.file_hash().as_bytes());
+        assert_eq!(complete.payload, blake3::hash(&data).as_bytes());
+        let mut remaining = Vec::new();
+        peer.read_to_end(&mut remaining).await.unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completes_all_reuse_and_empty_sources_without_chunk_frames() {
+        for (data, layout, records) in [
+            (
+                b"abcdefghijkl".to_vec(),
+                ChunkLayout::new(12, 4).unwrap(),
+                manifest_records(
+                    b"abcdefghijkl",
+                    ChunkLayout::new(12, 4).unwrap(),
+                    &[0, 1, 2],
+                ),
+            ),
+            (Vec::new(), ChunkLayout::new(0, 4).unwrap(), Vec::new()),
+        ] {
+            let mut scanner =
+                SourceScannerV03::new(Cursor::new(data.clone()), inventory(layout, records));
+            let (mut sender, mut peer) = duplex(1024);
+
+            let summary = send_source_chunks_and_complete_v03(&mut sender, &mut scanner)
+                .await
+                .unwrap();
+            sender.shutdown().await.unwrap();
+            let frames = read_frames(&mut peer, 1).await;
+
+            assert_eq!(frames[0].message_type, MessageType::Complete);
+            assert_eq!(frames[0].version, WFP_VERSION_V03);
+            assert_eq!(frames[0].payload, summary.file_hash().as_bytes());
+            assert_eq!(frames[0].payload, blake3::hash(&data).as_bytes());
+            let mut remaining = Vec::new();
+            peer.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn completes_after_final_short_chunk_and_final_data_fragment() {
+        let chunk_length = V03_MAX_DATA_BYTES + 1;
+        let data = vec![0xA5; chunk_length + 2];
+        let layout = ChunkLayout::new(
+            u64::try_from(data.len()).unwrap(),
+            u64::try_from(chunk_length).unwrap(),
+        )
+        .unwrap();
+        let mut scanner = SourceScannerV03::new(Cursor::new(data), inventory(layout, Vec::new()));
+        let (mut sender, mut peer) = duplex(256 * 1024);
+
+        send_source_chunks_and_complete_v03(&mut sender, &mut scanner)
+            .await
+            .unwrap();
+        sender.shutdown().await.unwrap();
+        let frames = read_frames(&mut peer, 5).await;
+
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![
+                MessageType::ChunkStart,
+                MessageType::Data,
+                MessageType::Data,
+                MessageType::ChunkStart,
+                MessageType::Data,
+            ]
+        );
+        assert_eq!(decode_data_v03(&frames[2].payload).unwrap().data.len(), 1);
+        assert_eq!(
+            decode_data_v03(&frames[4].payload).unwrap().data,
+            vec![0xA5; 2]
+        );
+
+        let complete = read_frames(&mut peer, 1).await;
+        assert_eq!(complete[0].message_type, MessageType::Complete);
+        let mut remaining = Vec::new();
+        peer.read_to_end(&mut remaining).await.unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_not_complete_when_the_scanner_cannot_reconcile_inventory() {
+        let layout = ChunkLayout::new(4, 4).unwrap();
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(b"abcd".to_vec()),
+            inventory(layout, vec![record(1, 0xA1)]),
+        );
+        let (mut sender, mut peer) = duplex(1024);
+
+        assert!(matches!(
+            send_source_chunks_and_complete_v03(&mut sender, &mut scanner).await,
+            Err(SenderV03TransferError::SourceScan(
+                SourceScanV03Error::UnreconciledInventory { .. }
+            ))
+        ));
+        sender.shutdown().await.unwrap();
+        let frames = read_frames(&mut peer, 2).await;
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.message_type != MessageType::Complete)
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_complete_after_a_data_write_failure() {
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(b"abcd".to_vec()),
+            inventory(ChunkLayout::new(4, 4).unwrap(), Vec::new()),
+        );
+        let mut writer = FailingWriter {
+            writes_before_failure: 1,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            send_source_chunks_and_complete_v03(&mut writer, &mut scanner).await,
+            Err(SenderV03TransferError::Protocol(ProtocolIoError::Io(error)))
+                if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(
+            written_frames(&writer)
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![MessageType::ChunkStart]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_a_complete_write_failure_without_retrying_or_reading() {
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(Vec::new()),
+            inventory(ChunkLayout::new(0, 4).unwrap(), Vec::new()),
+        );
+        let mut writer = FailingWriter::default();
+
+        assert!(matches!(
+            send_source_chunks_and_complete_v03(&mut writer, &mut scanner).await,
+            Err(SenderV03TransferError::Protocol(ProtocolIoError::Io(error)))
+                if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert!(writer.bytes.is_empty());
     }
 
     #[test]

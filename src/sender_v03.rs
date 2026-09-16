@@ -7,8 +7,9 @@ use crate::chunk::ChunkLayout;
 use crate::chunk_manifest::ChunkHash;
 use crate::protocol::frame::{FrameError, WFP_VERSION_V03};
 use crate::protocol::{
-    ChunkHashRecord, ChunkHashesError, Frame, MessageType, ProtocolIoError, ResumeV03Error,
-    decode_chunk_hashes, decode_resume_v03, read_frame_for_version, write_frame,
+    ChunkHashRecord, ChunkHashesError, ChunkStartV03, DataV03, DataV03Error, Frame, MessageType,
+    ProtocolIoError, ResumeV03Error, V03_MAX_DATA_BYTES, decode_chunk_hashes, decode_resume_v03,
+    encode_chunk_start_v03, encode_data_v03, read_frame_for_version, write_frame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +450,122 @@ where
     Ok(ReceiverInventoryV03 { layout, records })
 }
 
+#[derive(Debug)]
+pub enum SenderV03TransferError {
+    SourceScan(SourceScanV03Error),
+    Frame(FrameError),
+    Protocol(ProtocolIoError),
+    Data(DataV03Error),
+    DataLengthTooLarge(usize),
+    DataOffsetOverflow,
+}
+
+impl fmt::Display for SenderV03TransferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceScan(error) => write!(formatter, "WFP/0.3 source scan error: {error}"),
+            Self::Frame(error) => write!(formatter, "WFP/0.3 transfer frame error: {error}"),
+            Self::Protocol(error) => write!(formatter, "WFP/0.3 transfer I/O error: {error}"),
+            Self::Data(error) => write!(formatter, "WFP/0.3 DATA encoding error: {error}"),
+            Self::DataLengthTooLarge(length) => {
+                write!(
+                    formatter,
+                    "WFP/0.3 DATA length does not fit in u64: {length}"
+                )
+            }
+            Self::DataOffsetOverflow => formatter.write_str("WFP/0.3 DATA offset overflow"),
+        }
+    }
+}
+
+impl Error for SenderV03TransferError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SourceScan(error) => Some(error),
+            Self::Frame(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::Data(error) => Some(error),
+            Self::DataLengthTooLarge(_) | Self::DataOffsetOverflow => None,
+        }
+    }
+}
+
+impl From<SourceScanV03Error> for SenderV03TransferError {
+    fn from(error: SourceScanV03Error) -> Self {
+        Self::SourceScan(error)
+    }
+}
+
+impl From<FrameError> for SenderV03TransferError {
+    fn from(error: FrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<ProtocolIoError> for SenderV03TransferError {
+    fn from(error: ProtocolIoError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<DataV03Error> for SenderV03TransferError {
+    fn from(error: DataV03Error) -> Self {
+        Self::Data(error)
+    }
+}
+
+pub async fn send_source_chunks_v03<S, R>(
+    stream: &mut S,
+    scanner: &mut SourceScannerV03<R>,
+) -> Result<SourceScanSummaryV03, SenderV03TransferError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    while let Some(chunk) = scanner.next_chunk().await? {
+        if chunk.disposition() == SourceChunkDispositionV03::Transmit {
+            send_transmit_chunk_v03(stream, &chunk).await?;
+        }
+    }
+
+    Ok(scanner.finish()?)
+}
+
+async fn send_transmit_chunk_v03<S>(
+    stream: &mut S,
+    chunk: &SourceChunkV03,
+) -> Result<(), SenderV03TransferError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let chunk_start = Frame::new_for_version(
+        WFP_VERSION_V03,
+        MessageType::ChunkStart,
+        encode_chunk_start_v03(&ChunkStartV03 {
+            chunk_index: chunk.index(),
+            expected_hash: chunk.hash(),
+        }),
+    )?;
+    write_frame(stream, &chunk_start).await?;
+
+    let mut absolute_offset = chunk.offset();
+    for fragment in chunk.data().chunks(V03_MAX_DATA_BYTES) {
+        let data_length = u64::try_from(fragment.len())
+            .map_err(|_| SenderV03TransferError::DataLengthTooLarge(fragment.len()))?;
+        let payload = encode_data_v03(&DataV03 {
+            absolute_offset,
+            data: fragment.to_vec(),
+        })?;
+        let frame = Frame::new_for_version(WFP_VERSION_V03, MessageType::Data, payload)?;
+        write_frame(stream, &frame).await?;
+        absolute_offset = absolute_offset
+            .checked_add(data_length)
+            .ok_or(SenderV03TransferError::DataOffsetOverflow)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,7 +577,8 @@ mod tests {
     use crate::chunk_manifest::{ChunkHash, ChunkManifestBuilder};
     use crate::protocol::frame::{ACTIVE_WFP_VERSION, WFP_VERSION_V02};
     use crate::protocol::{
-        ChunkHashesBatch, DecodeError, ResumeRequestV03, encode_chunk_hashes, encode_resume_v03,
+        ChunkHashesBatch, DecodeError, ResumeRequestV03, V03_MAX_DATA_BYTES,
+        decode_chunk_start_v03, decode_data_v03, encode_chunk_hashes, encode_resume_v03,
     };
 
     fn layout() -> ChunkLayout {
@@ -549,6 +667,18 @@ mod tests {
         let mut bytes = Vec::new();
         peer.read_to_end(&mut bytes).await.unwrap();
         assert!(bytes.is_empty());
+    }
+
+    async fn read_frames(stream: &mut DuplexStream, count: usize) -> Vec<Frame> {
+        let mut frames = Vec::with_capacity(count);
+        for _ in 0..count {
+            frames.push(
+                read_frame_for_version(stream, WFP_VERSION_V03)
+                    .await
+                    .unwrap(),
+            );
+        }
+        frames
     }
 
     #[tokio::test]
@@ -995,6 +1125,294 @@ mod tests {
                 consumed: 0,
                 total: 1
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn sends_no_frames_for_all_reuse_and_returns_the_full_file_hash() {
+        let data = b"abcdefghijkl".to_vec();
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let records = manifest_records(&data, layout, &[0, 1, 2]);
+        let mut scanner =
+            SourceScannerV03::new(Cursor::new(data.clone()), inventory(layout, records));
+        let (mut sender, mut peer) = duplex(1024);
+
+        let summary = send_source_chunks_v03(&mut sender, &mut scanner)
+            .await
+            .unwrap();
+        sender.shutdown().await.unwrap();
+
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(summary.file_hash(), chunk_hash(&data));
+    }
+
+    #[tokio::test]
+    async fn sends_only_transmit_chunks_with_local_hashes_in_order() {
+        let data = b"abcdefghijklmnop".to_vec();
+        let layout = ChunkLayout::new(16, 4).unwrap();
+        let mut records = manifest_records(&data, layout, &[0, 1, 2]);
+        records[1].hash = chunk_hash(b"wrong");
+        let mut scanner =
+            SourceScannerV03::new(Cursor::new(data.clone()), inventory(layout, records));
+        let (mut sender, mut peer) = duplex(4096);
+
+        let summary = send_source_chunks_v03(&mut sender, &mut scanner)
+            .await
+            .unwrap();
+        sender.shutdown().await.unwrap();
+        let frames = read_frames(&mut peer, 4).await;
+        let mut remaining = Vec::new();
+        peer.read_to_end(&mut remaining).await.unwrap();
+
+        assert!(remaining.is_empty());
+        assert!(frames.iter().all(|frame| frame.version == WFP_VERSION_V03));
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![
+                MessageType::ChunkStart,
+                MessageType::Data,
+                MessageType::ChunkStart,
+                MessageType::Data,
+            ]
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&frames[0].payload)
+                .unwrap()
+                .chunk_index,
+            1
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&frames[0].payload)
+                .unwrap()
+                .expected_hash,
+            chunk_hash(b"efgh")
+        );
+        assert_eq!(decode_data_v03(&frames[1].payload).unwrap().data, b"efgh");
+        assert_eq!(
+            decode_chunk_start_v03(&frames[2].payload)
+                .unwrap()
+                .chunk_index,
+            3
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&frames[2].payload)
+                .unwrap()
+                .expected_hash,
+            chunk_hash(b"mnop")
+        );
+        assert_eq!(decode_data_v03(&frames[3].payload).unwrap().data, b"mnop");
+        assert_eq!(summary.file_hash(), chunk_hash(&data));
+    }
+
+    #[tokio::test]
+    async fn sends_a_final_short_chunk_at_its_absolute_offset() {
+        let data = b"abcdef".to_vec();
+        let layout = ChunkLayout::new(6, 4).unwrap();
+        let records = manifest_records(&data, layout, &[0]);
+        let mut scanner =
+            SourceScannerV03::new(Cursor::new(data.clone()), inventory(layout, records));
+        let (mut sender, mut peer) = duplex(1024);
+
+        let summary = send_source_chunks_v03(&mut sender, &mut scanner)
+            .await
+            .unwrap();
+        let frames = read_frames(&mut peer, 2).await;
+
+        assert_eq!(
+            decode_chunk_start_v03(&frames[0].payload)
+                .unwrap()
+                .chunk_index,
+            1
+        );
+        assert_eq!(
+            decode_data_v03(&frames[1].payload).unwrap(),
+            DataV03 {
+                absolute_offset: 4,
+                data: b"ef".to_vec(),
+            }
+        );
+        assert_eq!(summary.file_hash(), chunk_hash(&data));
+    }
+
+    #[tokio::test]
+    async fn fragments_data_at_the_existing_wire_limit() {
+        for (length, expected_data_frames) in [
+            (V03_MAX_DATA_BYTES - 1, 1usize),
+            (V03_MAX_DATA_BYTES, 1),
+            (V03_MAX_DATA_BYTES + 1, 2),
+        ] {
+            let data = vec![0xA5; length];
+            let layout = ChunkLayout::new(
+                u64::try_from(length).unwrap(),
+                u64::try_from(length).unwrap(),
+            )
+            .unwrap();
+            let mut scanner =
+                SourceScannerV03::new(Cursor::new(data.clone()), inventory(layout, Vec::new()));
+            let (mut sender, mut peer) = duplex(256 * 1024);
+
+            let summary = send_source_chunks_v03(&mut sender, &mut scanner)
+                .await
+                .unwrap();
+            let frames = read_frames(&mut peer, expected_data_frames + 1).await;
+
+            assert_eq!(frames[0].message_type, MessageType::ChunkStart);
+            let data_frames = frames[1..]
+                .iter()
+                .map(|frame| decode_data_v03(&frame.payload).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(data_frames.len(), expected_data_frames);
+            assert!(data_frames.iter().all(|frame| !frame.data.is_empty()));
+            assert!(
+                data_frames
+                    .iter()
+                    .all(|frame| frame.data.len() <= V03_MAX_DATA_BYTES)
+            );
+            assert_eq!(data_frames[0].absolute_offset, 0);
+            for pair in data_frames.windows(2) {
+                assert_eq!(
+                    pair[1].absolute_offset,
+                    pair[0]
+                        .absolute_offset
+                        .checked_add(u64::try_from(pair[0].data.len()).unwrap())
+                        .unwrap()
+                );
+            }
+            assert_eq!(
+                data_frames
+                    .iter()
+                    .flat_map(|frame| frame.data.iter().copied())
+                    .collect::<Vec<_>>(),
+                data
+            );
+            assert_eq!(summary.file_hash(), chunk_hash(&data));
+        }
+    }
+
+    #[tokio::test]
+    async fn finishes_one_transmitted_chunk_before_starting_the_next() {
+        let chunk_length = V03_MAX_DATA_BYTES + 1;
+        let data = vec![0x5A; chunk_length * 2];
+        let layout = ChunkLayout::new(
+            u64::try_from(data.len()).unwrap(),
+            u64::try_from(chunk_length).unwrap(),
+        )
+        .unwrap();
+        let mut scanner = SourceScannerV03::new(Cursor::new(data), inventory(layout, Vec::new()));
+        let (mut sender, mut peer) = duplex(512 * 1024);
+
+        send_source_chunks_v03(&mut sender, &mut scanner)
+            .await
+            .unwrap();
+        let frames = read_frames(&mut peer, 6).await;
+
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![
+                MessageType::ChunkStart,
+                MessageType::Data,
+                MessageType::Data,
+                MessageType::ChunkStart,
+                MessageType::Data,
+                MessageType::Data,
+            ]
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&frames[0].payload)
+                .unwrap()
+                .chunk_index,
+            0
+        );
+        assert_eq!(
+            decode_chunk_start_v03(&frames[3].payload)
+                .unwrap()
+                .chunk_index,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn confirms_an_empty_source_without_emitting_a_transfer_frame() {
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(Vec::new()),
+            inventory(ChunkLayout::new(0, 4).unwrap(), Vec::new()),
+        );
+        let (mut sender, mut peer) = duplex(1024);
+
+        let summary = send_source_chunks_v03(&mut sender, &mut scanner)
+            .await
+            .unwrap();
+        sender.shutdown().await.unwrap();
+
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(summary.file_hash(), chunk_hash(b""));
+    }
+
+    #[tokio::test]
+    async fn propagates_source_length_errors_without_a_complete_frame() {
+        for (source, layout, is_short_source) in [
+            (b"abcd".to_vec(), ChunkLayout::new(8, 4).unwrap(), true),
+            (b"abcdef".to_vec(), ChunkLayout::new(4, 4).unwrap(), false),
+        ] {
+            let mut scanner =
+                SourceScannerV03::new(Cursor::new(source), inventory(layout, Vec::new()));
+            let (mut sender, mut peer) = duplex(1024);
+
+            let result = send_source_chunks_v03(&mut sender, &mut scanner).await;
+            sender.shutdown().await.unwrap();
+            let frames = read_frames(&mut peer, 2).await;
+            let mut remaining = Vec::new();
+            peer.read_to_end(&mut remaining).await.unwrap();
+
+            if is_short_source {
+                assert!(matches!(
+                    result,
+                    Err(SenderV03TransferError::SourceScan(
+                        SourceScanV03Error::SourceTooShort {
+                            expected: 8,
+                            actual: 4,
+                        }
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SenderV03TransferError::SourceScan(
+                        SourceScanV03Error::SourceTooLong { expected: 4 }
+                    ))
+                ));
+            }
+            assert!(remaining.is_empty());
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.message_type != MessageType::Complete)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stops_on_a_network_write_error() {
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(b"abcd".to_vec()),
+            inventory(ChunkLayout::new(4, 4).unwrap(), Vec::new()),
+        );
+        let (mut sender, peer) = duplex(1024);
+        drop(peer);
+
+        assert!(matches!(
+            send_source_chunks_v03(&mut sender, &mut scanner).await,
+            Err(SenderV03TransferError::Protocol(ProtocolIoError::Io(_)))
         ));
     }
 

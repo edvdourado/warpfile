@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -13,8 +13,9 @@ use crate::chunk_state::{ChunkState, ChunkStateError, prepare_chunk_inventory, w
 use crate::protocol::frame::{FrameError, MAX_PAYLOAD_LENGTH, WFP_VERSION_V03};
 use crate::protocol::{
     CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkHashesError, ChunkStartV03,
-    DataV03, FileOfferV03, Frame, MessageType, ProtocolIoError, ResumeRequestV03,
-    encode_chunk_hashes, encode_resume_v03, read_frame_for_version, write_frame,
+    ChunkStartV03Error, DataV03, DataV03Error, FileOfferV03, Frame, MessageType, ProtocolIoError,
+    ResumeRequestV03, decode_chunk_start_v03, decode_data_v03, encode_chunk_hashes,
+    encode_resume_v03, read_frame_for_version, write_frame,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +200,7 @@ pub async fn prepare_v03_partial_file(
 }
 
 pub struct PreparedReceiverV03 {
+    partial_path: PathBuf,
     file: fs::File,
     receiver: ChunkReceiverV03,
     resume: ResumeRequestV03,
@@ -206,16 +208,113 @@ pub struct PreparedReceiverV03 {
 }
 
 pub struct AcceptedReceiverV03 {
-    #[allow(
-        dead_code,
-        reason = "the future WFP/0.3 data phase will consume this state"
-    )]
+    partial_path: PathBuf,
     file: fs::File,
-    #[allow(
-        dead_code,
-        reason = "the future WFP/0.3 data phase will consume this state"
-    )]
     receiver: ChunkReceiverV03,
+}
+
+#[allow(
+    dead_code,
+    reason = "the next WFP/0.3 final-verification phase will consume this state"
+)]
+pub struct ReceivedCompleteV03 {
+    file: fs::File,
+    partial_path: PathBuf,
+    receiver: ChunkReceiverV03,
+    sender_file_hash: ChunkHash,
+}
+
+#[derive(Debug)]
+pub enum ReceiverV03TransferError {
+    Protocol(ProtocolIoError),
+    ChunkStart(ChunkStartV03Error),
+    Data(DataV03Error),
+    Receiver(ReceiverV03Error),
+    UnexpectedMessageType(MessageType),
+    InvalidCompletePayload(usize),
+    CompleteWhileChunkActive { index: u64 },
+    CompleteWhileChunkPendingPersistence { index: u64 },
+    VerifiedChunkCountOverflow(usize),
+    IncompleteVerifiedCoverage { expected: u64, actual: u64 },
+}
+
+impl fmt::Display for ReceiverV03TransferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => write!(formatter, "WFP/0.3 transfer I/O error: {error}"),
+            Self::ChunkStart(error) => write!(formatter, "WFP/0.3 CHUNK_START error: {error}"),
+            Self::Data(error) => write!(formatter, "WFP/0.3 DATA error: {error}"),
+            Self::Receiver(error) => write!(formatter, "WFP/0.3 transfer receiver error: {error}"),
+            Self::UnexpectedMessageType(message_type) => write!(
+                formatter,
+                "unexpected WFP/0.3 transfer message type 0x{:02X}",
+                *message_type as u8
+            ),
+            Self::InvalidCompletePayload(length) => write!(
+                formatter,
+                "WFP/0.3 COMPLETE payload must contain exactly 32 bytes, received {length}"
+            ),
+            Self::CompleteWhileChunkActive { index } => {
+                write!(
+                    formatter,
+                    "WFP/0.3 COMPLETE arrived while chunk {index} is incomplete"
+                )
+            }
+            Self::CompleteWhileChunkPendingPersistence { index } => write!(
+                formatter,
+                "WFP/0.3 COMPLETE arrived while chunk {index} is waiting for persistence"
+            ),
+            Self::VerifiedChunkCountOverflow(count) => write!(
+                formatter,
+                "verified WFP/0.3 chunk count does not fit in u64: {count}"
+            ),
+            Self::IncompleteVerifiedCoverage { expected, actual } => write!(
+                formatter,
+                "WFP/0.3 transfer completed with {actual} of {expected} chunks verified"
+            ),
+        }
+    }
+}
+
+impl Error for ReceiverV03TransferError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::ChunkStart(error) => Some(error),
+            Self::Data(error) => Some(error),
+            Self::Receiver(error) => Some(error),
+            Self::UnexpectedMessageType(_)
+            | Self::InvalidCompletePayload(_)
+            | Self::CompleteWhileChunkActive { .. }
+            | Self::CompleteWhileChunkPendingPersistence { .. }
+            | Self::VerifiedChunkCountOverflow(_)
+            | Self::IncompleteVerifiedCoverage { .. } => None,
+        }
+    }
+}
+
+impl From<ProtocolIoError> for ReceiverV03TransferError {
+    fn from(error: ProtocolIoError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<ChunkStartV03Error> for ReceiverV03TransferError {
+    fn from(error: ChunkStartV03Error) -> Self {
+        Self::ChunkStart(error)
+    }
+}
+
+impl From<DataV03Error> for ReceiverV03TransferError {
+    fn from(error: DataV03Error) -> Self {
+        Self::Data(error)
+    }
+}
+
+impl From<ReceiverV03Error> for ReceiverV03TransferError {
+    fn from(error: ReceiverV03Error) -> Self {
+        Self::Receiver(error)
+    }
 }
 
 #[derive(Debug)]
@@ -316,9 +415,85 @@ impl PreparedReceiverV03 {
         }
 
         Ok(AcceptedReceiverV03 {
+            partial_path: self.partial_path,
             file: self.file,
             receiver: self.receiver,
         })
+    }
+}
+
+impl AcceptedReceiverV03 {
+    pub async fn receive_transfer<S>(
+        mut self,
+        stream: &mut S,
+    ) -> Result<ReceivedCompleteV03, ReceiverV03TransferError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        loop {
+            let frame = read_frame_for_version(stream, WFP_VERSION_V03).await?;
+
+            match frame.message_type {
+                MessageType::ChunkStart => {
+                    let chunk_start = decode_chunk_start_v03(&frame.payload)?;
+                    self.receiver.begin_chunk(chunk_start)?;
+                }
+                MessageType::Data => {
+                    let data = decode_data_v03(&frame.payload)?;
+                    if self
+                        .receiver
+                        .write_data(&mut self.file, &data)
+                        .await?
+                        .is_some()
+                    {
+                        self.receiver
+                            .persist_verified_chunk(&mut self.file, &self.partial_path)
+                            .await?;
+                    }
+                }
+                MessageType::Complete => {
+                    if let Some(active) = &self.receiver.active {
+                        return Err(ReceiverV03TransferError::CompleteWhileChunkActive {
+                            index: active.range.index,
+                        });
+                    }
+                    if let Some(pending) = self.receiver.pending_verified {
+                        return Err(
+                            ReceiverV03TransferError::CompleteWhileChunkPendingPersistence {
+                                index: pending.index,
+                            },
+                        );
+                    }
+
+                    let hash: [u8; 32] = frame.payload.as_slice().try_into().map_err(|_| {
+                        ReceiverV03TransferError::InvalidCompletePayload(frame.payload.len())
+                    })?;
+                    let expected = self.receiver.chunk_state.layout().chunk_count();
+                    let actual = self.receiver.chunk_state.recorded_chunks().len();
+                    let actual = u64::try_from(actual).map_err(|_| {
+                        ReceiverV03TransferError::VerifiedChunkCountOverflow(actual)
+                    })?;
+                    if actual != expected {
+                        return Err(ReceiverV03TransferError::IncompleteVerifiedCoverage {
+                            expected,
+                            actual,
+                        });
+                    }
+
+                    return Ok(ReceivedCompleteV03 {
+                        file: self.file,
+                        partial_path: self.partial_path,
+                        receiver: self.receiver,
+                        sender_file_hash: ChunkHash::from_bytes(hash),
+                    });
+                }
+                message_type => {
+                    return Err(ReceiverV03TransferError::UnexpectedMessageType(
+                        message_type,
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -336,6 +511,7 @@ pub async fn prepare_receiver_v03(
     let chunk_hash_batches = chunk_hash_batches(&receiver.chunk_state);
 
     Ok(PreparedReceiverV03 {
+        partial_path: partial_path.to_path_buf(),
         file,
         receiver,
         resume: ResumeRequestV03 { chunk_record_count },
@@ -528,6 +704,8 @@ impl ChunkReceiverV03 {
 mod tests {
     use super::*;
 
+    use std::io::Cursor;
+
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, DuplexStream, duplex};
 
@@ -536,7 +714,10 @@ mod tests {
         ChunkStateError, RecordedChunk, chunk_state_path, read_chunk_state, write_chunk_state,
     };
     use crate::protocol::frame::{ACTIVE_WFP_VERSION, WFP_VERSION_V02};
-    use crate::protocol::{DecodeError, decode_chunk_hashes, decode_resume_v03};
+    use crate::protocol::{
+        DecodeError, decode_chunk_hashes, decode_resume_v03, encode_chunk_start_v03,
+        encode_data_v03, encode_frame,
+    };
 
     fn hash(data: &[u8]) -> ChunkHash {
         ChunkHash::from_bytes(*blake3::hash(data).as_bytes())
@@ -557,6 +738,45 @@ mod tests {
         DataV03 {
             absolute_offset: offset,
             data: bytes.to_vec(),
+        }
+    }
+
+    fn transfer_frame(message_type: MessageType, payload: Vec<u8>) -> Frame {
+        Frame::new_for_version(WFP_VERSION_V03, message_type, payload).unwrap()
+    }
+
+    fn chunk_start_frame(index: u64, bytes: &[u8]) -> Frame {
+        transfer_frame(
+            MessageType::ChunkStart,
+            encode_chunk_start_v03(&chunk_start(index, bytes)),
+        )
+    }
+
+    fn data_frame(offset: u64, bytes: &[u8]) -> Frame {
+        transfer_frame(
+            MessageType::Data,
+            encode_data_v03(&data(offset, bytes)).unwrap(),
+        )
+    }
+
+    fn complete_frame(hash: ChunkHash) -> Frame {
+        transfer_frame(MessageType::Complete, hash.as_bytes().to_vec())
+    }
+
+    fn encoded_frames(frames: &[Frame]) -> Vec<u8> {
+        frames
+            .iter()
+            .flat_map(|frame| encode_frame(frame).unwrap())
+            .collect()
+    }
+
+    async fn accepted_from_state(partial: &Path, state: ChunkState) -> AcceptedReceiverV03 {
+        AcceptedReceiverV03 {
+            partial_path: partial.to_path_buf(),
+            file: prepare_v03_partial_file(partial, state.layout().file_size())
+                .await
+                .unwrap(),
+            receiver: ChunkReceiverV03::new(state),
         }
     }
 
@@ -636,6 +856,7 @@ mod tests {
         let chunk_hash_batches = chunk_hash_batches(&state);
 
         PreparedReceiverV03 {
+            partial_path: partial.to_path_buf(),
             file,
             receiver: ChunkReceiverV03::new(state),
             resume: ResumeRequestV03 { chunk_record_count },
@@ -1289,6 +1510,426 @@ mod tests {
                 index: 0,
                 hash: hash(b"z"),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_accepts_complete_only_for_zero_length_and_all_reuse() {
+        let temp = tempdir().unwrap();
+        let sender_hash = hash(b"");
+        let partial = temp.path().join("empty.part");
+        let accepted = accepted_from_state(&partial, state(0, 4, Vec::new())).await;
+        let bytes = encoded_frames(&[
+            complete_frame(sender_hash),
+            transfer_frame(MessageType::Accept, Vec::new()),
+        ]);
+        let first_frame_length = encode_frame(&complete_frame(sender_hash)).unwrap().len();
+        let mut stream = Cursor::new(bytes);
+
+        let complete = accepted.receive_transfer(&mut stream).await.unwrap();
+
+        assert_eq!(complete.sender_file_hash, sender_hash);
+        assert_eq!(complete.partial_path, partial);
+        assert_eq!(complete.file.metadata().await.unwrap().len(), 0);
+        assert!(complete.receiver.chunk_state.recorded_chunks().is_empty());
+        assert_eq!(
+            stream.position(),
+            u64::try_from(first_frame_length).unwrap()
+        );
+        assert_eq!(ACTIVE_WFP_VERSION, WFP_VERSION_V02);
+
+        let data = b"abcdefghijkl";
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let partial = temp.path().join("all-reuse.part");
+        fs::write(&partial, data).await.unwrap();
+        let reused = ChunkState::new(layout, records_for(data, layout, &[0, 1, 2])).unwrap();
+        let accepted = accepted_from_state(&partial, reused.clone()).await;
+        let sender_hash = hash(data);
+        let mut stream = Cursor::new(encoded_frames(&[complete_frame(sender_hash)]));
+
+        let complete = accepted.receive_transfer(&mut stream).await.unwrap();
+
+        assert_eq!(complete.sender_file_hash, sender_hash);
+        assert_eq!(complete.receiver.chunk_state, reused);
+        assert_eq!(fs::read(partial).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn transfer_receives_one_chunk_and_persists_it_before_complete() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("one.part");
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let frames = [
+            chunk_start_frame(0, b"abcd"),
+            data_frame(0, b"abcd"),
+            complete_frame(hash(b"abcd")),
+        ];
+        let mut stream = Cursor::new(encoded_frames(&frames));
+
+        let complete = accepted.receive_transfer(&mut stream).await.unwrap();
+
+        assert_eq!(fs::read(&partial).await.unwrap(), b"abcd");
+        assert_eq!(complete.receiver.chunk_state.hash(0), Some(hash(b"abcd")));
+        assert_eq!(
+            read_chunk_state(&partial).await.unwrap(),
+            complete.receiver.chunk_state
+        );
+        assert!(complete.receiver.active.is_none());
+        assert!(complete.receiver.pending_verified.is_none());
+    }
+
+    #[tokio::test]
+    async fn transfer_combines_reused_split_transmitted_and_final_short_chunks() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("mixed.part");
+        let expected = b"abcdefghijklmn";
+        let layout = ChunkLayout::new(14, 4).unwrap();
+        fs::write(&partial, b"abcd????ijkl??").await.unwrap();
+        let initial = ChunkState::new(layout, records_for(expected, layout, &[0, 2])).unwrap();
+        let accepted = accepted_from_state(&partial, initial).await;
+        let frames = [
+            chunk_start_frame(1, b"efgh"),
+            data_frame(4, b"ef"),
+            data_frame(6, b"gh"),
+            chunk_start_frame(3, b"mn"),
+            data_frame(12, b"mn"),
+            complete_frame(hash(expected)),
+        ];
+        let mut stream = Cursor::new(encoded_frames(&frames));
+
+        let complete = accepted.receive_transfer(&mut stream).await.unwrap();
+
+        assert_eq!(fs::read(&partial).await.unwrap(), expected);
+        assert_eq!(
+            complete
+                .receiver
+                .chunk_state
+                .recorded_chunks()
+                .iter()
+                .map(|chunk| chunk.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            read_chunk_state(&partial).await.unwrap(),
+            complete.receiver.chunk_state
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_preserves_receiver_errors_for_invalid_chunk_and_data_sequences() {
+        let temp = tempdir().unwrap();
+
+        let cases = [
+            (
+                "data-before-start",
+                state(4, 4, Vec::new()),
+                vec![data_frame(0, b"a")],
+                ReceiverV03Error::DataWithoutActiveChunk,
+            ),
+            (
+                "start-while-active",
+                state(8, 4, Vec::new()),
+                vec![chunk_start_frame(0, b"abcd"), chunk_start_frame(1, b"efgh")],
+                ReceiverV03Error::ChunkAlreadyActive,
+            ),
+            (
+                "wrong-offset",
+                state(4, 4, Vec::new()),
+                vec![chunk_start_frame(0, b"abcd"), data_frame(1, b"a")],
+                ReceiverV03Error::UnexpectedDataOffset {
+                    expected: 0,
+                    actual: 1,
+                },
+            ),
+            (
+                "cross-boundary",
+                state(8, 4, Vec::new()),
+                vec![chunk_start_frame(0, b"abcd"), data_frame(0, b"abcde")],
+                ReceiverV03Error::DataCrossesChunkBoundary {
+                    end: 5,
+                    chunk_end: 4,
+                },
+            ),
+        ];
+
+        for (name, chunk_state, frames, expected) in cases {
+            let partial = temp.path().join(format!("{name}.part"));
+            let accepted = accepted_from_state(&partial, chunk_state).await;
+            let mut stream = Cursor::new(encoded_frames(&frames));
+            let error = match accepted.receive_transfer(&mut stream).await {
+                Ok(_) => panic!("{name} unexpectedly succeeded"),
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(&error, ReceiverV03TransferError::Receiver(actual) if mem::discriminant(actual) == mem::discriminant(&expected)),
+                "unexpected error for {name}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_stops_on_hash_mismatch_without_persisting_or_reading_ahead() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("mismatch.part");
+        let accepted = accepted_from_state(&partial, state(8, 4, Vec::new())).await;
+        let first = chunk_start_frame(0, b"wxyz");
+        let second = data_frame(0, b"abcd");
+        let frames = [first.clone(), second.clone(), chunk_start_frame(1, b"efgh")];
+        let consumed = encode_frame(&first).unwrap().len() + encode_frame(&second).unwrap().len();
+        let mut stream = Cursor::new(encoded_frames(&frames));
+
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Receiver(
+                ReceiverV03Error::ChunkHashMismatch { index: 0 }
+            ))
+        ));
+        assert_eq!(stream.position(), u64::try_from(consumed).unwrap());
+        assert!(!chunk_state_path(&partial).exists());
+    }
+
+    #[tokio::test]
+    async fn transfer_preserves_begin_chunk_range_redundancy_and_order_errors() {
+        let temp = tempdir().unwrap();
+
+        let partial = temp.path().join("out-of-range.part");
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let mut stream = Cursor::new(encoded_frames(&[chunk_start_frame(1, b"efgh")]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Receiver(
+                ReceiverV03Error::ChunkIndexOutOfRange(1)
+            ))
+        ));
+
+        let partial = temp.path().join("redundant.part");
+        fs::write(&partial, b"abcd").await.unwrap();
+        let verified = vec![RecordedChunk {
+            index: 0,
+            hash: hash(b"abcd"),
+        }];
+        let accepted = accepted_from_state(&partial, state(4, 4, verified)).await;
+        let mut stream = Cursor::new(encoded_frames(&[chunk_start_frame(0, b"abcd")]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Receiver(
+                ReceiverV03Error::AlreadyVerifiedChunk(0)
+            ))
+        ));
+
+        let partial = temp.path().join("non-increasing.part");
+        let accepted = accepted_from_state(&partial, state(8, 4, Vec::new())).await;
+        let frames = [
+            chunk_start_frame(1, b"efgh"),
+            data_frame(4, b"efgh"),
+            chunk_start_frame(0, b"abcd"),
+        ];
+        let mut stream = Cursor::new(encoded_frames(&frames));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Receiver(
+                ReceiverV03Error::NonIncreasingChunkIndex {
+                    previous: 1,
+                    current: 0
+                }
+            ))
+        ));
+        assert_eq!(
+            read_chunk_state(&partial).await.unwrap().hash(1),
+            Some(hash(b"efgh"))
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_complete_at_unclean_or_incomplete_boundaries() {
+        let temp = tempdir().unwrap();
+
+        let partial = temp.path().join("active.part");
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let frames = [
+            chunk_start_frame(0, b"abcd"),
+            data_frame(0, b"ab"),
+            complete_frame(hash(b"abcd")),
+        ];
+        let mut stream = Cursor::new(encoded_frames(&frames));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::CompleteWhileChunkActive { index: 0 })
+        ));
+
+        let partial = temp.path().join("pending.part");
+        let mut file = prepare_v03_partial_file(&partial, 4).await.unwrap();
+        let mut receiver = ChunkReceiverV03::new(state(4, 4, Vec::new()));
+        receiver.begin_chunk(chunk_start(0, b"abcd")).unwrap();
+        receiver
+            .write_data(&mut file, &data(0, b"abcd"))
+            .await
+            .unwrap();
+        let accepted = AcceptedReceiverV03 {
+            partial_path: partial,
+            file,
+            receiver,
+        };
+        let mut stream = Cursor::new(encoded_frames(&[complete_frame(hash(b"abcd"))]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::CompleteWhileChunkPendingPersistence { index: 0 })
+        ));
+
+        let partial = temp.path().join("missing.part");
+        fs::write(&partial, b"abcd????????").await.unwrap();
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let initial = ChunkState::new(layout, records_for(b"abcdefghijkl", layout, &[0])).unwrap();
+        let accepted = accepted_from_state(&partial, initial).await;
+        let frames = [
+            chunk_start_frame(1, b"efgh"),
+            data_frame(4, b"efgh"),
+            complete_frame(hash(b"abcdefghijkl")),
+        ];
+        let mut stream = Cursor::new(encoded_frames(&frames));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::IncompleteVerifiedCoverage {
+                expected: 3,
+                actual: 2
+            })
+        ));
+        assert_eq!(
+            read_chunk_state(&partial)
+                .await
+                .unwrap()
+                .recorded_chunks()
+                .iter()
+                .map(|chunk| chunk.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_stops_before_complete_when_chunk_persistence_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("persistence-failure.part");
+        fs::create_dir(chunk_state_path(&partial)).await.unwrap();
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let first = chunk_start_frame(0, b"abcd");
+        let second = data_frame(0, b"abcd");
+        let frames = [first.clone(), second.clone(), complete_frame(hash(b"abcd"))];
+        let consumed = encode_frame(&first).unwrap().len() + encode_frame(&second).unwrap().len();
+        let mut stream = Cursor::new(encoded_frames(&frames));
+
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Receiver(
+                ReceiverV03Error::ChunkState(ChunkStateError::Io(_))
+            ))
+        ));
+        assert_eq!(stream.position(), u64::try_from(consumed).unwrap());
+        assert!(chunk_state_path(&partial).is_dir());
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_malformed_complete_and_transfer_payloads() {
+        let temp = tempdir().unwrap();
+
+        for length in [31, 33] {
+            let partial = temp.path().join(format!("complete-{length}.part"));
+            let accepted = accepted_from_state(&partial, state(0, 4, Vec::new())).await;
+            let frame = transfer_frame(MessageType::Complete, vec![0; length]);
+            let mut stream = Cursor::new(encoded_frames(&[frame]));
+            assert!(matches!(
+                accepted.receive_transfer(&mut stream).await,
+                Err(ReceiverV03TransferError::InvalidCompletePayload(actual)) if actual == length
+            ));
+        }
+
+        let partial = temp.path().join("chunk-start-codec.part");
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let frame = transfer_frame(MessageType::ChunkStart, vec![0; 39]);
+        let mut stream = Cursor::new(encoded_frames(&[frame]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::ChunkStart(
+                ChunkStartV03Error::InvalidPayloadLength(39)
+            ))
+        ));
+
+        let partial = temp.path().join("data-codec.part");
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let frame = transfer_frame(MessageType::Data, vec![0; 7]);
+        let mut stream = Cursor::new(encoded_frames(&[frame]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Data(
+                DataV03Error::InvalidPayloadLength
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn transfer_preserves_wrong_version_unexpected_message_and_eof_errors() {
+        let temp = tempdir().unwrap();
+
+        let partial = temp.path().join("wrong-version.part");
+        let accepted = accepted_from_state(&partial, state(0, 4, Vec::new())).await;
+        let frame =
+            Frame::new_for_version(WFP_VERSION_V02, MessageType::Complete, vec![0; 32]).unwrap();
+        let mut stream = Cursor::new(encoded_frames(&[frame]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Protocol(ProtocolIoError::Decode(
+                DecodeError::UnsupportedVersion(WFP_VERSION_V02)
+            )))
+        ));
+
+        let partial = temp.path().join("unexpected.part");
+        let accepted = accepted_from_state(&partial, state(0, 4, Vec::new())).await;
+        let frame = transfer_frame(MessageType::Accept, Vec::new());
+        let mut stream = Cursor::new(encoded_frames(&[frame]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::UnexpectedMessageType(
+                MessageType::Accept
+            ))
+        ));
+
+        let partial = temp.path().join("empty-eof.part");
+        let accepted = accepted_from_state(&partial, state(0, 4, Vec::new())).await;
+        let mut stream = Cursor::new(Vec::new());
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Protocol(ProtocolIoError::Io(error)))
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let partial = temp.path().join("active-eof.part");
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let mut stream = Cursor::new(encoded_frames(&[
+            chunk_start_frame(0, b"abcd"),
+            data_frame(0, b"ab"),
+        ]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Protocol(ProtocolIoError::Io(error)))
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let partial = temp.path().join("persisted-eof.part");
+        let accepted = accepted_from_state(&partial, state(4, 4, Vec::new())).await;
+        let mut stream = Cursor::new(encoded_frames(&[
+            chunk_start_frame(0, b"abcd"),
+            data_frame(0, b"abcd"),
+        ]));
+        assert!(matches!(
+            accepted.receive_transfer(&mut stream).await,
+            Err(ReceiverV03TransferError::Protocol(ProtocolIoError::Io(error)))
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            read_chunk_state(&partial).await.unwrap().hash(0),
+            Some(hash(b"abcd"))
         );
     }
 

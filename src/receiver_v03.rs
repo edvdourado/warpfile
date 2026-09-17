@@ -2251,6 +2251,7 @@ mod tests {
                 .is_some()
         );
 
+        file.flush().await.unwrap();
         assert_eq!(fs::read(&partial).await.unwrap(), b"keepMID!tail");
 
         let mut one_byte = ChunkReceiverV03::new(state(1, 1, Vec::new()));

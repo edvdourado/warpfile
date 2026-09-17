@@ -66,6 +66,7 @@ Persistent metadata must assist recovery without becoming a substitute for verif
                           |
                           v
                      WFP/0.2
+                     WFP/0.3 (opt-in)
                           |
                   +-------+-------+
                   |               |
@@ -112,12 +113,17 @@ The completion receipt records a successfully verified logical transfer and allo
 src/
 |-- main.rs
 |-- lib.rs
+|-- chunk.rs
+|-- chunk_manifest.rs
+|-- chunk_state.rs
 |-- completion_receipt.rs
 |-- destination.rs
 |-- discovery.rs
 |-- progress.rs
 |-- receiver.rs
+|-- receiver_v03.rs
 |-- sender.rs
+|-- sender_v03.rs
 |-- tailscale.rs
 |-- transfer_metadata.rs
 `-- protocol/
@@ -131,7 +137,8 @@ src/
     |-- reject.rs
     |-- resume.rs
     |-- transfer_id.rs
-    `-- discovery.rs
+    |-- discovery.rs
+    `-- v03.rs
 
 tests/
 |-- automatic_reconnect_e2e.rs
@@ -143,7 +150,8 @@ tests/
 |-- resume_sender_e2e.rs
 |-- retry_policy_e2e.rs
 |-- transfer_e2e.rs
-`-- transfer_metadata_e2e.rs
+|-- transfer_metadata_e2e.rs
+`-- wfp_v03_e2e.rs
 ```
 
 The layout separates:
@@ -1640,9 +1648,9 @@ This is intentionally correct before being maximally optimized.
 
 Future improvements may persist:
 
-- BLAKE3 checkpoints;
-- chunk hashes;
-- chunk manifests.
+- BLAKE3 checkpoints.
+
+Chunk hashes and chunk manifests are implemented in WFP/0.3 (chunk-aware resume) via `--wfp-version=0.3`.
 
 Transfer metadata itself is no longer future work; `.warpmeta` is already implemented.
 
@@ -1741,13 +1749,14 @@ WarpFile uses both unit and end-to-end tests.
 The currently validated suite contains:
 
 ```text
-83 unit tests
-29 end-to-end tests
+301 unit tests
+4 CLI tests in main.rs
+31 end-to-end tests
 -------------------
-112 tests total
+336 tests total
 ```
 
-All 112 were passing when this architecture state was documented.
+All 336 were passing when this architecture state was documented.
 
 Unit tests cover components such as:
 
@@ -2105,6 +2114,8 @@ partial deduplication
 multi-source/private swarm
 ```
 
+Chunk-addressable transfer state is delivered in WFP/0.3 via `--wfp-version=0.3`; the progression above is kept as historical record.
+
 Potential work includes:
 
 - persistent sender job identity where useful;
@@ -2117,6 +2128,8 @@ Potential work includes:
 - selective compression;
 - batch transfer for many small files;
 - platform-specific zero-copy paths behind portable abstractions.
+
+Chunk hashes and chunk manifests are delivered in WFP/0.3 via `--wfp-version=0.3`.
 
 The central efficiency principle remains:
 
@@ -2227,6 +2240,8 @@ batching / selective compression
       v
 dedup / topology-aware distribution
 ```
+
+Chunk-aware recovery is delivered in WFP/0.3 via `--wfp-version=0.3`; the progression above is kept as historical record.
 
 Any platform-specific optimization must remain behind an explicit abstraction so that the core protocol remains portable.
 

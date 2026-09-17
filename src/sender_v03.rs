@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;
@@ -17,6 +17,30 @@ use crate::protocol::{
     decode_chunk_hashes, decode_resume_v03, encode_chunk_start_v03, encode_data_v03,
     encode_offer_v03, read_frame_for_version, write_frame,
 };
+
+const PROGRESS_STRIDE_DIVISOR: usize = 100;
+
+fn progress_stride(total: usize) -> usize {
+    (total / PROGRESS_STRIDE_DIVISOR).max(1)
+}
+
+fn render_progress(label: &str, current: usize, total: usize) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let percent = current
+        .checked_mul(100)
+        .and_then(|scaled| scaled.checked_div(total))
+        .unwrap_or(100);
+    print!("\r{label}: {current}/{total} chunks ({percent}%)");
+    let _ = std::io::stdout().flush();
+}
+
+fn finish_progress(label: &str, total: usize) {
+    if std::io::stdout().is_terminal() {
+        println!("\r{label}: {total}/{total} chunks (100%)");
+    }
+}
 
 pub const V03_DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 
@@ -602,11 +626,21 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let total_chunks = scanner.inventory.layout.chunk_count() as usize;
+    let stride = progress_stride(total_chunks);
+    let mut processed = 0usize;
+
     while let Some(chunk) = scanner.next_chunk().await? {
         if chunk.disposition() == SourceChunkDispositionV03::Transmit {
             send_transmit_chunk_v03(stream, &chunk).await?;
         }
+        processed += 1;
+        if processed.is_multiple_of(stride) || processed == total_chunks {
+            render_progress("Sending", processed, total_chunks);
+        }
     }
+
+    finish_progress("Sending", total_chunks);
 
     Ok(scanner.finish()?)
 }
@@ -824,6 +858,8 @@ pub async fn send_session_v03(
         .await
         .map_err(SenderV03SessionError::Connect)?;
 
+    println!("Connected to {address}");
+
     send_session_v03_with_stream(path, stream, transfer_id, chunk_size).await
 }
 
@@ -852,6 +888,8 @@ where
     let hello = Frame::new_for_version(WFP_VERSION_V03, MessageType::Hello, vec![WFP_VERSION_V03])?;
     write_frame(&mut stream, &hello).await?;
 
+    println!("Sent HELLO (WFP/0.3)");
+
     let hello_ack = read_frame_for_version(&mut stream, WFP_VERSION_V03).await?;
     if hello_ack.message_type != MessageType::HelloAck {
         return Err(SenderV03SessionError::UnexpectedMessageType(
@@ -864,12 +902,18 @@ where
         ));
     }
 
+    println!("Received HELLO_ACK (WFP/0.3)");
+
     let offer = FileOfferV03 {
         transfer_id,
         filename,
         file_size,
         chunk_size: chunk_size.get(),
     };
+    println!(
+        "Sending OFFER: {} ({} bytes, chunk size {})",
+        offer.filename, offer.file_size, offer.chunk_size
+    );
     let offer_payload = encode_offer_v03(&offer)?;
     let offer_frame = Frame::new_for_version(WFP_VERSION_V03, MessageType::Offer, offer_payload)?;
     write_frame(&mut stream, &offer_frame).await?;
@@ -877,11 +921,20 @@ where
     let layout = ChunkLayout::new(file_size, chunk_size.get()).expect("chunk size is non-zero");
     let inventory = receive_inventory_and_accept(&mut stream, layout).await?;
 
+    let verified = inventory.records.len();
+    let total = inventory.layout.chunk_count() as usize;
+    println!(
+        "Receiver inventory: {verified} verified chunks; sending {}",
+        total - verified
+    );
+
     let file = tokio::fs::File::open(path)
         .await
         .map_err(SenderV03SessionError::Source)?;
     let mut scanner = SourceScannerV03::new(file, inventory);
     send_source_chunks_complete_and_verify_v03(&mut stream, &mut scanner).await?;
+
+    println!("VERIFIED received; transfer complete");
 
     Ok(())
 }

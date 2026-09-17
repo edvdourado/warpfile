@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::mem;
 use std::path::{Component, Path, PathBuf};
 
@@ -24,6 +24,30 @@ use crate::protocol::{
     ProtocolIoError, ResumeRequestV03, TransferId, decode_chunk_start_v03, decode_data_v03,
     decode_offer_v03, encode_chunk_hashes, encode_resume_v03, read_frame_for_version, write_frame,
 };
+
+const PROGRESS_STRIDE_DIVISOR: usize = 100;
+
+fn progress_stride(total: usize) -> usize {
+    (total / PROGRESS_STRIDE_DIVISOR).max(1)
+}
+
+fn render_progress(label: &str, current: usize, total: usize) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let percent = current
+        .checked_mul(100)
+        .and_then(|scaled| scaled.checked_div(total))
+        .unwrap_or(100);
+    print!("\r{label}: {current}/{total} chunks ({percent}%)");
+    let _ = std::io::stdout().flush();
+}
+
+fn finish_progress(label: &str, total: usize) {
+    if std::io::stdout().is_terminal() {
+        println!("\r{label}: {total}/{total} chunks (100%)");
+    }
+}
 
 const FINAL_VERIFICATION_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -288,6 +312,8 @@ impl ReceivedCompleteV03 {
 
         self.verify_complete_file().await?;
 
+        println!("Final file verified");
+
         if let Some(destination) = receipt_destination {
             let receipt = CompletionReceipt {
                 transfer_id: identity.transfer_id,
@@ -296,9 +322,13 @@ impl ReceivedCompleteV03 {
                 blake3: sender_file_hash.into_bytes(),
             };
             write_completion_receipt(destination, &receipt).await?;
+
+            println!("Completion receipt persisted");
         }
 
         fs::rename(&partial_path, &final_path).await?;
+
+        println!("Renamed partial to final");
 
         /*
          * Cleanup is best-effort: `.warpchunks` is advisory state whose
@@ -598,6 +628,8 @@ where
 
         send_verified_v03(stream).await?;
 
+        println!("Reconciled from {}", destination.display());
+
         return Ok(ReceiverV03ReconcileOutcome::Reconciled(destination));
     }
 
@@ -613,6 +645,8 @@ where
         let _ = remove_chunk_state(&partial_destination).await;
 
         send_verified_v03(stream).await?;
+
+        println!("Reconciled from {}", destination.display());
 
         return Ok(ReceiverV03ReconcileOutcome::Reconciled(destination));
     }
@@ -888,6 +922,10 @@ impl AcceptedReceiverV03 {
     where
         S: AsyncRead + Unpin,
     {
+        let total_chunks = self.receiver.chunk_state.layout().chunk_count() as usize;
+        let stride = progress_stride(total_chunks);
+        let mut last_reported = 0usize;
+
         loop {
             let frame = read_frame_for_version(stream, WFP_VERSION_V03).await?;
 
@@ -907,6 +945,14 @@ impl AcceptedReceiverV03 {
                         self.receiver
                             .persist_verified_chunk(&mut self.file, &self.partial_path)
                             .await?;
+
+                        let verified = self.receiver.chunk_state.recorded_chunks().len();
+                        if verified.saturating_sub(last_reported) >= stride
+                            || verified == total_chunks
+                        {
+                            render_progress("Receiving", verified, total_chunks);
+                            last_reported = verified;
+                        }
                     }
                 }
                 MessageType::Complete => {
@@ -937,6 +983,8 @@ impl AcceptedReceiverV03 {
                             actual,
                         });
                     }
+
+                    finish_progress("Receiving", total_chunks);
 
                     return Ok(ReceivedCompleteV03 {
                         file: self.file,
@@ -1342,8 +1390,6 @@ where
 
     match reconcile_completed_transfer_v03(stream, destination_directory, &offer).await? {
         ReceiverV03ReconcileOutcome::Reconciled(path) => {
-            println!("Saved to {}", path.display());
-
             return Ok(ReceiverV03SessionOutcome::Reconciled(path));
         }
 
@@ -1354,9 +1400,16 @@ where
 
     let prepared = prepare_receiver_v03(&partial_destination, &offer).await?;
 
+    let loaded = prepared.receiver.chunk_state.recorded_chunks().len();
+    if loaded > 0 {
+        println!("Loaded {loaded} verified chunks from persisted state");
+    }
+
     let accepted = prepared.negotiate_inventory(stream).await?;
 
     let received = accepted.receive_transfer(stream).await?;
+
+    println!("COMPLETE received; verifying final file...");
 
     let final_path = received
         .complete(stream, Some(destination_directory))

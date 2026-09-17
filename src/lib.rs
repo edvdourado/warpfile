@@ -1,9 +1,14 @@
+pub mod chunk;
+pub mod chunk_manifest;
+pub mod chunk_state;
 pub mod completion_receipt;
 pub mod destination;
 pub mod discovery;
 pub mod progress;
 pub mod protocol;
 pub mod receiver;
+pub mod receiver_v03;
 pub mod sender;
+pub mod sender_v03;
 pub mod tailscale;
 pub mod transfer_metadata;

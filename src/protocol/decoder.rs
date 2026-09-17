@@ -2,7 +2,8 @@ use std::error::Error;
 use std::fmt;
 
 use super::frame::{
-    Frame, HEADER_LENGTH, MAX_DATA_PAYLOAD_LENGTH, MAX_PAYLOAD_LENGTH, WFP_MAGIC, WFP_VERSION,
+    ACTIVE_WFP_VERSION, Frame, HEADER_LENGTH, MAX_DATA_PAYLOAD_LENGTH, MAX_PAYLOAD_LENGTH,
+    WFP_MAGIC, is_supported_version,
 };
 use super::message::MessageType;
 
@@ -69,9 +70,24 @@ impl fmt::Display for DecodeError {
 
 impl Error for DecodeError {}
 
-pub fn decode_frame(bytes: &[u8]) -> Result<Frame, DecodeError> {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameHeader {
+    pub version: u8,
+    pub message_type: MessageType,
+    pub flags: u16,
+    pub payload_length: usize,
+}
+
+pub(crate) fn validate_frame_header(
+    bytes: &[u8],
+    expected_version: u8,
+) -> Result<FrameHeader, DecodeError> {
     if bytes.len() < HEADER_LENGTH {
         return Err(DecodeError::HeaderTooShort(bytes.len()));
+    }
+
+    if !is_supported_version(expected_version) {
+        return Err(DecodeError::UnsupportedVersion(expected_version));
     }
 
     let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
@@ -82,14 +98,14 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, DecodeError> {
 
     let version = bytes[4];
 
-    if version != WFP_VERSION {
+    if !is_supported_version(version) || version != expected_version {
         return Err(DecodeError::UnsupportedVersion(version));
     }
 
     let message_type_byte = bytes[5];
 
-    let message_type =
-        MessageType::try_from(message_type_byte).map_err(DecodeError::UnknownMessageType)?;
+    let message_type = MessageType::from_wire(version, message_type_byte)
+        .map_err(DecodeError::UnknownMessageType)?;
 
     let flags = u16::from_be_bytes([bytes[6], bytes[7]]);
 
@@ -107,7 +123,21 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, DecodeError> {
         return Err(DecodeError::DataPayloadTooLarge(payload_length));
     }
 
-    let expected_length = HEADER_LENGTH + payload_length;
+    Ok(FrameHeader {
+        version,
+        message_type,
+        flags,
+        payload_length,
+    })
+}
+
+pub fn decode_frame(bytes: &[u8]) -> Result<Frame, DecodeError> {
+    decode_frame_for_version(bytes, ACTIVE_WFP_VERSION)
+}
+
+pub fn decode_frame_for_version(bytes: &[u8], version: u8) -> Result<Frame, DecodeError> {
+    let header = validate_frame_header(bytes, version)?;
+    let expected_length = HEADER_LENGTH + header.payload_length;
 
     if bytes.len() < expected_length {
         return Err(DecodeError::IncompleteFrame {
@@ -126,9 +156,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, DecodeError> {
     let payload = bytes[HEADER_LENGTH..expected_length].to_vec();
 
     Ok(Frame {
-        version,
-        message_type,
-        flags,
+        version: header.version,
+        message_type: header.message_type,
+        flags: header.flags,
         payload,
     })
 }
@@ -137,6 +167,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, DecodeError> {
 mod tests {
     use super::*;
     use crate::protocol::encoder::encode_frame;
+    use crate::protocol::frame::{WFP_VERSION, WFP_VERSION_V02, WFP_VERSION_V03};
 
     #[test]
     fn decodes_valid_hello_frame() {
@@ -164,6 +195,33 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_decodes_valid_wfp_v02_and_v03_frames() {
+        let v02 = Frame::new(MessageType::Hello, vec![WFP_VERSION_V02]);
+        assert_eq!(
+            decode_frame_for_version(&encode_frame(&v02).unwrap(), WFP_VERSION_V02).unwrap(),
+            v02
+        );
+
+        let v03 =
+            Frame::new_for_version(WFP_VERSION_V03, MessageType::ChunkHashes, Vec::new()).unwrap();
+        assert_eq!(
+            decode_frame_for_version(&encode_frame(&v03).unwrap(), WFP_VERSION_V03).unwrap(),
+            v03
+        );
+    }
+
+    #[test]
+    fn default_decoder_remains_constrained_to_wfp_v02() {
+        let v03 =
+            Frame::new_for_version(WFP_VERSION_V03, MessageType::ChunkHashes, Vec::new()).unwrap();
+
+        assert_eq!(
+            decode_frame(&encode_frame(&v03).unwrap()),
+            Err(DecodeError::UnsupportedVersion(WFP_VERSION_V03))
+        );
+    }
+
+    #[test]
     fn rejects_invalid_magic() {
         let bytes = vec![
             0x42, 0x41, 0x44, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
@@ -186,6 +244,64 @@ mod tests {
         let result = decode_frame(&bytes);
 
         assert_eq!(result, Err(DecodeError::UnknownMessageType(0x73)));
+    }
+
+    #[test]
+    fn rejects_chunk_hashes_message_type_under_wfp_v02() {
+        let bytes = vec![
+            0x57,
+            0x46,
+            0x50,
+            0x00,
+            WFP_VERSION_V02,
+            0x15,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        assert_eq!(
+            decode_frame(&bytes),
+            Err(DecodeError::UnknownMessageType(0x15))
+        );
+    }
+
+    #[test]
+    fn rejects_chunk_start_message_type_under_wfp_v02() {
+        let bytes = vec![
+            0x57,
+            0x46,
+            0x50,
+            0x00,
+            WFP_VERSION_V02,
+            0x16,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        assert_eq!(
+            decode_frame(&bytes),
+            Err(DecodeError::UnknownMessageType(0x16))
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_version() {
+        let bytes = vec![
+            0x57, 0x46, 0x50, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        assert_eq!(
+            decode_frame_for_version(&bytes, 0x04),
+            Err(DecodeError::UnsupportedVersion(0x04))
+        );
     }
 
     #[test]

@@ -598,6 +598,8 @@ while current post-release development uses:
 WFP/0.2
 ```
 
+An opt-in WFP/0.3 is also available via `--wfp-version=0.3`, adding chunk-aware resume (deterministic chunk layout, per-chunk BLAKE3 manifest, sparse chunk state). WFP/0.2 remains the default. Details live in `docs/ARCHITECTURE.md`.
+
 Every frame starts with a fixed 12-byte header:
 
 ```text
@@ -724,7 +726,8 @@ Current limitations include:
 - reconciliation rehashes completed physical files;
 - one file per TCP transfer session;
 - no directory-transfer manifest;
-- no arbitrary missing-chunk map;
+- WFP/0.2 resume is prefix-only (no arbitrary missing-chunk map); WFP/0.3
+  provides a sparse chunk inventory via `--wfp-version=0.3`.
 - no partial-content deduplication;
 - no receipt garbage-collection policy;
 - sequential rather than simultaneous multi-client receiving;
@@ -838,12 +841,13 @@ Implemented:
 - receiver-side completion reconciliation;
 - safe retry after lost `VERIFIED`;
 - direct `OFFER -> VERIFIED` reconciliation;
-- refusal to trust completion receipts without verifying physical bytes.
+- refusal to trust completion receipts without verifying physical bytes;
+- chunk management (deterministic chunk layout, per-chunk BLAKE3 manifest,
+  sparse chunk state) — available in WFP/0.3 via `--wfp-version=0.3`.
 
 Still planned within the broader reliability and transfer-efficiency milestone:
 
 - BLAKE3 checkpoints;
-- improved chunk management;
 - non-contiguous missing-range recovery;
 - directory transfer design;
 - receipt lifecycle / garbage collection;
@@ -870,10 +874,11 @@ WarpFile uses unit tests and end-to-end tests with real local TCP and UDP socket
 Current validated suite:
 
 ```text
-83 unit tests
-29 end-to-end tests
+301 unit tests
+4 CLI tests in main.rs
+31 end-to-end tests
 -------------------
-112 tests total
+336 tests total
 
 0 failures
 ```
@@ -934,10 +939,11 @@ A central principle is:
 
 Current resume and reconciliation behavior already apply that principle by avoiding unnecessary retransmission of validated file bytes.
 
+Chunk-oriented recovery (deterministic chunk layout, per-chunk BLAKE3 manifest, sparse chunk state) is delivered in WFP/0.3 via `--wfp-version=0.3`.
+
 Future optimization work includes:
 
 - BLAKE3 checkpoints;
-- chunk-oriented recovery;
 - adaptive chunks;
 - pipelining;
 - minimizing unnecessary copies;

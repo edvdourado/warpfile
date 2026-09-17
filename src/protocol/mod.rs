@@ -8,16 +8,17 @@ pub mod offer;
 pub mod reject;
 pub mod resume;
 pub mod transfer_id;
+pub mod v03;
 
-pub use decoder::{DecodeError, decode_frame};
+pub use decoder::{DecodeError, decode_frame, decode_frame_for_version};
 
 pub use discovery::{DeviceAnnouncement, DiscoveryError, decode_announcement, encode_announcement};
 
 pub use encoder::{EncodeError, encode_frame};
 
-pub use frame::Frame;
+pub use frame::{Frame, FrameError};
 
-pub use io::{ProtocolIoError, read_frame, write_frame};
+pub use io::{ProtocolIoError, read_frame, read_frame_for_version, write_frame};
 
 pub use message::MessageType;
 
@@ -31,3 +32,12 @@ pub use resume::{
 };
 
 pub use transfer_id::{TRANSFER_ID_LENGTH, TransferId};
+
+pub use v03::{
+    CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkHashesError, ChunkStartV03,
+    ChunkStartV03Error, DataV03, DataV03Error, FileOfferV03, OfferV03Error, ResumeRequestV03,
+    ResumeV03Error, V03_CHUNK_START_PAYLOAD_LENGTH, V03_DATA_OFFSET_LENGTH, V03_MAX_DATA_BYTES,
+    V03_RESUME_PAYLOAD_LENGTH, decode_chunk_hashes, decode_chunk_start_v03, decode_data_v03,
+    decode_offer_v03, decode_resume_v03, encode_chunk_hashes, encode_chunk_start_v03,
+    encode_data_v03, encode_offer_v03, encode_resume_v03,
+};

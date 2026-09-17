@@ -1,3 +1,5 @@
+use super::frame::{WFP_VERSION_V02, WFP_VERSION_V03};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
@@ -9,6 +11,8 @@ pub enum MessageType {
     Reject = 0x12,
     Resume = 0x13,
     Restart = 0x14,
+    ChunkHashes = 0x15,
+    ChunkStart = 0x16,
 
     Data = 0x20,
 
@@ -23,11 +27,9 @@ pub enum MessageType {
     Error = 0xFF,
 }
 
-impl TryFrom<u8> for MessageType {
-    type Error = u8;
-
-    fn try_from(value: u8) -> Result<Self, u8> {
-        match value {
+impl MessageType {
+    pub(crate) fn from_wire(version: u8, value: u8) -> Result<Self, u8> {
+        let message_type = match value {
             0x01 => Ok(Self::Hello),
             0x02 => Ok(Self::HelloAck),
 
@@ -36,6 +38,8 @@ impl TryFrom<u8> for MessageType {
             0x12 => Ok(Self::Reject),
             0x13 => Ok(Self::Resume),
             0x14 => Ok(Self::Restart),
+            0x15 => Ok(Self::ChunkHashes),
+            0x16 => Ok(Self::ChunkStart),
 
             0x20 => Ok(Self::Data),
 
@@ -50,6 +54,20 @@ impl TryFrom<u8> for MessageType {
             0xFF => Ok(Self::Error),
 
             unknown => Err(unknown),
+        }?;
+
+        if message_type.is_allowed_in_version(version) {
+            Ok(message_type)
+        } else {
+            Err(value)
+        }
+    }
+
+    pub(crate) fn is_allowed_in_version(self, version: u8) -> bool {
+        match version {
+            WFP_VERSION_V02 => !matches!(self, Self::ChunkHashes | Self::ChunkStart),
+            WFP_VERSION_V03 => true,
+            _ => false,
         }
     }
 }
@@ -60,26 +78,61 @@ mod tests {
 
     #[test]
     fn decodes_discover_message_type() {
-        assert_eq!(MessageType::try_from(0x50), Ok(MessageType::Discover));
+        assert_eq!(
+            MessageType::from_wire(WFP_VERSION_V02, 0x50),
+            Ok(MessageType::Discover)
+        );
     }
 
     #[test]
     fn decodes_announce_message_type() {
-        assert_eq!(MessageType::try_from(0x51), Ok(MessageType::Announce));
+        assert_eq!(
+            MessageType::from_wire(WFP_VERSION_V03, 0x51),
+            Ok(MessageType::Announce)
+        );
     }
 
     #[test]
     fn decodes_resume_message_type() {
-        assert_eq!(MessageType::try_from(0x13), Ok(MessageType::Resume));
+        for version in [WFP_VERSION_V02, WFP_VERSION_V03] {
+            assert_eq!(
+                MessageType::from_wire(version, 0x13),
+                Ok(MessageType::Resume)
+            );
+        }
     }
 
     #[test]
     fn decodes_restart_message_type() {
-        assert_eq!(MessageType::try_from(0x14), Ok(MessageType::Restart));
+        assert_eq!(
+            MessageType::from_wire(WFP_VERSION_V03, 0x14),
+            Ok(MessageType::Restart)
+        );
+    }
+
+    #[test]
+    fn chunk_hashes_is_allocated_only_for_wfp_v03() {
+        assert_eq!(MessageType::ChunkHashes as u8, 0x15);
+        assert_eq!(MessageType::from_wire(WFP_VERSION_V02, 0x15), Err(0x15));
+        assert_eq!(
+            MessageType::from_wire(WFP_VERSION_V03, 0x15),
+            Ok(MessageType::ChunkHashes)
+        );
+    }
+
+    #[test]
+    fn chunk_start_is_allocated_only_for_wfp_v03() {
+        assert_eq!(MessageType::ChunkStart as u8, 0x16);
+        assert_eq!(MessageType::from_wire(WFP_VERSION_V02, 0x16), Err(0x16));
+        assert_eq!(
+            MessageType::from_wire(WFP_VERSION_V03, 0x16),
+            Ok(MessageType::ChunkStart)
+        );
     }
 
     #[test]
     fn rejects_unknown_message_type() {
-        assert_eq!(MessageType::try_from(0x7E), Err(0x7E));
+        assert_eq!(MessageType::from_wire(WFP_VERSION_V02, 0x7E), Err(0x7E));
+        assert_eq!(MessageType::from_wire(WFP_VERSION_V03, 0x7E), Err(0x7E));
     }
 }

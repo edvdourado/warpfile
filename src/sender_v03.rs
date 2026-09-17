@@ -1,16 +1,49 @@
 use std::error::Error;
 use std::fmt;
+use std::io;
+use std::num::NonZeroU64;
+use std::path::Path;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::TcpStream;
 
 use crate::chunk::ChunkLayout;
 use crate::chunk_manifest::ChunkHash;
 use crate::protocol::frame::{FrameError, WFP_VERSION_V03};
 use crate::protocol::{
-    ChunkHashRecord, ChunkHashesError, ChunkStartV03, DataV03, DataV03Error, Frame, MessageType,
-    ProtocolIoError, ResumeV03Error, V03_MAX_DATA_BYTES, decode_chunk_hashes, decode_resume_v03,
-    encode_chunk_start_v03, encode_data_v03, read_frame_for_version, write_frame,
+    ChunkHashRecord, ChunkHashesError, ChunkStartV03, DataV03, DataV03Error, FileOfferV03, Frame,
+    MessageType, OfferV03Error, ProtocolIoError, ResumeV03Error, TransferId, V03_MAX_DATA_BYTES,
+    decode_chunk_hashes, decode_resume_v03, encode_chunk_start_v03, encode_data_v03,
+    encode_offer_v03, read_frame_for_version, write_frame,
 };
+
+pub const V03_DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
+
+const V03_MAX_SEND_ATTEMPTS: usize = 3;
+const V03_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+fn v03_is_retryable_network_kind(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WriteZero
+    )
+}
+
+fn v03_is_retryable_protocol(error: &ProtocolIoError) -> bool {
+    match error {
+        ProtocolIoError::Io(error) => v03_is_retryable_network_kind(error.kind()),
+        ProtocolIoError::Decode(_) | ProtocolIoError::Encode(_) => false,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverInventoryV03 {
@@ -374,6 +407,24 @@ impl From<ChunkHashesError> for SenderV03NegotiationError {
     }
 }
 
+impl SenderV03NegotiationError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Protocol(error) => v03_is_retryable_protocol(error),
+            Self::Frame(_)
+            | Self::Resume(_)
+            | Self::ChunkHashes(_)
+            | Self::UnexpectedMessageType(_)
+            | Self::RecordCountExceedsLayout { .. }
+            | Self::EmptyChunkHashes
+            | Self::RecordCountOverflow
+            | Self::RecordCountOverrun { .. }
+            | Self::ChunkIndexOutOfRange(_)
+            | Self::NonIncreasingChunkIndex { .. } => false,
+        }
+    }
+}
+
 pub async fn receive_inventory_and_accept<S>(
     stream: &mut S,
     layout: ChunkLayout,
@@ -458,6 +509,8 @@ pub enum SenderV03TransferError {
     Data(DataV03Error),
     DataLengthTooLarge(usize),
     DataOffsetOverflow,
+    UnexpectedMessageType(MessageType),
+    InvalidVerifiedPayload(usize),
 }
 
 impl fmt::Display for SenderV03TransferError {
@@ -474,6 +527,15 @@ impl fmt::Display for SenderV03TransferError {
                 )
             }
             Self::DataOffsetOverflow => formatter.write_str("WFP/0.3 DATA offset overflow"),
+            Self::UnexpectedMessageType(message_type) => write!(
+                formatter,
+                "expected WFP/0.3 VERIFIED after COMPLETE, received message type 0x{:02X}",
+                *message_type as u8
+            ),
+            Self::InvalidVerifiedPayload(length) => write!(
+                formatter,
+                "WFP/0.3 VERIFIED payload must be empty, received {length} bytes"
+            ),
         }
     }
 }
@@ -485,7 +547,10 @@ impl Error for SenderV03TransferError {
             Self::Frame(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::Data(error) => Some(error),
-            Self::DataLengthTooLarge(_) | Self::DataOffsetOverflow => None,
+            Self::DataLengthTooLarge(_)
+            | Self::DataOffsetOverflow
+            | Self::UnexpectedMessageType(_)
+            | Self::InvalidVerifiedPayload(_) => None,
         }
     }
 }
@@ -511,6 +576,21 @@ impl From<ProtocolIoError> for SenderV03TransferError {
 impl From<DataV03Error> for SenderV03TransferError {
     fn from(error: DataV03Error) -> Self {
         Self::Data(error)
+    }
+}
+
+impl SenderV03TransferError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Protocol(error) => v03_is_retryable_protocol(error),
+            Self::SourceScan(_)
+            | Self::Frame(_)
+            | Self::Data(_)
+            | Self::DataLengthTooLarge(_)
+            | Self::DataOffsetOverflow
+            | Self::UnexpectedMessageType(_)
+            | Self::InvalidVerifiedPayload(_) => false,
+        }
     }
 }
 
@@ -562,6 +642,31 @@ where
     Ok(())
 }
 
+pub async fn send_source_chunks_complete_and_verify_v03<S, R>(
+    stream: &mut S,
+    scanner: &mut SourceScannerV03<R>,
+) -> Result<SourceScanSummaryV03, SenderV03TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let summary = send_source_chunks_and_complete_v03(stream, scanner).await?;
+
+    let verified = read_frame_for_version(stream, WFP_VERSION_V03).await?;
+    if verified.message_type != MessageType::Verified {
+        return Err(SenderV03TransferError::UnexpectedMessageType(
+            verified.message_type,
+        ));
+    }
+    if !verified.payload.is_empty() {
+        return Err(SenderV03TransferError::InvalidVerifiedPayload(
+            verified.payload.len(),
+        ));
+    }
+
+    Ok(summary)
+}
+
 async fn send_transmit_chunk_v03<S>(
     stream: &mut S,
     chunk: &SourceChunkV03,
@@ -597,6 +702,232 @@ where
     Ok(())
 }
 
+#[derive(Debug)]
+pub enum SenderV03SessionError {
+    Connect(io::Error),
+    Source(io::Error),
+    NotARegularFile,
+    InvalidFilename,
+    Frame(FrameError),
+    Protocol(ProtocolIoError),
+    Offer(OfferV03Error),
+    Negotiation(SenderV03NegotiationError),
+    Transfer(SenderV03TransferError),
+    UnexpectedMessageType(MessageType),
+    InvalidHelloAckPayload(usize),
+}
+
+impl fmt::Display for SenderV03SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connect(error) => write!(formatter, "WFP/0.3 session connect error: {error}"),
+            Self::Source(error) => write!(formatter, "WFP/0.3 session source error: {error}"),
+            Self::NotARegularFile => {
+                formatter.write_str("WFP/0.3 session source is not a regular file")
+            }
+            Self::InvalidFilename => {
+                formatter.write_str("WFP/0.3 session source filename is not valid UTF-8")
+            }
+            Self::Frame(error) => write!(formatter, "WFP/0.3 session frame error: {error}"),
+            Self::Protocol(error) => write!(formatter, "WFP/0.3 session I/O error: {error}"),
+            Self::Offer(error) => write!(formatter, "WFP/0.3 session OFFER error: {error}"),
+            Self::Negotiation(error) => {
+                write!(formatter, "WFP/0.3 session inventory error: {error}")
+            }
+            Self::Transfer(error) => write!(formatter, "WFP/0.3 session transfer error: {error}"),
+            Self::UnexpectedMessageType(message_type) => write!(
+                formatter,
+                "unexpected WFP/0.3 session message type 0x{:02X}",
+                *message_type as u8
+            ),
+            Self::InvalidHelloAckPayload(length) => write!(
+                formatter,
+                "WFP/0.3 HELLO_ACK payload must contain exactly one version byte, received {length} bytes"
+            ),
+        }
+    }
+}
+
+impl Error for SenderV03SessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Connect(error) => Some(error),
+            Self::Source(error) => Some(error),
+            Self::Frame(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::Offer(error) => Some(error),
+            Self::Negotiation(error) => Some(error),
+            Self::Transfer(error) => Some(error),
+            Self::NotARegularFile
+            | Self::InvalidFilename
+            | Self::UnexpectedMessageType(_)
+            | Self::InvalidHelloAckPayload(_) => None,
+        }
+    }
+}
+
+impl From<FrameError> for SenderV03SessionError {
+    fn from(error: FrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<ProtocolIoError> for SenderV03SessionError {
+    fn from(error: ProtocolIoError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<OfferV03Error> for SenderV03SessionError {
+    fn from(error: OfferV03Error) -> Self {
+        Self::Offer(error)
+    }
+}
+
+impl From<SenderV03NegotiationError> for SenderV03SessionError {
+    fn from(error: SenderV03NegotiationError) -> Self {
+        Self::Negotiation(error)
+    }
+}
+
+impl From<SenderV03TransferError> for SenderV03SessionError {
+    fn from(error: SenderV03TransferError) -> Self {
+        Self::Transfer(error)
+    }
+}
+
+impl SenderV03SessionError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Connect(error) => v03_is_retryable_network_kind(error.kind()),
+            Self::Protocol(error) => v03_is_retryable_protocol(error),
+            Self::Negotiation(error) => error.is_retryable(),
+            Self::Transfer(error) => error.is_retryable(),
+            Self::Source(_)
+            | Self::NotARegularFile
+            | Self::InvalidFilename
+            | Self::Frame(_)
+            | Self::Offer(_)
+            | Self::UnexpectedMessageType(_)
+            | Self::InvalidHelloAckPayload(_) => false,
+        }
+    }
+}
+
+pub async fn send_session_v03(
+    path: &Path,
+    address: &str,
+    transfer_id: TransferId,
+    chunk_size: NonZeroU64,
+) -> Result<(), SenderV03SessionError> {
+    let stream = TcpStream::connect(address)
+        .await
+        .map_err(SenderV03SessionError::Connect)?;
+
+    send_session_v03_with_stream(path, stream, transfer_id, chunk_size).await
+}
+
+async fn send_session_v03_with_stream<S>(
+    path: &Path,
+    mut stream: S,
+    transfer_id: TransferId,
+    chunk_size: NonZeroU64,
+) -> Result<(), SenderV03SessionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(SenderV03SessionError::Source)?;
+    if !metadata.is_file() {
+        return Err(SenderV03SessionError::NotARegularFile);
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SenderV03SessionError::InvalidFilename)?
+        .to_string();
+    let file_size = metadata.len();
+
+    let hello = Frame::new_for_version(WFP_VERSION_V03, MessageType::Hello, vec![WFP_VERSION_V03])?;
+    write_frame(&mut stream, &hello).await?;
+
+    let hello_ack = read_frame_for_version(&mut stream, WFP_VERSION_V03).await?;
+    if hello_ack.message_type != MessageType::HelloAck {
+        return Err(SenderV03SessionError::UnexpectedMessageType(
+            hello_ack.message_type,
+        ));
+    }
+    if hello_ack.payload != vec![WFP_VERSION_V03] {
+        return Err(SenderV03SessionError::InvalidHelloAckPayload(
+            hello_ack.payload.len(),
+        ));
+    }
+
+    let offer = FileOfferV03 {
+        transfer_id,
+        filename,
+        file_size,
+        chunk_size: chunk_size.get(),
+    };
+    let offer_payload = encode_offer_v03(&offer)?;
+    let offer_frame = Frame::new_for_version(WFP_VERSION_V03, MessageType::Offer, offer_payload)?;
+    write_frame(&mut stream, &offer_frame).await?;
+
+    let layout = ChunkLayout::new(file_size, chunk_size.get()).expect("chunk size is non-zero");
+    let inventory = receive_inventory_and_accept(&mut stream, layout).await?;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(SenderV03SessionError::Source)?;
+    let mut scanner = SourceScannerV03::new(file, inventory);
+    send_source_chunks_complete_and_verify_v03(&mut stream, &mut scanner).await?;
+
+    Ok(())
+}
+
+pub async fn run_sender_v03(path: &Path, address: &str) -> Result<(), Box<dyn Error>> {
+    println!("WarpFile Sender (WFP/0.3)");
+
+    let transfer_id = TransferId::generate().map_err(|error| {
+        io::Error::other(format!("failed to generate transfer identity: {error}"))
+    })?;
+
+    println!("Transfer ID: {transfer_id}");
+
+    for attempt in 1..=V03_MAX_SEND_ATTEMPTS {
+        let result = send_session_v03(
+            path,
+            address,
+            transfer_id,
+            NonZeroU64::new(V03_DEFAULT_CHUNK_SIZE).expect("chunk size is non-zero"),
+        )
+        .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_retryable() && attempt < V03_MAX_SEND_ATTEMPTS => {
+                println!();
+                println!(
+                    "WFP/0.3 transfer attempt {attempt} failed with a recoverable network error: {error}"
+                );
+                println!("Retrying in {} second(s)...", V03_RETRY_DELAY.as_secs());
+                tokio::time::sleep(V03_RETRY_DELAY).await;
+            }
+            Err(error) if error.is_retryable() => {
+                println!();
+                println!(
+                    "WFP/0.3 transfer failed after {attempt} attempts due to a recoverable network error"
+                );
+                return Err(Box::new(error));
+            }
+            Err(error) => return Err(Box::new(error)),
+        }
+    }
+
+    unreachable!("the WFP/0.3 send loop always returns an outcome")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,8 +942,8 @@ mod tests {
     use crate::protocol::frame::{ACTIVE_WFP_VERSION, WFP_VERSION_V02};
     use crate::protocol::{
         ChunkHashesBatch, DecodeError, ResumeRequestV03, V03_MAX_DATA_BYTES,
-        decode_chunk_start_v03, decode_data_v03, decode_frame_for_version, encode_chunk_hashes,
-        encode_resume_v03,
+        decode_chunk_start_v03, decode_data_v03, decode_frame_for_version, decode_offer_v03,
+        encode_chunk_hashes, encode_resume_v03,
     };
 
     fn layout() -> ChunkLayout {
@@ -1683,6 +2014,576 @@ mod tests {
                 if error.kind() == io::ErrorKind::BrokenPipe
         ));
         assert!(writer.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sender_reads_empty_verified_after_complete() {
+        let data = b"abcdefghijkl".to_vec();
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let records = manifest_records(&data, layout, &[0, 1, 2]);
+        let mut scanner =
+            SourceScannerV03::new(Cursor::new(data.clone()), inventory(layout, records));
+        let (mut sender, mut peer) = duplex(4096);
+
+        let peer_task = async {
+            let complete = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            complete
+        };
+
+        let (result, complete) = tokio::join!(
+            send_source_chunks_complete_and_verify_v03(&mut sender, &mut scanner),
+            peer_task
+        );
+
+        let summary = result.unwrap();
+        assert_eq!(complete.version, WFP_VERSION_V03);
+        assert_eq!(complete.message_type, MessageType::Complete);
+        assert_eq!(complete.payload, summary.file_hash().as_bytes());
+        sender.shutdown().await.unwrap();
+        let mut remaining = Vec::new();
+        peer.read_to_end(&mut remaining).await.unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_non_empty_verified() {
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(Vec::new()),
+            inventory(ChunkLayout::new(0, 4).unwrap(), Vec::new()),
+        );
+        let (mut sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let complete = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(complete.message_type, MessageType::Complete);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, vec![0xA5])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_source_chunks_complete_and_verify_v03(&mut sender, &mut scanner),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03TransferError::InvalidVerifiedPayload(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_unexpected_message_after_complete() {
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(Vec::new()),
+            inventory(ChunkLayout::new(0, 4).unwrap(), Vec::new()),
+        );
+        let (mut sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let complete = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(complete.message_type, MessageType::Complete);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Data, Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_source_chunks_complete_and_verify_v03(&mut sender, &mut scanner),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03TransferError::UnexpectedMessageType(
+                MessageType::Data
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_eof_before_verified() {
+        let mut scanner = SourceScannerV03::new(
+            Cursor::new(Vec::new()),
+            inventory(ChunkLayout::new(0, 4).unwrap(), Vec::new()),
+        );
+        let (mut sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let complete = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(complete.message_type, MessageType::Complete);
+            drop(peer);
+        };
+
+        let (result, ()) = tokio::join!(
+            send_source_chunks_complete_and_verify_v03(&mut sender, &mut scanner),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03TransferError::Protocol(ProtocolIoError::Io(error)))
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_sends_hello_and_offer_and_completes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archive.bin");
+        std::fs::write(&path, b"abcdefghijkl").unwrap();
+        let transfer_id = TransferId::from_bytes([0xA5; 16]);
+        let (sender, mut peer) = duplex(64 * 1024);
+
+        let peer_task = async {
+            let hello = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello.version, WFP_VERSION_V03);
+            assert_eq!(hello.message_type, MessageType::Hello);
+            assert_eq!(hello.payload, vec![WFP_VERSION_V03]);
+
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(
+                    WFP_VERSION_V03,
+                    MessageType::HelloAck,
+                    vec![WFP_VERSION_V03],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let offer_frame = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(offer_frame.message_type, MessageType::Offer);
+            let offer = decode_offer_v03(&offer_frame.payload).unwrap();
+            assert_eq!(offer.transfer_id, transfer_id);
+            assert_eq!(offer.filename, "archive.bin");
+            assert_eq!(offer.file_size, 12);
+            assert_eq!(offer.chunk_size, 4);
+
+            write_frame(&mut peer, &resume(0)).await.unwrap();
+
+            let accept = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(accept.message_type, MessageType::Accept);
+            assert!(accept.payload.is_empty());
+
+            for chunk_bytes in [&b"abcd"[..], &b"efgh"[..], &b"ijkl"[..]] {
+                let start = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                    .await
+                    .unwrap();
+                assert_eq!(start.message_type, MessageType::ChunkStart);
+                assert_eq!(
+                    decode_chunk_start_v03(&start.payload)
+                        .unwrap()
+                        .expected_hash,
+                    chunk_hash(chunk_bytes)
+                );
+                let data = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                    .await
+                    .unwrap();
+                assert_eq!(data.message_type, MessageType::Data);
+                assert_eq!(decode_data_v03(&data.payload).unwrap().data, chunk_bytes);
+            }
+
+            let complete = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(complete.message_type, MessageType::Complete);
+            assert_eq!(
+                complete.payload,
+                blake3::hash(b"abcdefghijkl").as_bytes().to_vec()
+            );
+
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_session_v03_with_stream(&path, sender, transfer_id, NonZeroU64::new(4).unwrap(),),
+            peer_task
+        );
+
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_rejects_unexpected_hello_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archive.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let (sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let hello = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello.message_type, MessageType::Hello);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Offer, Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_session_v03_with_stream(
+                &path,
+                sender,
+                TransferId::from_bytes([0; 16]),
+                NonZeroU64::new(4).unwrap(),
+            ),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03SessionError::UnexpectedMessageType(
+                MessageType::Offer
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_rejects_invalid_hello_ack_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archive.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let (sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let hello = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello.message_type, MessageType::Hello);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::HelloAck, vec![0xA5])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_session_v03_with_stream(
+                &path,
+                sender,
+                TransferId::from_bytes([0; 16]),
+                NonZeroU64::new(4).unwrap(),
+            ),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03SessionError::InvalidHelloAckPayload(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_propagates_inventory_negotiation_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archive.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let (sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let hello = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello.message_type, MessageType::Hello);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(
+                    WFP_VERSION_V03,
+                    MessageType::HelloAck,
+                    vec![WFP_VERSION_V03],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let offer_frame = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(offer_frame.message_type, MessageType::Offer);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Accept, vec![0xA5]).unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_session_v03_with_stream(
+                &path,
+                sender,
+                TransferId::from_bytes([0; 16]),
+                NonZeroU64::new(4).unwrap(),
+            ),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03SessionError::Negotiation(
+                SenderV03NegotiationError::UnexpectedMessageType(MessageType::Accept)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_propagates_transfer_error_after_handshake() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("empty.bin");
+        std::fs::write(&path, b"").unwrap();
+        let (sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let hello = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello.message_type, MessageType::Hello);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(
+                    WFP_VERSION_V03,
+                    MessageType::HelloAck,
+                    vec![WFP_VERSION_V03],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let offer_frame = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(offer_frame.message_type, MessageType::Offer);
+            write_frame(&mut peer, &resume(0)).await.unwrap();
+
+            let accept = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(accept.message_type, MessageType::Accept);
+
+            let complete = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(complete.message_type, MessageType::Complete);
+            assert_eq!(complete.payload, blake3::hash(b"").as_bytes().to_vec());
+
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, vec![0xA5])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_session_v03_with_stream(
+                &path,
+                sender,
+                TransferId::from_bytes([0; 16]),
+                NonZeroU64::new(4).unwrap(),
+            ),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03SessionError::Transfer(
+                SenderV03TransferError::InvalidVerifiedPayload(1)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_propagates_connect_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archive.bin");
+        std::fs::write(&path, b"x").unwrap();
+
+        let result = send_session_v03(
+            &path,
+            &address.to_string(),
+            TransferId::from_bytes([0; 16]),
+            NonZeroU64::new(4).unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SenderV03SessionError::Connect(error))
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_rejects_missing_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing.bin");
+        let (sender, peer) = duplex(1024);
+        drop(peer);
+
+        let result = send_session_v03_with_stream(
+            &path,
+            sender,
+            TransferId::from_bytes([0; 16]),
+            NonZeroU64::new(4).unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SenderV03SessionError::Source(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn v03_classifies_connect_network_errors_as_retryable() {
+        let kinds = [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WriteZero,
+        ];
+
+        for kind in kinds {
+            let error = SenderV03SessionError::Connect(io::Error::from(kind));
+            assert!(error.is_retryable(), "{kind:?} should be retryable");
+        }
+    }
+
+    #[test]
+    fn v03_classifies_non_network_connect_errors_as_permanent() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+        ] {
+            let error = SenderV03SessionError::Connect(io::Error::from(kind));
+            assert!(!error.is_retryable(), "{kind:?} should be permanent");
+        }
+    }
+
+    #[test]
+    fn v03_classifies_protocol_io_retryable() {
+        let retryable = SenderV03SessionError::Protocol(ProtocolIoError::Io(io::Error::from(
+            io::ErrorKind::ConnectionReset,
+        )));
+        assert!(retryable.is_retryable());
+
+        let permanent_io = SenderV03SessionError::Protocol(ProtocolIoError::Io(io::Error::from(
+            io::ErrorKind::PermissionDenied,
+        )));
+        assert!(!permanent_io.is_retryable());
+
+        let decode = SenderV03SessionError::Protocol(ProtocolIoError::Decode(
+            DecodeError::UnknownMessageType(0x7E),
+        ));
+        assert!(!decode.is_retryable());
+    }
+
+    #[test]
+    fn v03_classifies_source_and_frame_errors_as_permanent() {
+        let errors = [
+            SenderV03SessionError::Source(io::Error::from(io::ErrorKind::NotFound)),
+            SenderV03SessionError::NotARegularFile,
+            SenderV03SessionError::InvalidFilename,
+            SenderV03SessionError::Frame(FrameError::UnsupportedVersion(0x04)),
+            SenderV03SessionError::Offer(OfferV03Error::InvalidPayloadLength),
+            SenderV03SessionError::UnexpectedMessageType(MessageType::Offer),
+            SenderV03SessionError::InvalidHelloAckPayload(2),
+        ];
+
+        for error in errors {
+            assert!(!error.is_retryable(), "{error:?} should be permanent");
+        }
+    }
+
+    #[test]
+    fn v03_classifies_nested_negotiation_and_transfer_errors() {
+        let negotiation_retryable =
+            SenderV03SessionError::Negotiation(SenderV03NegotiationError::Protocol(
+                ProtocolIoError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
+            ));
+        assert!(negotiation_retryable.is_retryable());
+
+        let negotiation_permanent_io =
+            SenderV03SessionError::Negotiation(SenderV03NegotiationError::Protocol(
+                ProtocolIoError::Io(io::Error::from(io::ErrorKind::PermissionDenied)),
+            ));
+        assert!(!negotiation_permanent_io.is_retryable());
+
+        let negotiation_structural = SenderV03SessionError::Negotiation(
+            SenderV03NegotiationError::UnexpectedMessageType(MessageType::Accept),
+        );
+        assert!(!negotiation_structural.is_retryable());
+
+        let transfer_retryable = SenderV03SessionError::Transfer(SenderV03TransferError::Protocol(
+            ProtocolIoError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
+        ));
+        assert!(transfer_retryable.is_retryable());
+
+        let transfer_permanent_io =
+            SenderV03SessionError::Transfer(SenderV03TransferError::Protocol(ProtocolIoError::Io(
+                io::Error::from(io::ErrorKind::PermissionDenied),
+            )));
+        assert!(!transfer_permanent_io.is_retryable());
+
+        let transfer_structural =
+            SenderV03SessionError::Transfer(SenderV03TransferError::DataOffsetOverflow);
+        assert!(!transfer_structural.is_retryable());
     }
 
     #[test]

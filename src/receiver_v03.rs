@@ -2,21 +2,30 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use tokio::fs::{self, OpenOptions};
-use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use crate::chunk::{ChunkLayout, ChunkLayoutError, ChunkRange};
 use crate::chunk_manifest::ChunkHash;
-use crate::chunk_state::{ChunkState, ChunkStateError, prepare_chunk_inventory, write_chunk_state};
+use crate::chunk_state::{
+    ChunkState, ChunkStateError, prepare_chunk_inventory, remove_chunk_state, write_chunk_state,
+};
+use crate::completion_receipt::{
+    CompletionReceipt, CompletionReceiptError, completion_receipt_path, read_completion_receipt,
+    write_completion_receipt,
+};
 use crate::protocol::frame::{FrameError, MAX_PAYLOAD_LENGTH, WFP_VERSION_V03};
 use crate::protocol::{
     CHUNK_HASH_RECORD_LENGTH, ChunkHashRecord, ChunkHashesBatch, ChunkHashesError, ChunkStartV03,
-    ChunkStartV03Error, DataV03, DataV03Error, FileOfferV03, Frame, MessageType, ProtocolIoError,
-    ResumeRequestV03, decode_chunk_start_v03, decode_data_v03, encode_chunk_hashes,
-    encode_resume_v03, read_frame_for_version, write_frame,
+    ChunkStartV03Error, DataV03, DataV03Error, FileOfferV03, Frame, MessageType, OfferV03Error,
+    ProtocolIoError, ResumeRequestV03, TransferId, decode_chunk_start_v03, decode_data_v03,
+    decode_offer_v03, encode_chunk_hashes, encode_resume_v03, read_frame_for_version, write_frame,
 };
+
+const FINAL_VERIFICATION_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedChunk {
@@ -199,29 +208,477 @@ pub async fn prepare_v03_partial_file(
     Ok(file)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferIdentity {
+    pub transfer_id: TransferId,
+    pub filename: String,
+}
+
 pub struct PreparedReceiverV03 {
     partial_path: PathBuf,
     file: fs::File,
     receiver: ChunkReceiverV03,
     resume: ResumeRequestV03,
     chunk_hash_batches: Vec<ChunkHashesBatch>,
+    identity: TransferIdentity,
 }
 
 pub struct AcceptedReceiverV03 {
     partial_path: PathBuf,
     file: fs::File,
     receiver: ChunkReceiverV03,
+    identity: TransferIdentity,
 }
 
-#[allow(
-    dead_code,
-    reason = "the next WFP/0.3 final-verification phase will consume this state"
-)]
 pub struct ReceivedCompleteV03 {
     file: fs::File,
     partial_path: PathBuf,
     receiver: ChunkReceiverV03,
     sender_file_hash: ChunkHash,
+    identity: TransferIdentity,
+}
+
+impl ReceivedCompleteV03 {
+    pub async fn verify_complete_file(mut self) -> Result<(), ReceiverV03VerificationError> {
+        let expected_size = self.receiver.chunk_state.layout().file_size();
+
+        self.file.seek(io::SeekFrom::Start(0)).await?;
+
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0u8; FINAL_VERIFICATION_BUFFER_SIZE];
+        let mut bytes_read_total = 0u64;
+
+        loop {
+            let bytes_read = self.file.read(&mut buffer).await?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..bytes_read]);
+            bytes_read_total += u64::try_from(bytes_read)
+                .expect("read length must fit into u64 on supported targets");
+        }
+
+        if bytes_read_total != expected_size {
+            return Err(ReceiverV03VerificationError::FileSizeMismatch {
+                expected: expected_size,
+                actual: bytes_read_total,
+            });
+        }
+
+        let actual_hash = ChunkHash::from_bytes(*hasher.finalize().as_bytes());
+
+        if actual_hash != self.sender_file_hash {
+            return Err(ReceiverV03VerificationError::FileHashMismatch);
+        }
+
+        Ok(())
+    }
+
+    pub async fn finalize(
+        self,
+        receipt_destination: Option<&Path>,
+    ) -> Result<PathBuf, ReceiverV03FinalizeError> {
+        let partial_path = self.partial_path.clone();
+        let final_path = final_path_for_partial(&partial_path)?;
+        let file_size = self.receiver.chunk_state.layout().file_size();
+        let sender_file_hash = self.sender_file_hash;
+        let identity = self.identity.clone();
+
+        self.verify_complete_file().await?;
+
+        if let Some(destination) = receipt_destination {
+            let receipt = CompletionReceipt {
+                transfer_id: identity.transfer_id,
+                filename: identity.filename,
+                file_size,
+                blake3: sender_file_hash.into_bytes(),
+            };
+            write_completion_receipt(destination, &receipt).await?;
+        }
+
+        fs::rename(&partial_path, &final_path).await?;
+
+        /*
+         * Cleanup is best-effort: `.warpchunks` is advisory state whose
+         * name still refers to the now-renamed partial. A failure here
+         * does not invalidate the committed destination, so it is not
+         * fatal.
+         */
+        let _ = remove_chunk_state(&partial_path).await;
+
+        Ok(final_path)
+    }
+
+    pub async fn complete<S>(
+        self,
+        stream: &mut S,
+        receipt_destination: Option<&Path>,
+    ) -> Result<PathBuf, ReceiverV03CompleteError>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let final_path = self.finalize(receipt_destination).await?;
+        let frame = Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, Vec::new())?;
+        write_frame(stream, &frame).await?;
+
+        Ok(final_path)
+    }
+}
+
+fn final_path_for_partial(partial: &Path) -> Result<PathBuf, ReceiverV03FinalizeError> {
+    let file_name = partial
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ReceiverV03FinalizeError::InvalidPartialPath(partial.to_path_buf()))?;
+    let stripped = file_name
+        .strip_suffix(".part")
+        .filter(|stripped| !stripped.is_empty())
+        .ok_or_else(|| ReceiverV03FinalizeError::InvalidPartialPath(partial.to_path_buf()))?;
+
+    Ok(partial.with_file_name(stripped))
+}
+
+#[derive(Debug)]
+pub enum ReceiverV03VerificationError {
+    Io(io::Error),
+    FileSizeMismatch { expected: u64, actual: u64 },
+    FileHashMismatch,
+}
+
+impl fmt::Display for ReceiverV03VerificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => {
+                write!(formatter, "WFP/0.3 final verification I/O error: {error}")
+            }
+            Self::FileSizeMismatch { expected, actual } => write!(
+                formatter,
+                "WFP/0.3 final verification read {actual} bytes, expected {expected}"
+            ),
+            Self::FileHashMismatch => formatter
+                .write_str("WFP/0.3 final verification failed: file hash does not match COMPLETE"),
+        }
+    }
+}
+
+impl Error for ReceiverV03VerificationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::FileSizeMismatch { .. } | Self::FileHashMismatch => None,
+        }
+    }
+}
+
+impl From<io::Error> for ReceiverV03VerificationError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug)]
+pub enum ReceiverV03FinalizeError {
+    Verification(ReceiverV03VerificationError),
+    InvalidPartialPath(PathBuf),
+    Receipt(CompletionReceiptError),
+    Io(io::Error),
+}
+
+impl fmt::Display for ReceiverV03FinalizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verification(error) => {
+                write!(formatter, "WFP/0.3 finalize verification error: {error}")
+            }
+            Self::InvalidPartialPath(path) => write!(
+                formatter,
+                "WFP/0.3 finalize requires a `.part` partial path, got {}",
+                path.display()
+            ),
+            Self::Receipt(error) => write!(formatter, "WFP/0.3 finalize receipt error: {error}"),
+            Self::Io(error) => write!(formatter, "WFP/0.3 finalize I/O error: {error}"),
+        }
+    }
+}
+
+impl Error for ReceiverV03FinalizeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Verification(error) => Some(error),
+            Self::Receipt(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::InvalidPartialPath(_) => None,
+        }
+    }
+}
+
+impl From<ReceiverV03VerificationError> for ReceiverV03FinalizeError {
+    fn from(error: ReceiverV03VerificationError) -> Self {
+        Self::Verification(error)
+    }
+}
+
+impl From<io::Error> for ReceiverV03FinalizeError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<CompletionReceiptError> for ReceiverV03FinalizeError {
+    fn from(error: CompletionReceiptError) -> Self {
+        Self::Receipt(error)
+    }
+}
+
+#[derive(Debug)]
+pub enum ReceiverV03CompleteError {
+    Finalize(ReceiverV03FinalizeError),
+    Frame(FrameError),
+    Protocol(ProtocolIoError),
+}
+
+impl fmt::Display for ReceiverV03CompleteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Finalize(error) => write!(formatter, "WFP/0.3 finalize error: {error}"),
+            Self::Frame(error) => write!(formatter, "WFP/0.3 VERIFIED frame error: {error}"),
+            Self::Protocol(error) => write!(formatter, "WFP/0.3 VERIFIED I/O error: {error}"),
+        }
+    }
+}
+
+impl Error for ReceiverV03CompleteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Finalize(error) => Some(error),
+            Self::Frame(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+        }
+    }
+}
+
+impl From<ReceiverV03FinalizeError> for ReceiverV03CompleteError {
+    fn from(error: ReceiverV03FinalizeError) -> Self {
+        Self::Finalize(error)
+    }
+}
+
+impl From<FrameError> for ReceiverV03CompleteError {
+    fn from(error: FrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<ProtocolIoError> for ReceiverV03CompleteError {
+    fn from(error: ProtocolIoError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverV03ReconcileOutcome {
+    Reconciled(PathBuf),
+    NotReconciled,
+}
+
+#[derive(Debug)]
+pub enum ReceiverV03ReconcileError {
+    Io(io::Error),
+    Protocol(ProtocolIoError),
+    Frame(FrameError),
+    Receipt(CompletionReceiptError),
+    InvalidFilename,
+    ConflictingReceipt,
+}
+
+impl fmt::Display for ReceiverV03ReconcileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "WFP/0.3 reconciliation I/O error: {error}"),
+            Self::Protocol(error) => {
+                write!(
+                    formatter,
+                    "WFP/0.3 reconciliation VERIFIED I/O error: {error}"
+                )
+            }
+            Self::Frame(error) => {
+                write!(
+                    formatter,
+                    "WFP/0.3 reconciliation VERIFIED frame error: {error}"
+                )
+            }
+            Self::Receipt(error) => {
+                write!(formatter, "WFP/0.3 reconciliation receipt error: {error}")
+            }
+            Self::InvalidFilename => {
+                formatter.write_str("WFP/0.3 reconciliation rejected an unsafe filename")
+            }
+            Self::ConflictingReceipt => {
+                formatter.write_str("WFP/0.3 reconciliation found a conflicting completion receipt")
+            }
+        }
+    }
+}
+
+impl Error for ReceiverV03ReconcileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::Frame(error) => Some(error),
+            Self::Receipt(error) => Some(error),
+            Self::InvalidFilename | Self::ConflictingReceipt => None,
+        }
+    }
+}
+
+impl From<io::Error> for ReceiverV03ReconcileError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ProtocolIoError> for ReceiverV03ReconcileError {
+    fn from(error: ProtocolIoError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<FrameError> for ReceiverV03ReconcileError {
+    fn from(error: FrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<CompletionReceiptError> for ReceiverV03ReconcileError {
+    fn from(error: CompletionReceiptError) -> Self {
+        Self::Receipt(error)
+    }
+}
+
+pub async fn reconcile_completed_transfer_v03<S>(
+    stream: &mut S,
+    destination_directory: &Path,
+    offer: &FileOfferV03,
+) -> Result<ReceiverV03ReconcileOutcome, ReceiverV03ReconcileError>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !is_safe_filename_v03(&offer.filename) {
+        return Err(ReceiverV03ReconcileError::InvalidFilename);
+    }
+
+    let receipt_path = completion_receipt_path(destination_directory, offer.transfer_id);
+
+    if !fs::try_exists(&receipt_path).await? {
+        return Ok(ReceiverV03ReconcileOutcome::NotReconciled);
+    }
+
+    let receipt = read_completion_receipt(destination_directory, offer.transfer_id).await?;
+
+    if receipt.filename != offer.filename || receipt.file_size != offer.file_size {
+        return Err(ReceiverV03ReconcileError::ConflictingReceipt);
+    }
+
+    let destination = destination_directory.join(&offer.filename);
+    let partial_destination = destination_directory.join(format!("{}.part", offer.filename));
+
+    if fs::try_exists(&destination).await? {
+        if let Err(error) =
+            verify_physical_file_v03(&destination, receipt.file_size, &receipt.blake3).await
+        {
+            eprintln!(
+                "Warning: completed destination does not match the completion receipt: {error}"
+            );
+
+            return Ok(ReceiverV03ReconcileOutcome::NotReconciled);
+        }
+
+        send_verified_v03(stream).await?;
+
+        return Ok(ReceiverV03ReconcileOutcome::Reconciled(destination));
+    }
+
+    if fs::try_exists(&partial_destination).await? {
+        if let Err(_error) =
+            verify_physical_file_v03(&partial_destination, receipt.file_size, &receipt.blake3).await
+        {
+            return Ok(ReceiverV03ReconcileOutcome::NotReconciled);
+        }
+
+        fs::rename(&partial_destination, &destination).await?;
+
+        let _ = remove_chunk_state(&partial_destination).await;
+
+        send_verified_v03(stream).await?;
+
+        return Ok(ReceiverV03ReconcileOutcome::Reconciled(destination));
+    }
+
+    Ok(ReceiverV03ReconcileOutcome::NotReconciled)
+}
+
+async fn send_verified_v03<S>(stream: &mut S) -> Result<(), ReceiverV03ReconcileError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let frame = Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, Vec::new())?;
+
+    write_frame(stream, &frame).await?;
+
+    Ok(())
+}
+
+async fn verify_physical_file_v03(
+    path: &Path,
+    expected_size: u64,
+    expected_hash: &[u8; 32],
+) -> Result<(), ReceiverV03VerificationError> {
+    let mut file = fs::File::open(path).await?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; FINAL_VERIFICATION_BUFFER_SIZE];
+    let mut bytes_read_total = 0u64;
+
+    loop {
+        let bytes_read = file.read(&mut buffer).await?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+        bytes_read_total +=
+            u64::try_from(bytes_read).expect("read length must fit into u64 on supported targets");
+    }
+
+    if bytes_read_total != expected_size {
+        return Err(ReceiverV03VerificationError::FileSizeMismatch {
+            expected: expected_size,
+            actual: bytes_read_total,
+        });
+    }
+
+    if hasher.finalize().as_bytes() != expected_hash {
+        return Err(ReceiverV03VerificationError::FileHashMismatch);
+    }
+
+    Ok(())
+}
+
+fn is_safe_filename_v03(filename: &str) -> bool {
+    if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
+        return false;
+    }
+
+    let mut components = Path::new(filename).components();
+
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    )
 }
 
 #[derive(Debug)]
@@ -418,6 +875,7 @@ impl PreparedReceiverV03 {
             partial_path: self.partial_path,
             file: self.file,
             receiver: self.receiver,
+            identity: self.identity,
         })
     }
 }
@@ -485,6 +943,7 @@ impl AcceptedReceiverV03 {
                         partial_path: self.partial_path,
                         receiver: self.receiver,
                         sender_file_hash: ChunkHash::from_bytes(hash),
+                        identity: self.identity,
                     });
                 }
                 message_type => {
@@ -516,6 +975,10 @@ pub async fn prepare_receiver_v03(
         receiver,
         resume: ResumeRequestV03 { chunk_record_count },
         chunk_hash_batches,
+        identity: TransferIdentity {
+            transfer_id: offer.transfer_id,
+            filename: offer.filename.clone(),
+        },
     })
 }
 
@@ -700,6 +1163,233 @@ impl ChunkReceiverV03 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverV03SessionOutcome {
+    Reconciled(PathBuf),
+    Completed(PathBuf),
+}
+
+#[derive(Debug)]
+pub enum ReceiverV03SessionError {
+    Io(io::Error),
+    Frame(FrameError),
+    Protocol(ProtocolIoError),
+    Offer(OfferV03Error),
+    UnexpectedMessageType(MessageType),
+    InvalidHelloPayload(usize),
+    Reconcile(ReceiverV03ReconcileError),
+    Preparation(ReceiverV03PreparationError),
+    Negotiation(ReceiverV03NegotiationError),
+    Transfer(ReceiverV03TransferError),
+    Complete(ReceiverV03CompleteError),
+}
+
+impl fmt::Display for ReceiverV03SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "WFP/0.3 session I/O error: {error}"),
+            Self::Frame(error) => write!(formatter, "WFP/0.3 session frame error: {error}"),
+            Self::Protocol(error) => {
+                write!(formatter, "WFP/0.3 session protocol I/O error: {error}")
+            }
+            Self::Offer(error) => write!(formatter, "WFP/0.3 session OFFER error: {error}"),
+            Self::UnexpectedMessageType(message_type) => write!(
+                formatter,
+                "unexpected WFP/0.3 session message type 0x{:02X}",
+                *message_type as u8
+            ),
+            Self::InvalidHelloPayload(length) => write!(
+                formatter,
+                "WFP/0.3 HELLO payload must contain exactly 1 byte, received {length}"
+            ),
+            Self::Reconcile(error) => {
+                write!(formatter, "WFP/0.3 session reconciliation error: {error}")
+            }
+            Self::Preparation(error) => {
+                write!(formatter, "WFP/0.3 session preparation error: {error}")
+            }
+            Self::Negotiation(error) => {
+                write!(formatter, "WFP/0.3 session negotiation error: {error}")
+            }
+            Self::Transfer(error) => write!(formatter, "WFP/0.3 session transfer error: {error}"),
+            Self::Complete(error) => write!(formatter, "WFP/0.3 session completion error: {error}"),
+        }
+    }
+}
+
+impl Error for ReceiverV03SessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Frame(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::Offer(error) => Some(error),
+            Self::Reconcile(error) => Some(error),
+            Self::Preparation(error) => Some(error),
+            Self::Negotiation(error) => Some(error),
+            Self::Transfer(error) => Some(error),
+            Self::Complete(error) => Some(error),
+            Self::UnexpectedMessageType(_) | Self::InvalidHelloPayload(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for ReceiverV03SessionError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<FrameError> for ReceiverV03SessionError {
+    fn from(error: FrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<ProtocolIoError> for ReceiverV03SessionError {
+    fn from(error: ProtocolIoError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<OfferV03Error> for ReceiverV03SessionError {
+    fn from(error: OfferV03Error) -> Self {
+        Self::Offer(error)
+    }
+}
+
+impl From<ReceiverV03ReconcileError> for ReceiverV03SessionError {
+    fn from(error: ReceiverV03ReconcileError) -> Self {
+        Self::Reconcile(error)
+    }
+}
+
+impl From<ReceiverV03PreparationError> for ReceiverV03SessionError {
+    fn from(error: ReceiverV03PreparationError) -> Self {
+        Self::Preparation(error)
+    }
+}
+
+impl From<ReceiverV03NegotiationError> for ReceiverV03SessionError {
+    fn from(error: ReceiverV03NegotiationError) -> Self {
+        Self::Negotiation(error)
+    }
+}
+
+impl From<ReceiverV03TransferError> for ReceiverV03SessionError {
+    fn from(error: ReceiverV03TransferError) -> Self {
+        Self::Transfer(error)
+    }
+}
+
+impl From<ReceiverV03CompleteError> for ReceiverV03SessionError {
+    fn from(error: ReceiverV03CompleteError) -> Self {
+        Self::Complete(error)
+    }
+}
+
+pub async fn receive_session_v03<S>(
+    stream: &mut S,
+    destination_directory: &Path,
+) -> Result<ReceiverV03SessionOutcome, ReceiverV03SessionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fs::create_dir_all(destination_directory).await?;
+
+    let hello = read_frame_for_version(stream, WFP_VERSION_V03).await?;
+
+    if hello.message_type != MessageType::Hello {
+        return Err(ReceiverV03SessionError::UnexpectedMessageType(
+            hello.message_type,
+        ));
+    }
+
+    if hello.payload != vec![WFP_VERSION_V03] {
+        return Err(ReceiverV03SessionError::InvalidHelloPayload(
+            hello.payload.len(),
+        ));
+    }
+
+    println!("Received HELLO (WFP/0.3)");
+
+    let hello_ack = Frame::new_for_version(
+        WFP_VERSION_V03,
+        MessageType::HelloAck,
+        vec![WFP_VERSION_V03],
+    )?;
+
+    write_frame(stream, &hello_ack).await?;
+
+    println!("Sent HELLO_ACK (WFP/0.3)");
+
+    let offer_frame = read_frame_for_version(stream, WFP_VERSION_V03).await?;
+
+    if offer_frame.message_type != MessageType::Offer {
+        return Err(ReceiverV03SessionError::UnexpectedMessageType(
+            offer_frame.message_type,
+        ));
+    }
+
+    let offer = decode_offer_v03(&offer_frame.payload)?;
+
+    println!();
+    println!("Incoming file:");
+    println!("Transfer ID: {}", offer.transfer_id);
+    println!("Name: {}", offer.filename);
+    println!("Size: {} bytes", offer.file_size);
+    println!();
+
+    match reconcile_completed_transfer_v03(stream, destination_directory, &offer).await? {
+        ReceiverV03ReconcileOutcome::Reconciled(path) => {
+            println!("Saved to {}", path.display());
+
+            return Ok(ReceiverV03SessionOutcome::Reconciled(path));
+        }
+
+        ReceiverV03ReconcileOutcome::NotReconciled => {}
+    }
+
+    let partial_destination = destination_directory.join(format!("{}.part", offer.filename));
+
+    let prepared = prepare_receiver_v03(&partial_destination, &offer).await?;
+
+    let accepted = prepared.negotiate_inventory(stream).await?;
+
+    let received = accepted.receive_transfer(stream).await?;
+
+    let final_path = received
+        .complete(stream, Some(destination_directory))
+        .await?;
+
+    println!("Saved to {}", final_path.display());
+
+    Ok(ReceiverV03SessionOutcome::Completed(final_path))
+}
+
+pub async fn run_receiver_v03(
+    bind_address: &str,
+    destination_directory: &Path,
+) -> Result<(), Box<dyn Error>> {
+    println!("WarpFile Receiver (WFP/0.3)");
+
+    let listener = TcpListener::bind(bind_address).await?;
+
+    let local_addr = listener.local_addr()?;
+
+    println!("Listening on {local_addr}");
+
+    loop {
+        let (mut stream, peer_address) = listener.accept().await?;
+
+        println!("Connection from {peer_address}");
+
+        if let Err(error) = receive_session_v03(&mut stream, destination_directory).await {
+            eprintln!("WFP/0.3 session failed: {error}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,10 +1403,14 @@ mod tests {
     use crate::chunk_state::{
         ChunkStateError, RecordedChunk, chunk_state_path, read_chunk_state, write_chunk_state,
     };
+    use crate::completion_receipt::{
+        CompletionReceipt, CompletionReceiptError, completion_receipt_path,
+        read_completion_receipt, write_completion_receipt,
+    };
     use crate::protocol::frame::{ACTIVE_WFP_VERSION, WFP_VERSION_V02};
     use crate::protocol::{
         DecodeError, decode_chunk_hashes, decode_resume_v03, encode_chunk_start_v03,
-        encode_data_v03, encode_frame,
+        encode_data_v03, encode_frame, encode_offer_v03,
     };
 
     fn hash(data: &[u8]) -> ChunkHash {
@@ -777,6 +1471,7 @@ mod tests {
                 .await
                 .unwrap(),
             receiver: ChunkReceiverV03::new(state),
+            identity: identity(),
         }
     }
 
@@ -786,6 +1481,13 @@ mod tests {
             filename: "archive.bin".to_string(),
             file_size,
             chunk_size,
+        }
+    }
+
+    fn identity() -> TransferIdentity {
+        TransferIdentity {
+            transfer_id: crate::protocol::TransferId::from_bytes([0xA5; 16]),
+            filename: "archive.bin".to_string(),
         }
     }
 
@@ -861,6 +1563,7 @@ mod tests {
             receiver: ChunkReceiverV03::new(state),
             resume: ResumeRequestV03 { chunk_record_count },
             chunk_hash_batches,
+            identity: identity(),
         }
     }
 
@@ -1771,6 +2474,7 @@ mod tests {
             partial_path: partial,
             file,
             receiver,
+            identity: identity(),
         };
         let mut stream = Cursor::new(encoded_frames(&[complete_frame(hash(b"abcd"))]));
         assert!(matches!(
@@ -2190,5 +2894,1155 @@ mod tests {
                 .unwrap(),
             next
         );
+    }
+
+    async fn received_complete(
+        partial: &Path,
+        physical: &[u8],
+        declared_size: u64,
+        chunk_size: u64,
+        sender_hash: ChunkHash,
+    ) -> ReceivedCompleteV03 {
+        fs::write(partial, physical).await.unwrap();
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(partial)
+            .await
+            .unwrap();
+
+        let layout = ChunkLayout::new(declared_size, chunk_size).unwrap();
+        let chunk_state = ChunkState::new(layout, Vec::new()).unwrap();
+
+        ReceivedCompleteV03 {
+            file,
+            partial_path: partial.to_path_buf(),
+            receiver: ChunkReceiverV03::new(chunk_state),
+            sender_file_hash: sender_hash,
+            identity: identity(),
+        }
+    }
+
+    #[tokio::test]
+    async fn final_verification_accepts_intact_physical_bytes() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("intact.part");
+        let contents = b"abcdefghijkl";
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+
+        received.verify_complete_file().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_verification_rejects_a_modified_byte() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("modified.part");
+        let mut physical = b"abcdefghijkl".to_vec();
+        physical[3] ^= 0x01;
+
+        let received = received_complete(&partial, &physical, 12, 4, hash(b"abcdefghijkl")).await;
+
+        let error = received.verify_complete_file().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiverV03VerificationError::FileHashMismatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_verification_rejects_a_truncated_part() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("truncated.part");
+        let received = received_complete(&partial, b"abc", 4, 4, hash(b"abcd")).await;
+
+        let error = received.verify_complete_file().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiverV03VerificationError::FileSizeMismatch {
+                expected: 4,
+                actual: 3,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_verification_accepts_an_empty_file() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("empty.part");
+        let received = received_complete(&partial, b"", 0, 4, hash(b"")).await;
+
+        received.verify_complete_file().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_verification_uses_physical_bytes_not_chunk_state() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("corrupt-snapshot.part");
+        let contents = b"abcd";
+        let layout = ChunkLayout::new(4, 4).unwrap();
+        let corrupt_state = ChunkState::new(
+            layout,
+            vec![RecordedChunk {
+                index: 0,
+                hash: hash(b"wrong"),
+            }],
+        )
+        .unwrap();
+
+        fs::write(&partial, contents).await.unwrap();
+        write_chunk_state(&partial, &corrupt_state).await.unwrap();
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial)
+            .await
+            .unwrap();
+
+        let received = ReceivedCompleteV03 {
+            file,
+            partial_path: partial.to_path_buf(),
+            receiver: ChunkReceiverV03::new(corrupt_state),
+            sender_file_hash: hash(contents),
+            identity: identity(),
+        };
+
+        received.verify_complete_file().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_verifies_renames_and_removes_chunk_state() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(contents, layout, &[0, 1, 2])).unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let snapshot = chunk_state_path(&partial);
+        assert!(snapshot.exists());
+
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+        let final_path = received.finalize(None).await.unwrap();
+
+        assert_eq!(final_path, temp.path().join("archive.bin"));
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+        assert!(!snapshot.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_succeeds_when_no_chunk_state_snapshot_exists() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcd";
+        let received = received_complete(&partial, contents, 4, 4, hash(contents)).await;
+
+        let final_path = received.finalize(None).await.unwrap();
+
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+        assert!(!chunk_state_path(&partial).exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_preserves_partial_and_chunk_state_when_rename_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(contents, layout, &[0, 1, 2])).unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let snapshot = chunk_state_path(&partial);
+
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+
+        // Occupy the destination so the rename cannot complete.
+        fs::create_dir(temp.path().join("archive.bin"))
+            .await
+            .unwrap();
+
+        let error = received.finalize(None).await.unwrap_err();
+        assert!(matches!(error, ReceiverV03FinalizeError::Io(_)));
+        assert!(partial.exists());
+        assert_eq!(fs::read(&partial).await.unwrap(), contents);
+        assert!(snapshot.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_skips_rename_and_cleanup_when_verification_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(contents, layout, &[0, 1, 2])).unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let snapshot = chunk_state_path(&partial);
+
+        let received = received_complete(&partial, contents, 12, 4, hash(b"different")).await;
+
+        let error = received.finalize(None).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ReceiverV03FinalizeError::Verification(ReceiverV03VerificationError::FileHashMismatch)
+        ));
+        assert!(partial.exists());
+        assert!(snapshot.exists());
+        assert!(!temp.path().join("archive.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_a_partial_path_without_the_part_suffix() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin");
+        let contents = b"abcd";
+        let received = received_complete(&partial, contents, 4, 4, hash(contents)).await;
+
+        let error = received.finalize(None).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ReceiverV03FinalizeError::InvalidPartialPath(path) if path == partial
+        ));
+        assert!(partial.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_promotes_an_empty_file() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("empty.bin.part");
+        let received = received_complete(&partial, b"", 0, 4, hash(b"")).await;
+
+        let final_path = received.finalize(None).await.unwrap();
+
+        assert_eq!(final_path, temp.path().join("empty.bin"));
+        assert_eq!(fs::read(&final_path).await.unwrap(), b"");
+        assert!(!partial.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_with_receipt_persists_before_rename_and_commits() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let receipt_dir = temp.path();
+        let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
+        let receipt_path = completion_receipt_path(receipt_dir, transfer_id);
+
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+
+        let final_path = received.finalize(Some(receipt_dir)).await.unwrap();
+
+        assert_eq!(final_path, temp.path().join("archive.bin"));
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+        assert!(receipt_path.exists());
+        assert_eq!(
+            read_completion_receipt(receipt_dir, transfer_id)
+                .await
+                .unwrap(),
+            CompletionReceipt {
+                transfer_id,
+                filename: "archive.bin".to_string(),
+                file_size: 12,
+                blake3: hash(contents).into_bytes(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_with_receipt_skips_persistence_when_verification_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(contents, layout, &[0, 1, 2])).unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let snapshot = chunk_state_path(&partial);
+        let receipt_dir = temp.path();
+        let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
+        let receipt_path = completion_receipt_path(receipt_dir, transfer_id);
+
+        let received = received_complete(&partial, contents, 12, 4, hash(b"different")).await;
+
+        let error = received.finalize(Some(receipt_dir)).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ReceiverV03FinalizeError::Verification(ReceiverV03VerificationError::FileHashMismatch)
+        ));
+        assert!(!receipt_path.exists());
+        assert!(partial.exists());
+        assert_eq!(fs::read(&partial).await.unwrap(), contents);
+        assert!(snapshot.exists());
+        assert!(!temp.path().join("archive.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_with_receipt_keeps_receipt_when_rename_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(contents, layout, &[0, 1, 2])).unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let snapshot = chunk_state_path(&partial);
+        fs::create_dir(temp.path().join("archive.bin"))
+            .await
+            .unwrap();
+        let receipt_dir = temp.path();
+        let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
+
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+
+        let error = received.finalize(Some(receipt_dir)).await.unwrap_err();
+        assert!(matches!(error, ReceiverV03FinalizeError::Io(_)));
+        assert!(partial.exists());
+        assert_eq!(fs::read(&partial).await.unwrap(), contents);
+        assert!(snapshot.exists());
+        assert!(completion_receipt_path(receipt_dir, transfer_id).exists());
+        assert_eq!(
+            read_completion_receipt(receipt_dir, transfer_id)
+                .await
+                .unwrap(),
+            CompletionReceipt {
+                transfer_id,
+                filename: "archive.bin".to_string(),
+                file_size: 12,
+                blake3: hash(contents).into_bytes(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_with_identical_receipt_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let receipt_dir = temp.path();
+        let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
+        let receipt = CompletionReceipt {
+            transfer_id,
+            filename: "archive.bin".to_string(),
+            file_size: 12,
+            blake3: hash(contents).into_bytes(),
+        };
+        write_completion_receipt(receipt_dir, &receipt)
+            .await
+            .unwrap();
+
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+
+        let final_path = received.finalize(Some(receipt_dir)).await.unwrap();
+
+        assert_eq!(final_path, temp.path().join("archive.bin"));
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_with_conflicting_receipt_fails_before_rename() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let layout = ChunkLayout::new(12, 4).unwrap();
+        let state = ChunkState::new(layout, records_for(contents, layout, &[0, 1, 2])).unwrap();
+        write_chunk_state(&partial, &state).await.unwrap();
+        let snapshot = chunk_state_path(&partial);
+        let receipt_dir = temp.path();
+        let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
+        let conflicting = CompletionReceipt {
+            transfer_id,
+            filename: "archive.bin".to_string(),
+            file_size: 12,
+            blake3: hash(b"different").into_bytes(),
+        };
+        write_completion_receipt(receipt_dir, &conflicting)
+            .await
+            .unwrap();
+
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+
+        let error = received.finalize(Some(receipt_dir)).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ReceiverV03FinalizeError::Receipt(CompletionReceiptError::ConflictingReceipt)
+        ));
+        assert!(partial.exists());
+        assert_eq!(fs::read(&partial).await.unwrap(), contents);
+        assert!(snapshot.exists());
+        assert!(!temp.path().join("archive.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_with_none_receipt_writes_no_receipt() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let receipt_dir = temp.path();
+
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+
+        let final_path = received.finalize(None).await.unwrap();
+
+        assert_eq!(final_path, temp.path().join("archive.bin"));
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!receipt_dir.join(".warpfile").join("receipts").exists());
+    }
+
+    #[tokio::test]
+    async fn complete_sends_empty_verified_after_finalize() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let final_path = received.complete(&mut receiver_stream, None).await.unwrap();
+
+        let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+            .await
+            .unwrap();
+        assert_eq!(verified.version, WFP_VERSION_V03);
+        assert_eq!(verified.message_type, MessageType::Verified);
+        assert!(verified.payload.is_empty());
+        assert_eq!(final_path, temp.path().join("archive.bin"));
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+    }
+
+    #[tokio::test]
+    async fn complete_does_not_send_verified_when_verification_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let received = received_complete(&partial, contents, 12, 4, hash(b"different")).await;
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let error = received
+            .complete(&mut receiver_stream, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiverV03CompleteError::Finalize(ReceiverV03FinalizeError::Verification(
+                ReceiverV03VerificationError::FileHashMismatch
+            ))
+        ));
+        receiver_stream.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        peer_stream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_does_not_send_verified_when_rename_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        fs::create_dir(temp.path().join("archive.bin"))
+            .await
+            .unwrap();
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let error = received
+            .complete(&mut receiver_stream, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiverV03CompleteError::Finalize(ReceiverV03FinalizeError::Io(_))
+        ));
+        receiver_stream.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        peer_stream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        assert!(partial.exists());
+        assert_eq!(fs::read(&partial).await.unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn complete_leaves_committed_state_when_verified_write_fails() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let receipt_dir = temp.path();
+        let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
+        let receipt_path = completion_receipt_path(receipt_dir, transfer_id);
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+        let (mut receiver_stream, peer_stream) = duplex(1024);
+        drop(peer_stream);
+
+        let error = received
+            .complete(&mut receiver_stream, Some(receipt_dir))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiverV03CompleteError::Protocol(ProtocolIoError::Io(_))
+        ));
+        let final_path = temp.path().join("archive.bin");
+        assert!(final_path.exists());
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+        assert!(receipt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn complete_with_receipt_persists_and_sends_verified() {
+        let temp = tempdir().unwrap();
+        let partial = temp.path().join("archive.bin.part");
+        let contents = b"abcdefghijkl";
+        let receipt_dir = temp.path();
+        let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
+        let receipt_path = completion_receipt_path(receipt_dir, transfer_id);
+        let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let final_path = received
+            .complete(&mut receiver_stream, Some(receipt_dir))
+            .await
+            .unwrap();
+
+        let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+            .await
+            .unwrap();
+        assert_eq!(verified.version, WFP_VERSION_V03);
+        assert_eq!(verified.message_type, MessageType::Verified);
+        assert!(verified.payload.is_empty());
+        assert_eq!(final_path, temp.path().join("archive.bin"));
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+        assert!(receipt_path.exists());
+        assert_eq!(
+            read_completion_receipt(receipt_dir, transfer_id)
+                .await
+                .unwrap(),
+            CompletionReceipt {
+                transfer_id,
+                filename: "archive.bin".to_string(),
+                file_size: 12,
+                blake3: hash(contents).into_bytes(),
+            }
+        );
+    }
+
+    fn receipt_for(offer: &FileOfferV03, contents: &[u8]) -> CompletionReceipt {
+        CompletionReceipt {
+            transfer_id: offer.transfer_id,
+            filename: offer.filename.clone(),
+            file_size: offer.file_size,
+            blake3: hash(contents).into_bytes(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_receipt_returns_not_reconciled() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let outcome = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer(12, 4))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ReceiverV03ReconcileOutcome::NotReconciled);
+        receiver_stream.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        peer_stream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_final_file_sends_verified() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        write_completion_receipt(dir, &receipt_for(&offer, contents))
+            .await
+            .unwrap();
+        fs::write(dir.join("archive.bin"), contents).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let outcome = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ReceiverV03ReconcileOutcome::Reconciled(dir.join("archive.bin"))
+        );
+        let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+            .await
+            .unwrap();
+        assert_eq!(verified.version, WFP_VERSION_V03);
+        assert_eq!(verified.message_type, MessageType::Verified);
+        assert!(verified.payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_partial_file_promotes_and_sends_verified() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        write_completion_receipt(dir, &receipt_for(&offer, contents))
+            .await
+            .unwrap();
+        fs::write(dir.join("archive.bin.part"), contents)
+            .await
+            .unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let outcome = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ReceiverV03ReconcileOutcome::Reconciled(dir.join("archive.bin"))
+        );
+        assert!(dir.join("archive.bin").exists());
+        assert_eq!(fs::read(dir.join("archive.bin")).await.unwrap(), contents);
+        assert!(!dir.join("archive.bin.part").exists());
+        let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+            .await
+            .unwrap();
+        assert_eq!(verified.version, WFP_VERSION_V03);
+        assert_eq!(verified.message_type, MessageType::Verified);
+        assert!(verified.payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_not_reconciled_when_final_hash_mismatches() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        write_completion_receipt(dir, &receipt_for(&offer, contents))
+            .await
+            .unwrap();
+        let mut corrupted = contents.to_vec();
+        corrupted[3] ^= 0x01;
+        fs::write(dir.join("archive.bin"), &corrupted)
+            .await
+            .unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let outcome = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ReceiverV03ReconcileOutcome::NotReconciled);
+        assert_eq!(fs::read(dir.join("archive.bin")).await.unwrap(), corrupted);
+        receiver_stream.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        peer_stream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_not_reconciled_when_partial_hash_mismatches() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        write_completion_receipt(dir, &receipt_for(&offer, contents))
+            .await
+            .unwrap();
+        let mut corrupted = contents.to_vec();
+        corrupted[3] ^= 0x01;
+        fs::write(dir.join("archive.bin.part"), &corrupted)
+            .await
+            .unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let outcome = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ReceiverV03ReconcileOutcome::NotReconciled);
+        assert!(dir.join("archive.bin.part").exists());
+        assert_eq!(
+            fs::read(dir.join("archive.bin.part")).await.unwrap(),
+            corrupted
+        );
+        assert!(!dir.join("archive.bin").exists());
+        receiver_stream.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        peer_stream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_conflicting_receipt() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        let mut receipt = receipt_for(&offer, contents);
+        receipt.filename = "other.bin".to_string();
+        write_completion_receipt(dir, &receipt).await.unwrap();
+        let (mut receiver_stream, _peer_stream) = duplex(1024);
+
+        let error = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiverV03ReconcileError::ConflictingReceipt
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_unsafe_filename() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let mut unsafe_offer = offer(12, 4);
+        unsafe_offer.filename = "../evil".to_string();
+        let (mut receiver_stream, _peer_stream) = duplex(1024);
+
+        let error = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &unsafe_offer)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ReceiverV03ReconcileError::InvalidFilename));
+        assert!(!dir.join(".warpfile").exists());
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_committed_state_when_verified_write_fails() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        write_completion_receipt(dir, &receipt_for(&offer, contents))
+            .await
+            .unwrap();
+        fs::write(dir.join("archive.bin"), contents).await.unwrap();
+        let (mut receiver_stream, peer_stream) = duplex(1024);
+        drop(peer_stream);
+
+        let error = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReceiverV03ReconcileError::Protocol(ProtocolIoError::Io(_))
+        ));
+        let final_path = dir.join("archive.bin");
+        assert!(final_path.exists());
+        assert_eq!(fs::read(&final_path).await.unwrap(), contents);
+    }
+
+    fn hello_frame_v03() -> Frame {
+        Frame::new_for_version(WFP_VERSION_V03, MessageType::Hello, vec![WFP_VERSION_V03]).unwrap()
+    }
+
+    fn offer_frame_v03(offer: &FileOfferV03) -> Frame {
+        transfer_frame(MessageType::Offer, encode_offer_v03(offer).unwrap())
+    }
+
+    #[tokio::test]
+    async fn receive_session_completes_new_transfer() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        let (mut receiver_stream, mut peer_stream) = duplex(4096);
+
+        let peer = async {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+
+            let hello_ack = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+            assert_eq!(hello_ack.payload, vec![WFP_VERSION_V03]);
+
+            write_frame(&mut peer_stream, &offer_frame_v03(&offer))
+                .await
+                .unwrap();
+
+            let (resume, batches) = read_inventory(&mut peer_stream, 0).await;
+            assert_eq!(resume.message_type, MessageType::Resume);
+            assert_eq!(
+                decode_resume_v03(&resume.payload)
+                    .unwrap()
+                    .chunk_record_count,
+                0
+            );
+            assert!(batches.is_empty());
+
+            write_frame(&mut peer_stream, &accept_frame())
+                .await
+                .unwrap();
+
+            for (index, chunk) in contents.chunks(4).enumerate() {
+                write_frame(
+                    &mut peer_stream,
+                    &chunk_start_frame(u64::try_from(index).unwrap(), chunk),
+                )
+                .await
+                .unwrap();
+                write_frame(
+                    &mut peer_stream,
+                    &data_frame(u64::try_from(index * 4).unwrap(), chunk),
+                )
+                .await
+                .unwrap();
+            }
+
+            write_frame(&mut peer_stream, &complete_frame(hash(contents)))
+                .await
+                .unwrap();
+
+            let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(verified.message_type, MessageType::Verified);
+            assert!(verified.payload.is_empty());
+        };
+
+        let (outcome, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+        let outcome = outcome.unwrap();
+
+        assert_eq!(
+            outcome,
+            ReceiverV03SessionOutcome::Completed(dir.join("archive.bin"))
+        );
+        assert_eq!(fs::read(dir.join("archive.bin")).await.unwrap(), contents);
+        assert!(completion_receipt_path(dir, offer.transfer_id).exists());
+        assert_eq!(
+            read_completion_receipt(dir, offer.transfer_id)
+                .await
+                .unwrap(),
+            receipt_for(&offer, contents)
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_session_reconciles_existing_transfer() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        write_completion_receipt(dir, &receipt_for(&offer, contents))
+            .await
+            .unwrap();
+        fs::write(dir.join("archive.bin"), contents).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let peer = async {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+
+            let hello_ack = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+            assert_eq!(hello_ack.payload, vec![WFP_VERSION_V03]);
+
+            write_frame(&mut peer_stream, &offer_frame_v03(&offer))
+                .await
+                .unwrap();
+
+            let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(verified.message_type, MessageType::Verified);
+            assert!(verified.payload.is_empty());
+
+            peer_stream
+        };
+
+        let (outcome, mut peer_stream) =
+            tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+        let outcome = outcome.unwrap();
+
+        assert_eq!(
+            outcome,
+            ReceiverV03SessionOutcome::Reconciled(dir.join("archive.bin"))
+        );
+
+        drop(receiver_stream);
+        let mut extra = Vec::new();
+        peer_stream.read_to_end(&mut extra).await.unwrap();
+        assert!(extra.is_empty());
+
+        assert!(!dir.join("archive.bin.part").exists());
+    }
+
+    #[tokio::test]
+    async fn receive_session_rejects_unexpected_hello() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let peer = async {
+            write_frame(&mut peer_stream, &offer_frame_v03(&offer(12, 4)))
+                .await
+                .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+
+        assert!(matches!(
+            result,
+            Err(ReceiverV03SessionError::UnexpectedMessageType(
+                MessageType::Offer
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_session_rejects_invalid_hello_payload() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let peer = async {
+            let hello =
+                Frame::new_for_version(WFP_VERSION_V03, MessageType::Hello, vec![0x00]).unwrap();
+            write_frame(&mut peer_stream, &hello).await.unwrap();
+        };
+
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+
+        assert!(matches!(
+            result,
+            Err(ReceiverV03SessionError::InvalidHelloPayload(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_session_creates_destination_directory() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("does-not-exist-yet");
+        assert!(!dir.exists());
+
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let peer = async move {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+
+            let _ = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03).await;
+
+            write_frame(&mut peer_stream, &offer_frame_v03(&offer(4, 4)))
+                .await
+                .unwrap();
+
+            // Force-drop the peer half so the receiver observes EOF instead of
+            // blocking forever waiting for the next frame from the peer.
+            drop(peer_stream);
+        };
+
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, &dir), peer);
+
+        assert!(result.is_err(), "session should fail with peer dropped");
+        assert!(
+            dir.is_dir(),
+            "destination directory must exist after session start"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_session_propagates_unsafe_filename() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let mut unsafe_offer = offer(12, 4);
+        unsafe_offer.filename = "../evil".to_string();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let peer = async {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+
+            let hello_ack = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+
+            write_frame(&mut peer_stream, &offer_frame_v03(&unsafe_offer))
+                .await
+                .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+
+        assert!(matches!(
+            result,
+            Err(ReceiverV03SessionError::Reconcile(
+                ReceiverV03ReconcileError::InvalidFilename
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_session_propagates_conflicting_receipt() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let contents = b"abcdefghijkl";
+        let offer = offer(12, 4);
+        let mut conflicting = receipt_for(&offer, contents);
+        conflicting.filename = "other.bin".to_string();
+        write_completion_receipt(dir, &conflicting).await.unwrap();
+        let (mut receiver_stream, mut peer_stream) = duplex(1024);
+
+        let peer = async {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+
+            let hello_ack = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+
+            write_frame(&mut peer_stream, &offer_frame_v03(&offer))
+                .await
+                .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+
+        assert!(matches!(
+            result,
+            Err(ReceiverV03SessionError::Reconcile(
+                ReceiverV03ReconcileError::ConflictingReceipt
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_session_propagates_receive_error() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let offer = offer(12, 4);
+        let (mut receiver_stream, mut peer_stream) = duplex(4096);
+
+        let peer = async {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+
+            let hello_ack = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+
+            write_frame(&mut peer_stream, &offer_frame_v03(&offer))
+                .await
+                .unwrap();
+
+            let (resume, batches) = read_inventory(&mut peer_stream, 0).await;
+            assert_eq!(
+                decode_resume_v03(&resume.payload)
+                    .unwrap()
+                    .chunk_record_count,
+                0
+            );
+            assert!(batches.is_empty());
+
+            write_frame(&mut peer_stream, &accept_frame())
+                .await
+                .unwrap();
+
+            write_frame(&mut peer_stream, &chunk_start_frame(0, b"abcd"))
+                .await
+                .unwrap();
+            write_frame(&mut peer_stream, &data_frame(0, b"abcd"))
+                .await
+                .unwrap();
+            write_frame(&mut peer_stream, &chunk_start_frame(1, b"efgh"))
+                .await
+                .unwrap();
+            write_frame(&mut peer_stream, &data_frame(4, b"efgh"))
+                .await
+                .unwrap();
+
+            let wrong_declared_hash = transfer_frame(
+                MessageType::ChunkStart,
+                encode_chunk_start_v03(&ChunkStartV03 {
+                    chunk_index: 2,
+                    expected_hash: hash(b"wxyz"),
+                }),
+            );
+            write_frame(&mut peer_stream, &wrong_declared_hash)
+                .await
+                .unwrap();
+            write_frame(&mut peer_stream, &data_frame(8, b"ijkl"))
+                .await
+                .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+
+        assert!(matches!(
+            result,
+            Err(ReceiverV03SessionError::Transfer(
+                ReceiverV03TransferError::Receiver(ReceiverV03Error::ChunkHashMismatch {
+                    index: 2
+                })
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_session_propagates_negotiation_error() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let offer = offer(12, 4);
+        let (mut receiver_stream, mut peer_stream) = duplex(4096);
+
+        let peer = async {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+
+            let hello_ack = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello_ack.message_type, MessageType::HelloAck);
+
+            write_frame(&mut peer_stream, &offer_frame_v03(&offer))
+                .await
+                .unwrap();
+
+            let (resume, batches) = read_inventory(&mut peer_stream, 0).await;
+            assert_eq!(
+                decode_resume_v03(&resume.payload)
+                    .unwrap()
+                    .chunk_record_count,
+                0
+            );
+            assert!(batches.is_empty());
+
+            write_frame(&mut peer_stream, &data_frame(0, b"abcd"))
+                .await
+                .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+
+        assert!(matches!(
+            result,
+            Err(ReceiverV03SessionError::Negotiation(
+                ReceiverV03NegotiationError::UnexpectedMessageType(MessageType::Data)
+            ))
+        ));
     }
 }

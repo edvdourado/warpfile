@@ -370,6 +370,133 @@ async fn wfp_v03_reuses_sparse_physically_valid_chunks_on_wire() {
 }
 
 #[tokio::test]
+async fn wfp_v03_revalidates_corrupted_sparse_chunk_before_reuse() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::num::NonZeroU64;
+
+    use warpfile::chunk::ChunkLayout;
+    use warpfile::chunk_manifest::ChunkHash;
+    use warpfile::chunk_state::{
+        ChunkState, RecordedChunk, decode_chunk_state, encode_chunk_state,
+    };
+    use warpfile::protocol::{TransferId, decode_chunk_start_v03, decode_data_v03};
+    use warpfile::sender_v03::send_session_v03;
+
+    let temp = tempdir().unwrap();
+    let source_path = temp.path().join("payload.bin");
+    let dest_dir = temp.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let contents: Vec<u8> = (0..4096u32).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&source_path, &contents).unwrap();
+
+    let chunk_size = 1024u64;
+    let layout = ChunkLayout::new(4096, chunk_size).unwrap();
+    let records: Vec<_> = [0, 2]
+        .into_iter()
+        .map(|index| {
+            let range = layout.range(index).unwrap();
+            let start = range.offset as usize;
+            let end = (range.offset + range.length) as usize;
+            RecordedChunk {
+                index,
+                hash: ChunkHash::from_bytes(*blake3::hash(&contents[start..end]).as_bytes()),
+            }
+        })
+        .collect();
+    let state = ChunkState::new(layout, records).unwrap();
+
+    let partial = dest_dir.join("payload.bin.part");
+    let mut partial_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&partial)
+        .unwrap();
+    partial_file.set_len(contents.len() as u64).unwrap();
+    for index in [0, 2] {
+        let range = layout.range(index).unwrap();
+        let start = range.offset as usize;
+        let end = (range.offset + range.length) as usize;
+        partial_file.seek(SeekFrom::Start(range.offset)).unwrap();
+        partial_file.write_all(&contents[start..end]).unwrap();
+    }
+    drop(partial_file);
+
+    let metadata_path = dest_dir.join("payload.bin.part.warpchunks");
+    let encoded_state = encode_chunk_state(&state).unwrap();
+    std::fs::write(&metadata_path, &encoded_state).unwrap();
+    let persisted = decode_chunk_state(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(
+        persisted
+            .recorded_chunks()
+            .iter()
+            .map(|chunk| chunk.index)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+
+    partial_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial)
+        .unwrap();
+    partial_file.seek(SeekFrom::Start(2 * chunk_size)).unwrap();
+    partial_file
+        .write_all(&vec![0xA5; chunk_size as usize])
+        .unwrap();
+    drop(partial_file);
+
+    let receiver_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let receiver_address = receiver_probe.local_addr().unwrap().to_string();
+    drop(receiver_probe);
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap().to_string();
+    let receiver_dest = dest_dir.clone();
+    let receiver_bind = receiver_address.clone();
+    let receiver = tokio::spawn(async move {
+        let _ = run_receiver_v03(&receiver_bind, &receiver_dest).await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let proxied_receiver = receiver_address.clone();
+    let proxy_task =
+        tokio::spawn(async move { proxy_v03_session(&proxy, &proxied_receiver, false).await });
+    send_session_v03(
+        &source_path,
+        &proxy_address,
+        TransferId::generate().unwrap(),
+        NonZeroU64::new(chunk_size).unwrap(),
+    )
+    .await
+    .unwrap();
+    let frames = proxy_task.await.unwrap();
+    receiver.abort();
+    let _ = receiver.await;
+
+    let chunk_starts: Vec<u64> = frames
+        .iter()
+        .filter(|frame| frame.message_type == MessageType::ChunkStart)
+        .map(|frame| decode_chunk_start_v03(&frame.payload).unwrap().chunk_index)
+        .collect();
+    assert_eq!(chunk_starts, vec![1, 2, 3]);
+    assert!(!chunk_starts.contains(&0));
+    let useful_data_bytes: usize = frames
+        .iter()
+        .filter(|frame| frame.message_type == MessageType::Data)
+        .map(|frame| decode_data_v03(&frame.payload).unwrap().data.len())
+        .sum();
+    assert_eq!(useful_data_bytes, 3072);
+
+    assert_eq!(
+        std::fs::read(dest_dir.join("payload.bin")).unwrap(),
+        contents
+    );
+    assert!(
+        !partial.exists(),
+        ".part must be removed after finalization"
+    );
+}
+
+#[tokio::test]
 async fn wfp_v03_reconciles_after_the_first_verified_is_lost() {
     let temp = tempdir().unwrap();
     let source_path = temp.path().join("payload.bin");

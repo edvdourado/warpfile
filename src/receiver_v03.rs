@@ -25,13 +25,13 @@ use crate::protocol::{
     decode_offer_v03, encode_chunk_hashes, encode_resume_v03, read_frame_for_version, write_frame,
 };
 
-const PROGRESS_STRIDE_DIVISOR: usize = 100;
+const PROGRESS_STRIDE_DIVISOR: u64 = 100;
 
-fn progress_stride(total: usize) -> usize {
+fn progress_stride(total: u64) -> u64 {
     (total / PROGRESS_STRIDE_DIVISOR).max(1)
 }
 
-fn render_progress(label: &str, current: usize, total: usize) {
+fn render_progress(label: &str, current: u64, total: u64) {
     if !std::io::stdout().is_terminal() {
         return;
     }
@@ -43,7 +43,7 @@ fn render_progress(label: &str, current: usize, total: usize) {
     let _ = std::io::stdout().flush();
 }
 
-fn finish_progress(label: &str, total: usize) {
+fn finish_progress(label: &str, total: u64) {
     if std::io::stdout().is_terminal() {
         println!("\r{label}: {total}/{total} chunks (100%)");
     }
@@ -953,9 +953,9 @@ impl AcceptedReceiverV03 {
     where
         S: AsyncRead + Unpin,
     {
-        let total_chunks = self.receiver.chunk_state.layout().chunk_count() as usize;
+        let total_chunks = self.receiver.chunk_state.layout().chunk_count();
         let stride = progress_stride(total_chunks);
-        let mut last_reported = 0usize;
+        let mut last_reported = 0u64;
 
         loop {
             let frame = read_frame_for_version(stream, WFP_VERSION_V03).await?;
@@ -978,6 +978,9 @@ impl AcceptedReceiverV03 {
                             .await?;
 
                         let verified = self.receiver.chunk_state.recorded_chunks().len();
+                        let verified = u64::try_from(verified).map_err(|_| {
+                            ReceiverV03TransferError::VerifiedChunkCountOverflow(verified)
+                        })?;
                         if verified.saturating_sub(last_reported) >= stride
                             || verified == total_chunks
                         {
@@ -1503,6 +1506,14 @@ mod tests {
 
     fn state(file_size: u64, chunk_size: u64, chunks: Vec<RecordedChunk>) -> ChunkState {
         ChunkState::new(ChunkLayout::new(file_size, chunk_size).unwrap(), chunks).unwrap()
+    }
+
+    #[test]
+    fn progress_stride_preserves_large_chunk_counts() {
+        assert_eq!(
+            progress_stride(u64::MAX),
+            u64::MAX / PROGRESS_STRIDE_DIVISOR
+        );
     }
 
     fn chunk_start(index: u64, bytes: &[u8]) -> ChunkStartV03 {

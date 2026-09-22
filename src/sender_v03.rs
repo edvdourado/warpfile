@@ -18,13 +18,13 @@ use crate::protocol::{
     encode_offer_v03, read_frame_for_version, write_frame,
 };
 
-const PROGRESS_STRIDE_DIVISOR: usize = 100;
+const PROGRESS_STRIDE_DIVISOR: u64 = 100;
 
-fn progress_stride(total: usize) -> usize {
+fn progress_stride(total: u64) -> u64 {
     (total / PROGRESS_STRIDE_DIVISOR).max(1)
 }
 
-fn render_progress(label: &str, current: usize, total: usize) {
+fn render_progress(label: &str, current: u64, total: u64) {
     if !std::io::stdout().is_terminal() {
         return;
     }
@@ -36,7 +36,7 @@ fn render_progress(label: &str, current: usize, total: usize) {
     let _ = std::io::stdout().flush();
 }
 
-fn finish_progress(label: &str, total: usize) {
+fn finish_progress(label: &str, total: u64) {
     if std::io::stdout().is_terminal() {
         println!("\r{label}: {total}/{total} chunks (100%)");
     }
@@ -638,9 +638,9 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let total_chunks = scanner.inventory.layout.chunk_count() as usize;
+    let total_chunks = scanner.inventory.layout.chunk_count();
     let stride = progress_stride(total_chunks);
-    let mut processed = 0usize;
+    let mut processed = 0u64;
 
     while let Some(chunk) = scanner.next_chunk().await? {
         if chunk.disposition() == SourceChunkDispositionV03::Transmit {
@@ -761,6 +761,7 @@ pub enum SenderV03SessionError {
     Transfer(SenderV03TransferError),
     UnexpectedMessageType(MessageType),
     InvalidHelloAckPayload(usize),
+    VerifiedChunkCountOverflow(usize),
 }
 
 impl fmt::Display for SenderV03SessionError {
@@ -790,6 +791,10 @@ impl fmt::Display for SenderV03SessionError {
                 formatter,
                 "WFP/0.3 HELLO_ACK payload must contain exactly one version byte, received {length} bytes"
             ),
+            Self::VerifiedChunkCountOverflow(count) => write!(
+                formatter,
+                "WFP/0.3 receiver verified chunk count does not fit in u64: {count}"
+            ),
         }
     }
 }
@@ -807,7 +812,8 @@ impl Error for SenderV03SessionError {
             Self::NotARegularFile
             | Self::InvalidFilename
             | Self::UnexpectedMessageType(_)
-            | Self::InvalidHelloAckPayload(_) => None,
+            | Self::InvalidHelloAckPayload(_)
+            | Self::VerifiedChunkCountOverflow(_) => None,
         }
     }
 }
@@ -855,7 +861,8 @@ impl SenderV03SessionError {
             | Self::Frame(_)
             | Self::Offer(_)
             | Self::UnexpectedMessageType(_)
-            | Self::InvalidHelloAckPayload(_) => false,
+            | Self::InvalidHelloAckPayload(_)
+            | Self::VerifiedChunkCountOverflow(_) => false,
         }
     }
 }
@@ -947,8 +954,9 @@ where
     let inventory =
         receive_inventory_and_accept_after_resume(&mut stream, layout, offer_response).await?;
 
-    let verified = inventory.records.len();
-    let total = inventory.layout.chunk_count() as usize;
+    let verified = u64::try_from(inventory.records.len())
+        .map_err(|_| SenderV03SessionError::VerifiedChunkCountOverflow(inventory.records.len()))?;
+    let total = inventory.layout.chunk_count();
     println!(
         "Receiver inventory: {verified} verified chunks; sending {}",
         total - verified
@@ -1027,6 +1035,14 @@ mod tests {
 
     fn layout() -> ChunkLayout {
         ChunkLayout::new(40, 4).unwrap()
+    }
+
+    #[test]
+    fn progress_stride_preserves_large_chunk_counts() {
+        assert_eq!(
+            progress_stride(u64::MAX),
+            u64::MAX / PROGRESS_STRIDE_DIVISOR
+        );
     }
 
     fn record(index: u64, byte: u8) -> ChunkHashRecord {

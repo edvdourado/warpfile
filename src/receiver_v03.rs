@@ -326,9 +326,16 @@ impl ReceivedCompleteV03 {
             println!("Completion receipt persisted");
         }
 
-        fs::rename(&partial_path, &final_path).await?;
+        promote_partial_no_clobber(&partial_path, &final_path)
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => {
+                    ReceiverV03FinalizeError::DestinationExists(final_path.clone())
+                }
+                _ => ReceiverV03FinalizeError::Io(error),
+            })?;
 
-        println!("Renamed partial to final");
+        println!("Promoted partial to final");
 
         /*
          * Cleanup is best-effort: `.warpchunks` is advisory state whose
@@ -368,6 +375,11 @@ fn final_path_for_partial(partial: &Path) -> Result<PathBuf, ReceiverV03Finalize
         .ok_or_else(|| ReceiverV03FinalizeError::InvalidPartialPath(partial.to_path_buf()))?;
 
     Ok(partial.with_file_name(stripped))
+}
+
+async fn promote_partial_no_clobber(partial: &Path, destination: &Path) -> io::Result<()> {
+    fs::hard_link(partial, destination).await?;
+    fs::remove_file(partial).await
 }
 
 #[derive(Debug)]
@@ -413,6 +425,7 @@ pub enum ReceiverV03FinalizeError {
     Verification(ReceiverV03VerificationError),
     InvalidPartialPath(PathBuf),
     Receipt(CompletionReceiptError),
+    DestinationExists(PathBuf),
     Io(io::Error),
 }
 
@@ -428,6 +441,11 @@ impl fmt::Display for ReceiverV03FinalizeError {
                 path.display()
             ),
             Self::Receipt(error) => write!(formatter, "WFP/0.3 finalize receipt error: {error}"),
+            Self::DestinationExists(path) => write!(
+                formatter,
+                "WFP/0.3 finalize will not replace existing destination {}",
+                path.display()
+            ),
             Self::Io(error) => write!(formatter, "WFP/0.3 finalize I/O error: {error}"),
         }
     }
@@ -439,7 +457,7 @@ impl Error for ReceiverV03FinalizeError {
             Self::Verification(error) => Some(error),
             Self::Receipt(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::InvalidPartialPath(_) => None,
+            Self::InvalidPartialPath(_) | Self::DestinationExists(_) => None,
         }
     }
 }
@@ -521,6 +539,7 @@ pub enum ReceiverV03ReconcileError {
     Receipt(CompletionReceiptError),
     InvalidFilename,
     ConflictingReceipt,
+    DestinationExists(PathBuf),
 }
 
 impl fmt::Display for ReceiverV03ReconcileError {
@@ -548,6 +567,11 @@ impl fmt::Display for ReceiverV03ReconcileError {
             Self::ConflictingReceipt => {
                 formatter.write_str("WFP/0.3 reconciliation found a conflicting completion receipt")
             }
+            Self::DestinationExists(path) => write!(
+                formatter,
+                "WFP/0.3 reconciliation will not replace existing destination {}",
+                path.display()
+            ),
         }
     }
 }
@@ -559,7 +583,7 @@ impl Error for ReceiverV03ReconcileError {
             Self::Protocol(error) => Some(error),
             Self::Frame(error) => Some(error),
             Self::Receipt(error) => Some(error),
-            Self::InvalidFilename | Self::ConflictingReceipt => None,
+            Self::InvalidFilename | Self::ConflictingReceipt | Self::DestinationExists(_) => None,
         }
     }
 }
@@ -640,7 +664,14 @@ where
             return Ok(ReceiverV03ReconcileOutcome::NotReconciled);
         }
 
-        fs::rename(&partial_destination, &destination).await?;
+        promote_partial_no_clobber(&partial_destination, &destination)
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => {
+                    ReceiverV03ReconcileError::DestinationExists(destination.clone())
+                }
+                _ => ReceiverV03ReconcileError::Io(error),
+            })?;
 
         let _ = remove_chunk_state(&partial_destination).await;
 
@@ -3068,7 +3099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_verifies_renames_and_removes_chunk_state() {
+    async fn finalize_verifies_promotes_and_removes_chunk_state() {
         let temp = tempdir().unwrap();
         let partial = temp.path().join("archive.bin.part");
         let contents = b"abcdefghijkl";
@@ -3102,7 +3133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_preserves_partial_and_chunk_state_when_rename_fails() {
+    async fn finalize_preserves_existing_destination_partial_and_chunk_state() {
         let temp = tempdir().unwrap();
         let partial = temp.path().join("archive.bin.part");
         let contents = b"abcdefghijkl";
@@ -3113,20 +3144,23 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
 
-        // Occupy the destination so the rename cannot complete.
-        fs::create_dir(temp.path().join("archive.bin"))
-            .await
-            .unwrap();
+        let final_path = temp.path().join("archive.bin");
+        let existing = b"existing destination";
+        fs::write(&final_path, existing).await.unwrap();
 
         let error = received.finalize(None).await.unwrap_err();
-        assert!(matches!(error, ReceiverV03FinalizeError::Io(_)));
+        assert!(matches!(
+            error,
+            ReceiverV03FinalizeError::DestinationExists(path) if path == final_path
+        ));
+        assert_eq!(fs::read(&final_path).await.unwrap(), existing);
         assert!(partial.exists());
         assert_eq!(fs::read(&partial).await.unwrap(), contents);
         assert!(snapshot.exists());
     }
 
     #[tokio::test]
-    async fn finalize_skips_rename_and_cleanup_when_verification_fails() {
+    async fn finalize_skips_promotion_and_cleanup_when_verification_fails() {
         let temp = tempdir().unwrap();
         let partial = temp.path().join("archive.bin.part");
         let contents = b"abcdefghijkl";
@@ -3176,7 +3210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_with_receipt_persists_before_rename_and_commits() {
+    async fn finalize_with_receipt_persists_before_promotion_and_commits() {
         let temp = tempdir().unwrap();
         let partial = temp.path().join("archive.bin.part");
         let contents = b"abcdefghijkl";
@@ -3233,7 +3267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_with_receipt_keeps_receipt_when_rename_fails() {
+    async fn finalize_with_receipt_keeps_receipt_when_destination_exists() {
         let temp = tempdir().unwrap();
         let partial = temp.path().join("archive.bin.part");
         let contents = b"abcdefghijkl";
@@ -3241,16 +3275,20 @@ mod tests {
         let state = ChunkState::new(layout, records_for(contents, layout, &[0, 1, 2])).unwrap();
         write_chunk_state(&partial, &state).await.unwrap();
         let snapshot = chunk_state_path(&partial);
-        fs::create_dir(temp.path().join("archive.bin"))
-            .await
-            .unwrap();
+        let final_path = temp.path().join("archive.bin");
+        let existing = b"existing destination";
+        fs::write(&final_path, existing).await.unwrap();
         let receipt_dir = temp.path();
         let transfer_id = crate::protocol::TransferId::from_bytes([0xA5; 16]);
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
 
         let error = received.finalize(Some(receipt_dir)).await.unwrap_err();
-        assert!(matches!(error, ReceiverV03FinalizeError::Io(_)));
+        assert!(matches!(
+            error,
+            ReceiverV03FinalizeError::DestinationExists(path) if path == final_path
+        ));
+        assert_eq!(fs::read(&final_path).await.unwrap(), existing);
         assert!(partial.exists());
         assert_eq!(fs::read(&partial).await.unwrap(), contents);
         assert!(snapshot.exists());
@@ -3295,7 +3333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_with_conflicting_receipt_fails_before_rename() {
+    async fn finalize_with_conflicting_receipt_fails_before_promotion() {
         let temp = tempdir().unwrap();
         let partial = temp.path().join("archive.bin.part");
         let contents = b"abcdefghijkl";
@@ -3391,13 +3429,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_does_not_send_verified_when_rename_fails() {
+    async fn complete_does_not_send_verified_when_destination_exists() {
         let temp = tempdir().unwrap();
         let partial = temp.path().join("archive.bin.part");
         let contents = b"abcdefghijkl";
-        fs::create_dir(temp.path().join("archive.bin"))
-            .await
-            .unwrap();
+        let final_path = temp.path().join("archive.bin");
+        let existing = b"existing destination";
+        fs::write(&final_path, existing).await.unwrap();
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
 
@@ -3408,7 +3446,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            ReceiverV03CompleteError::Finalize(ReceiverV03FinalizeError::Io(_))
+            ReceiverV03CompleteError::Finalize(ReceiverV03FinalizeError::DestinationExists(path))
+                if path == final_path
         ));
         receiver_stream.shutdown().await.unwrap();
         let mut bytes = Vec::new();
@@ -3416,6 +3455,7 @@ mod tests {
         assert!(bytes.is_empty());
         assert!(partial.exists());
         assert_eq!(fs::read(&partial).await.unwrap(), contents);
+        assert_eq!(fs::read(&final_path).await.unwrap(), existing);
     }
 
     #[tokio::test]

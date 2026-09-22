@@ -598,7 +598,7 @@ while current post-release development uses:
 WFP/0.2
 ```
 
-An opt-in WFP/0.3 is also available via `--wfp-version=0.3`, adding chunk-aware resume (deterministic chunk layout, per-chunk BLAKE3 manifest, sparse chunk state). WFP/0.2 remains the default. Details live in `docs/ARCHITECTURE.md`.
+An opt-in WFP/0.3 is also available via `--wfp-version=0.3` or `--wfp-version 0.3`, adding chunk-aware resume (deterministic chunk layout, per-chunk BLAKE3 manifest, sparse chunk state). WFP/0.2 remains the default. Details live in `docs/ARCHITECTURE.md`.
 
 Every frame starts with a fixed 12-byte header:
 
@@ -848,7 +848,6 @@ Implemented:
 Still planned within the broader reliability and transfer-efficiency milestone:
 
 - BLAKE3 checkpoints;
-- non-contiguous missing-range recovery;
 - directory transfer design;
 - receipt lifecycle / garbage collection;
 - persistent sender job identity where useful;
@@ -859,7 +858,6 @@ Still planned within the broader reliability and transfer-efficiency milestone:
 Planned.
 
 - verified Linux support;
-- automated CI;
 - broader release automation;
 - installation workflow;
 - reproducible performance benchmarks;
@@ -874,11 +872,11 @@ WarpFile uses unit tests and end-to-end tests with real local TCP and UDP socket
 Current validated suite:
 
 ```text
-301 unit tests
-4 CLI tests in main.rs
-31 end-to-end tests
+304 unit tests
+5 CLI tests in main.rs
+32 end-to-end tests
 -------------------
-336 tests total
+341 tests total
 
 0 failures
 ```

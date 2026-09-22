@@ -1749,14 +1749,14 @@ WarpFile uses both unit and end-to-end tests.
 The currently validated suite contains:
 
 ```text
-301 unit tests
-4 CLI tests in main.rs
-31 end-to-end tests
+304 unit tests
+5 CLI tests in main.rs
+32 end-to-end tests
 -------------------
-336 tests total
+341 tests total
 ```
 
-All 336 were passing when this architecture state was documented.
+All 341 were passing when this architecture state was documented.
 
 Unit tests cover components such as:
 
@@ -2071,7 +2071,7 @@ Current limitations include:
 - reconciliation rehashes completed physical files;
 - one file per TCP transfer session;
 - no directory-transfer manifest;
-- prefix-only resume rather than an arbitrary missing-chunk map;
+- WFP/0.2 resume is prefix-only; WFP/0.3 provides a sparse verified-chunk inventory.
 - no partial content deduplication;
 - no receipt garbage-collection policy;
 - sequential rather than concurrent receiver sessions;
@@ -2121,8 +2121,6 @@ Potential work includes:
 - persistent sender job identity where useful;
 - receipt lifecycle and garbage collection;
 - hash checkpoints;
-- chunk hashes;
-- chunk manifests;
 - adaptive chunk sizing;
 - transfer pipelining;
 - selective compression;

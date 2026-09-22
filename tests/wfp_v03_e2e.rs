@@ -1,11 +1,74 @@
 use std::time::Duration;
 
 use tempfile::tempdir;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use warpfile::completion_receipt::decode_completion_receipt;
+use warpfile::protocol::frame::WFP_VERSION_V03;
+use warpfile::protocol::{
+    Frame, MessageType, ProtocolIoError, decode_offer_v03, read_frame_for_version, write_frame,
+};
 use warpfile::receiver_v03::run_receiver_v03;
 use warpfile::sender_v03::run_sender_v03;
+
+async fn proxy_v03_session(
+    listener: &TcpListener,
+    receiver_address: &str,
+    drop_verified: bool,
+) -> Vec<Frame> {
+    let (sender, _) = listener.accept().await.unwrap();
+    let receiver = TcpStream::connect(receiver_address).await.unwrap();
+    let (mut sender_read, mut sender_write) = sender.into_split();
+    let (mut receiver_read, mut receiver_write) = receiver.into_split();
+
+    let sender_to_receiver = tokio::spawn(async move {
+        let mut frames = Vec::new();
+
+        loop {
+            match read_frame_for_version(&mut sender_read, WFP_VERSION_V03).await {
+                Ok(frame) => {
+                    write_frame(&mut receiver_write, &frame).await.unwrap();
+                    frames.push(frame);
+                }
+                Err(ProtocolIoError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("sender-to-receiver proxy failed: {error}"),
+            }
+        }
+
+        frames
+    });
+
+    loop {
+        let frame = read_frame_for_version(&mut receiver_read, WFP_VERSION_V03)
+            .await
+            .unwrap();
+        let verified = frame.message_type == MessageType::Verified;
+
+        if !verified || !drop_verified {
+            write_frame(&mut sender_write, &frame).await.unwrap();
+        }
+
+        if verified {
+            break;
+        }
+    }
+
+    drop(sender_write);
+
+    tokio::time::timeout(Duration::from_secs(2), sender_to_receiver)
+        .await
+        .unwrap()
+        .unwrap()
+}
 
 #[tokio::test]
 async fn wfp_v03_transfers_a_small_file_end_to_end() {
@@ -195,5 +258,83 @@ async fn wfp_v03_resumes_from_preseeded_partial() {
     assert!(
         matched_receipt,
         "a completion receipt for payload.bin must be persisted"
+    );
+}
+
+#[tokio::test]
+async fn wfp_v03_reconciles_after_the_first_verified_is_lost() {
+    let temp = tempdir().unwrap();
+    let source_path = temp.path().join("payload.bin");
+    let dest_dir = temp.path().join("dest");
+    let contents: Vec<u8> = (0..4096u32).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&source_path, &contents).unwrap();
+
+    let receiver_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let receiver_address = receiver_probe.local_addr().unwrap().to_string();
+    drop(receiver_probe);
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap().to_string();
+
+    let receiver_dest = dest_dir.clone();
+    let receiver_bind = receiver_address.clone();
+    let receiver = tokio::spawn(async move {
+        let _ = run_receiver_v03(&receiver_bind, &receiver_dest).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let proxied_receiver = receiver_address.clone();
+    let proxy_task = tokio::spawn(async move {
+        let first = proxy_v03_session(&proxy, &proxied_receiver, true).await;
+        let second = proxy_v03_session(&proxy, &proxied_receiver, false).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), proxy.accept())
+                .await
+                .is_err(),
+            "sender opened an unexpected third session"
+        );
+
+        [first, second]
+    });
+
+    let sender_result = run_sender_v03(&source_path, &proxy_address).await;
+    let [first, second] = proxy_task.await.unwrap();
+
+    receiver.abort();
+    let _ = receiver.await;
+
+    sender_result.unwrap();
+    assert_eq!(
+        std::fs::read(dest_dir.join("payload.bin")).unwrap(),
+        contents
+    );
+
+    let first_offer = first
+        .iter()
+        .find(|frame| frame.message_type == MessageType::Offer)
+        .map(|frame| decode_offer_v03(&frame.payload).unwrap())
+        .unwrap();
+    let second_offer = second
+        .iter()
+        .find(|frame| frame.message_type == MessageType::Offer)
+        .map(|frame| decode_offer_v03(&frame.payload).unwrap())
+        .unwrap();
+
+    assert_eq!(first_offer.transfer_id, second_offer.transfer_id);
+    assert!(
+        first
+            .iter()
+            .any(|frame| frame.message_type == MessageType::Data),
+        "first session must transfer file data"
+    );
+    assert_eq!(
+        second
+            .iter()
+            .map(|frame| frame.message_type)
+            .collect::<Vec<_>>(),
+        vec![MessageType::Hello, MessageType::Offer],
+        "reconciled session must stop after OFFER"
     );
 }

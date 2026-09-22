@@ -457,6 +457,18 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let resume_frame = read_frame_for_version(stream, WFP_VERSION_V03).await?;
+
+    receive_inventory_and_accept_after_resume(stream, layout, resume_frame).await
+}
+
+async fn receive_inventory_and_accept_after_resume<S>(
+    stream: &mut S,
+    layout: ChunkLayout,
+    resume_frame: Frame,
+) -> Result<ReceiverInventoryV03, SenderV03NegotiationError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if resume_frame.message_type != MessageType::Resume {
         return Err(SenderV03NegotiationError::UnexpectedMessageType(
             resume_frame.message_type,
@@ -919,7 +931,21 @@ where
     write_frame(&mut stream, &offer_frame).await?;
 
     let layout = ChunkLayout::new(file_size, chunk_size.get()).expect("chunk size is non-zero");
-    let inventory = receive_inventory_and_accept(&mut stream, layout).await?;
+    let offer_response = read_frame_for_version(&mut stream, WFP_VERSION_V03).await?;
+    if offer_response.message_type == MessageType::Verified {
+        if !offer_response.payload.is_empty() {
+            return Err(SenderV03TransferError::InvalidVerifiedPayload(
+                offer_response.payload.len(),
+            )
+            .into());
+        }
+
+        println!("VERIFIED received; transfer complete");
+
+        return Ok(());
+    }
+    let inventory =
+        receive_inventory_and_accept_after_resume(&mut stream, layout, offer_response).await?;
 
     let verified = inventory.records.len();
     let total = inventory.layout.chunk_count() as usize;
@@ -2290,6 +2316,61 @@ mod tests {
         );
 
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_rejects_non_empty_verified_directly_after_offer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archive.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let (sender, mut peer) = duplex(1024);
+
+        let peer_task = async {
+            let hello = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(hello.message_type, MessageType::Hello);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(
+                    WFP_VERSION_V03,
+                    MessageType::HelloAck,
+                    vec![WFP_VERSION_V03],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let offer = read_frame_for_version(&mut peer, WFP_VERSION_V03)
+                .await
+                .unwrap();
+            assert_eq!(offer.message_type, MessageType::Offer);
+            write_frame(
+                &mut peer,
+                &Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, vec![0xA5])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        };
+
+        let (result, ()) = tokio::join!(
+            send_session_v03_with_stream(
+                &path,
+                sender,
+                TransferId::from_bytes([0; 16]),
+                NonZeroU64::new(4).unwrap(),
+            ),
+            peer_task
+        );
+
+        assert!(matches!(
+            result,
+            Err(SenderV03SessionError::Transfer(
+                SenderV03TransferError::InvalidVerifiedPayload(1)
+            ))
+        ));
     }
 
     #[tokio::test]

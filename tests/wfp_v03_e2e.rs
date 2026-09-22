@@ -3,10 +3,12 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::net::{TcpListener, TcpStream};
 
+use warpfile::chunk_state::decode_chunk_state;
 use warpfile::completion_receipt::decode_completion_receipt;
 use warpfile::protocol::frame::WFP_VERSION_V03;
 use warpfile::protocol::{
-    Frame, MessageType, ProtocolIoError, decode_offer_v03, read_frame_for_version, write_frame,
+    Frame, MessageType, ProtocolIoError, decode_chunk_start_v03, decode_data_v03, decode_offer_v03,
+    read_frame_for_version, write_frame,
 };
 use warpfile::receiver_v03::run_receiver_v03;
 use warpfile::sender_v03::run_sender_v03;
@@ -20,7 +22,6 @@ async fn proxy_v03_session(
     let receiver = TcpStream::connect(receiver_address).await.unwrap();
     let (mut sender_read, mut sender_write) = sender.into_split();
     let (mut receiver_read, mut receiver_write) = receiver.into_split();
-
     let sender_to_receiver = tokio::spawn(async move {
         let mut frames = Vec::new();
 
@@ -68,6 +69,92 @@ async fn proxy_v03_session(
         .await
         .unwrap()
         .unwrap()
+}
+
+async fn proxy_v03_drop_after_chunk_persisted(
+    listener: &TcpListener,
+    receiver_address: &str,
+    chunk_state_path: &std::path::Path,
+) -> Vec<Frame> {
+    let (sender, _) = listener.accept().await.unwrap();
+    let receiver = TcpStream::connect(receiver_address).await.unwrap();
+    let (mut sender_read, mut sender_write) = sender.into_split();
+    let (mut receiver_read, mut receiver_write) = receiver.into_split();
+    let chunk_state_path = chunk_state_path.to_path_buf();
+
+    let sender_to_receiver = tokio::spawn(async move {
+        let mut frames = Vec::new();
+        let mut first_chunk_data_seen = false;
+        loop {
+            match read_frame_for_version(&mut sender_read, WFP_VERSION_V03).await {
+                Ok(frame) => {
+                    let completes_first_chunk = frame.message_type == MessageType::Data
+                        && decode_data_v03(&frame.payload).is_ok_and(|data| {
+                            data.absolute_offset + data.data.len() as u64 == 1024 * 1024
+                        });
+                    write_frame(&mut receiver_write, &frame).await.unwrap();
+                    frames.push(frame);
+
+                    if completes_first_chunk {
+                        first_chunk_data_seen = true;
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                if let Ok(bytes) = tokio::fs::read(&chunk_state_path).await
+                                    && let Ok(state) = decode_chunk_state(&bytes)
+                                    && state.hash(0).is_some()
+                                {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("receiver did not persist chunk 0 after its complete DATA frame");
+                        break;
+                    }
+                }
+                Err(ProtocolIoError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("sender-to-receiver proxy failed: {error}"),
+            }
+        }
+        drop(receiver_write);
+        (frames, first_chunk_data_seen)
+    });
+
+    loop {
+        match read_frame_for_version(&mut receiver_read, WFP_VERSION_V03).await {
+            Ok(frame) => {
+                write_frame(&mut sender_write, &frame).await.unwrap();
+                if frame.message_type == MessageType::Verified {
+                    panic!("first session unexpectedly completed before interruption");
+                }
+            }
+            Err(ProtocolIoError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("receiver-to-sender proxy failed: {error}"),
+        }
+    }
+    drop(sender_write);
+    let (frames, first_chunk_data_seen) = sender_to_receiver.await.unwrap();
+    assert!(first_chunk_data_seen, "first chunk DATA was not forwarded");
+    frames
 }
 
 #[tokio::test]
@@ -571,5 +658,98 @@ async fn wfp_v03_reconciles_after_the_first_verified_is_lost() {
             .collect::<Vec<_>>(),
         vec![MessageType::Hello, MessageType::Offer],
         "reconciled session must stop after OFFER"
+    );
+}
+
+#[tokio::test]
+async fn wfp_v03_retries_after_a_persisted_chunk_without_retransmitting_it() {
+    let temp = tempdir().unwrap();
+    let source_path = temp.path().join("payload.bin");
+    let dest_dir = temp.path().join("dest");
+    let contents: Vec<u8> = (0..4 * 1024 * 1024u32).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&source_path, &contents).unwrap();
+
+    let receiver_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let receiver_address = receiver_probe.local_addr().unwrap().to_string();
+    drop(receiver_probe);
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap().to_string();
+    let partial = dest_dir.join("payload.bin.part");
+    let chunk_state_path = dest_dir.join("payload.bin.part.warpchunks");
+
+    let receiver_dest = dest_dir.clone();
+    let receiver_bind = receiver_address.clone();
+    let receiver = tokio::spawn(async move {
+        let _ = run_receiver_v03(&receiver_bind, &receiver_dest).await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let proxied_receiver = receiver_address.clone();
+    let proxy_task = tokio::spawn(async move {
+        let first =
+            proxy_v03_drop_after_chunk_persisted(&proxy, &proxied_receiver, &chunk_state_path)
+                .await;
+        assert!(
+            chunk_state_path.exists(),
+            "snapshot must exist after interruption"
+        );
+        let second = proxy_v03_session(&proxy, &proxied_receiver, false).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), proxy.accept())
+                .await
+                .is_err(),
+            "sender opened an unexpected third session"
+        );
+        [first, second]
+    });
+
+    let sender_result = run_sender_v03(&source_path, &proxy_address).await;
+    let [first, second] = proxy_task.await.unwrap();
+    receiver.abort();
+    let _ = receiver.await;
+    sender_result.unwrap();
+
+    let chunk_starts = |frames: &[Frame]| {
+        frames
+            .iter()
+            .filter(|frame| frame.message_type == MessageType::ChunkStart)
+            .map(|frame| decode_chunk_start_v03(&frame.payload).unwrap().chunk_index)
+            .collect::<Vec<_>>()
+    };
+    let useful_data_bytes = |frames: &[Frame]| {
+        frames
+            .iter()
+            .filter(|frame| frame.message_type == MessageType::Data)
+            .map(|frame| decode_data_v03(&frame.payload).unwrap().data.len())
+            .sum::<usize>()
+    };
+    let offer_id = |frames: &[Frame]| {
+        frames
+            .iter()
+            .find(|frame| frame.message_type == MessageType::Offer)
+            .map(|frame| decode_offer_v03(&frame.payload).unwrap().transfer_id)
+            .unwrap()
+    };
+
+    assert_eq!(chunk_starts(&first), vec![0]);
+    assert_eq!(chunk_starts(&second), vec![1, 2, 3]);
+    assert_eq!(useful_data_bytes(&first), 1024 * 1024);
+    assert_eq!(useful_data_bytes(&second), 3 * 1024 * 1024);
+    assert_eq!(offer_id(&first), offer_id(&second));
+    assert!(
+        second
+            .iter()
+            .any(|frame| frame.message_type == MessageType::Complete),
+        "second session must send COMPLETE before run_sender_v03 returns success"
+    );
+
+    assert_eq!(
+        std::fs::read(dest_dir.join("payload.bin")).unwrap(),
+        contents
+    );
+    assert!(!partial.exists(), ".part must be removed after finalize");
+    assert!(
+        !dest_dir.join("payload.bin.part.warpchunks").exists(),
+        ".warpchunks must be removed after finalize"
     );
 }

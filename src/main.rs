@@ -67,24 +67,37 @@ fn version_flag_value(arguments: &[String]) -> Result<WfpVersionChoice, String> 
     Ok(WfpVersionChoice::V02)
 }
 
+fn positional_arguments(arguments: &[String]) -> Vec<&str> {
+    let mut remaining = arguments[2..].iter();
+    let mut positional = Vec::new();
+
+    while let Some(argument) = remaining.next() {
+        if argument.as_str() == VERSION_FLAG {
+            remaining.next();
+        } else if !argument.starts_with("--") {
+            positional.push(argument.as_str());
+        }
+    }
+
+    positional
+}
+
 fn parse_arguments(arguments: &[String]) -> Result<Command, String> {
     let Some(command) = arguments.get(1) else {
         return Err("missing command".to_string());
     };
 
-    let positional: Vec<&str> = arguments[2..]
-        .iter()
-        .filter(|argument| !argument.starts_with("--"))
-        .map(|argument| argument.as_str())
-        .collect();
+    let positional = positional_arguments(arguments);
 
     match command.as_str() {
         "receive" => {
+            let version = version_flag_value(arguments)?;
+
             if !positional.is_empty() {
                 return Err("receive does not accept positional arguments".to_string());
             }
 
-            Ok(Command::Receive(version_flag_value(arguments)?))
+            Ok(Command::Receive(version))
         }
 
         "discover" => {
@@ -100,6 +113,8 @@ fn parse_arguments(arguments: &[String]) -> Result<Command, String> {
         }
 
         "send" => {
+            let version = version_flag_value(arguments)?;
+
             if positional.len() != 2 {
                 return Err("send requires <file> and <destination>".to_string());
             }
@@ -107,7 +122,7 @@ fn parse_arguments(arguments: &[String]) -> Result<Command, String> {
             Ok(Command::Send {
                 file: positional[0].to_string(),
                 destination: positional[1].to_string(),
-                version: version_flag_value(arguments)?,
+                version,
             })
         }
 
@@ -273,6 +288,27 @@ mod tests {
                 version: WfpVersionChoice::V03,
             }
         );
+
+        assert_eq!(
+            parse_arguments(&args(&["receive", "--wfp-version", "0.3"])).unwrap(),
+            Command::Receive(WfpVersionChoice::V03)
+        );
+
+        assert_eq!(
+            parse_arguments(&args(&[
+                "send",
+                "file.bin",
+                "127.0.0.1:42069",
+                "--wfp-version",
+                "0.3"
+            ]))
+            .unwrap(),
+            Command::Send {
+                file: "file.bin".to_string(),
+                destination: "127.0.0.1:42069".to_string(),
+                version: WfpVersionChoice::V03,
+            }
+        );
     }
 
     #[test]
@@ -280,6 +316,17 @@ mod tests {
         let error = parse_arguments(&args(&["receive", "--wfp-version=1.0"])).unwrap_err();
 
         assert!(error.contains("unsupported WFP version"));
+
+        let error = parse_arguments(&args(&["receive", "--wfp-version", "1.0"])).unwrap_err();
+
+        assert!(error.contains("unsupported WFP version"));
+    }
+
+    #[test]
+    fn rejects_wfp_version_without_value() {
+        let error = parse_arguments(&args(&["receive", "--wfp-version"])).unwrap_err();
+
+        assert_eq!(error, "missing value for --wfp-version");
     }
 
     #[test]

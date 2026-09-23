@@ -814,7 +814,15 @@ async fn receive_file_data(
     let mut progress = ProgressTracker::new("Receiving", remaining_size);
 
     let sender_hash = loop {
-        let frame = read_frame(stream).await?;
+        let frame = match read_frame(stream).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                if should_preserve_partial(&error) {
+                    output.flush().await?;
+                }
+                return Err(error.into());
+            }
+        };
 
         match frame.message_type {
             MessageType::Data => {

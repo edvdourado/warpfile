@@ -32,6 +32,10 @@ struct RunResult {
     elapsed_ms: f64,
     effective_throughput_mib_s: f64,
     benchmark_process_cpu_time_ms: f64,
+    #[cfg(target_os = "linux")]
+    benchmark_process_linux_rchar_delta_bytes: u64,
+    #[cfg(target_os = "linux")]
+    benchmark_process_linux_wchar_delta_bytes: u64,
     #[cfg(windows)]
     benchmark_process_windows_read_transfer_delta_bytes: u64,
     #[cfg(windows)]
@@ -56,6 +60,60 @@ fn windows_process_io_snapshot() -> WindowsProcessIoSnapshot {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LinuxProcessIoSnapshot {
+    rchar: u64,
+    wchar: u64,
+}
+
+fn parse_linux_process_io(contents: &str) -> Result<LinuxProcessIoSnapshot, String> {
+    let mut rchar = None;
+    let mut wchar = None;
+    for line in contents.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name {
+            "rchar" => {
+                rchar = Some(
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid rchar value: {error}"))?,
+                )
+            }
+            "wchar" => {
+                wchar = Some(
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid wchar value: {error}"))?,
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok(LinuxProcessIoSnapshot {
+        rchar: rchar.ok_or_else(|| "missing rchar field".to_owned())?,
+        wchar: wchar.ok_or_else(|| "missing wchar field".to_owned())?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_io_snapshot() -> LinuxProcessIoSnapshot {
+    let contents = std::fs::read_to_string("/proc/self/io").expect("failed to read /proc/self/io");
+    parse_linux_process_io(&contents).expect("failed to parse /proc/self/io")
+}
+
+#[test]
+fn parses_linux_process_io_fields_by_name() {
+    let snapshot =
+        parse_linux_process_io("syscr: 10\nwchar: 42\nread_bytes: 99\nrchar: 24\nsyscw: 7\n")
+            .unwrap();
+    assert_eq!(snapshot.rchar, 24);
+    assert_eq!(snapshot.wchar, 42);
+}
+
 fn print_run(scenario: &str, run: usize, result: &RunResult) {
     let record = serde_json::json!({
         "wfp_version": format!("0.{}", WFP_VERSION_V03),
@@ -70,6 +128,15 @@ fn print_run(scenario: &str, run: usize, result: &RunResult) {
         "benchmark_process_cpu_time_ms": result.benchmark_process_cpu_time_ms,
         "run": run,
     });
+    #[cfg(target_os = "linux")]
+    let record = {
+        let mut record = record;
+        record["benchmark_process_linux_rchar_delta_bytes"] =
+            result.benchmark_process_linux_rchar_delta_bytes.into();
+        record["benchmark_process_linux_wchar_delta_bytes"] =
+            result.benchmark_process_linux_wchar_delta_bytes.into();
+        record
+    };
     #[cfg(windows)]
     let record = {
         let mut record = record;
@@ -104,6 +171,25 @@ fn print_summary(scenario: &str, results: &[RunResult]) {
         "median_effective_throughput_mib_s": FILE_SIZE_BYTES as f64 / MIB / (median_elapsed_ms / 1000.0),
         "median_benchmark_process_cpu_time_ms": median_benchmark_process_cpu_time_ms,
     });
+    #[cfg(target_os = "linux")]
+    let summary = {
+        let mut summary = summary;
+        let mut process_rchar: Vec<u64> = results
+            .iter()
+            .map(|result| result.benchmark_process_linux_rchar_delta_bytes)
+            .collect();
+        process_rchar.sort_unstable();
+        let mut process_wchar: Vec<u64> = results
+            .iter()
+            .map(|result| result.benchmark_process_linux_wchar_delta_bytes)
+            .collect();
+        process_wchar.sort_unstable();
+        summary["median_benchmark_process_linux_rchar_delta_bytes"] =
+            process_rchar[RUN_COUNT / 2].into();
+        summary["median_benchmark_process_linux_wchar_delta_bytes"] =
+            process_wchar[RUN_COUNT / 2].into();
+        summary
+    };
     #[cfg(windows)]
     let summary = {
         let mut summary = summary;
@@ -149,6 +235,8 @@ async fn run_fresh_once() -> RunResult {
     let proxy_task =
         tokio::spawn(async move { proxy_v03_session(&proxy, &receiver_address, false).await });
 
+    #[cfg(target_os = "linux")]
+    let io_before = linux_process_io_snapshot();
     #[cfg(windows)]
     let io_before = windows_process_io_snapshot();
     let process_started = ProcessTime::now();
@@ -164,6 +252,8 @@ async fn run_fresh_once() -> RunResult {
     let elapsed = started.elapsed();
     let benchmark_process_cpu_time = process_started.elapsed();
     let frames = proxy_task.await.unwrap();
+    #[cfg(target_os = "linux")]
+    let io_after = linux_process_io_snapshot();
     #[cfg(windows)]
     let io_after = windows_process_io_snapshot();
     receiver.abort();
@@ -197,6 +287,16 @@ async fn run_fresh_once() -> RunResult {
         elapsed_ms,
         effective_throughput_mib_s,
         benchmark_process_cpu_time_ms: benchmark_process_cpu_time.as_secs_f64() * 1000.0,
+        #[cfg(target_os = "linux")]
+        benchmark_process_linux_rchar_delta_bytes: io_after
+            .rchar
+            .checked_sub(io_before.rchar)
+            .expect("process rchar counter decreased during benchmark"),
+        #[cfg(target_os = "linux")]
+        benchmark_process_linux_wchar_delta_bytes: io_after
+            .wchar
+            .checked_sub(io_before.wchar)
+            .expect("process wchar counter decreased during benchmark"),
         #[cfg(windows)]
         benchmark_process_windows_read_transfer_delta_bytes: io_after
             .read_transfer_count
@@ -274,6 +374,8 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     let proxy_task =
         tokio::spawn(async move { proxy_v03_session(&proxy, &receiver_address, false).await });
 
+    #[cfg(target_os = "linux")]
+    let io_before = linux_process_io_snapshot();
     #[cfg(windows)]
     let io_before = windows_process_io_snapshot();
     let process_started = ProcessTime::now();
@@ -289,6 +391,8 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     let elapsed = started.elapsed();
     let benchmark_process_cpu_time = process_started.elapsed();
     let frames = proxy_task.await.unwrap();
+    #[cfg(target_os = "linux")]
+    let io_after = linux_process_io_snapshot();
     #[cfg(windows)]
     let io_after = windows_process_io_snapshot();
     receiver.abort();
@@ -339,6 +443,16 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
         elapsed_ms,
         effective_throughput_mib_s,
         benchmark_process_cpu_time_ms: benchmark_process_cpu_time.as_secs_f64() * 1000.0,
+        #[cfg(target_os = "linux")]
+        benchmark_process_linux_rchar_delta_bytes: io_after
+            .rchar
+            .checked_sub(io_before.rchar)
+            .expect("process rchar counter decreased during benchmark"),
+        #[cfg(target_os = "linux")]
+        benchmark_process_linux_wchar_delta_bytes: io_after
+            .wchar
+            .checked_sub(io_before.wchar)
+            .expect("process wchar counter decreased during benchmark"),
         #[cfg(windows)]
         benchmark_process_windows_read_transfer_delta_bytes: io_after
             .read_transfer_count

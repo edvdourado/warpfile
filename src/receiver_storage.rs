@@ -1,6 +1,8 @@
 //! Receiver filesystem operations anchored to real directory handles.
 
-use std::fs::{self, File, Metadata};
+#[cfg(windows)]
+use std::fs;
+use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -144,8 +146,8 @@ mod linux {
         }
     }
 
-    pub(super) fn open(dir: &Directory, name: &Path, flags: i32) -> io::Result<File> {
-        let name = name(name)?;
+    pub(super) fn open(dir: &Directory, path: &Path, flags: i32) -> io::Result<File> {
+        let name = name(path)?;
         // SAFETY: the directory descriptor and NUL-terminated name stay live for this call.
         opened(unsafe {
             openat(
@@ -183,7 +185,7 @@ mod linux {
 
     pub(super) fn file(
         dir: &Directory,
-        name: &Path,
+        path: &Path,
         read: bool,
         write: bool,
         append: bool,
@@ -202,15 +204,15 @@ mod linux {
         if create_new {
             flags |= O_CREAT | O_EXCL;
         }
-        open(dir, name, flags)
+        open(dir, path, flags)
     }
 
-    pub(super) fn entry(dir: &Directory, name: &Path) -> io::Result<File> {
-        open(dir, name, O_PATH)
+    pub(super) fn entry(dir: &Directory, path: &Path) -> io::Result<File> {
+        open(dir, path, O_PATH)
     }
 
-    pub(super) fn remove(dir: &Directory, name: &Path) -> io::Result<()> {
-        let name = name(name)?;
+    pub(super) fn remove(dir: &Directory, path: &Path) -> io::Result<()> {
+        let name = name(path)?;
         // SAFETY: pointers and parent descriptor stay live for the call.
         if unsafe { unlinkat(dir.0.as_raw_fd(), name.as_ptr(), 0) } == 0 {
             Ok(())

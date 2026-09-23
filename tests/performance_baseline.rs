@@ -105,6 +105,12 @@ fn linux_process_io_snapshot() -> LinuxProcessIoSnapshot {
     parse_linux_process_io(&contents).expect("failed to parse /proc/self/io")
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn reads_linux_process_io_snapshot() {
+    let _snapshot = linux_process_io_snapshot();
+}
+
 #[test]
 fn parses_linux_process_io_fields_by_name() {
     let snapshot =

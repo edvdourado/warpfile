@@ -6,6 +6,7 @@ use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use common::proxy_v03_session;
+use cpu_time::ProcessTime;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use warpfile::chunk::ChunkLayout;
@@ -28,6 +29,7 @@ struct RunResult {
     protocol_bytes_sender_to_receiver: u64,
     elapsed_ms: f64,
     effective_throughput_mib_s: f64,
+    benchmark_process_cpu_time_ms: f64,
 }
 
 fn print_run(scenario: &str, run: usize, result: &RunResult) {
@@ -43,6 +45,7 @@ fn print_run(scenario: &str, run: usize, result: &RunResult) {
             "protocol_bytes_sender_to_receiver": result.protocol_bytes_sender_to_receiver,
             "elapsed_ms": result.elapsed_ms,
             "effective_throughput_mib_s": result.effective_throughput_mib_s,
+            "benchmark_process_cpu_time_ms": result.benchmark_process_cpu_time_ms,
             "run": run,
         })
     );
@@ -52,6 +55,12 @@ fn print_summary(scenario: &str, results: &[RunResult]) {
     let mut elapsed: Vec<f64> = results.iter().map(|result| result.elapsed_ms).collect();
     elapsed.sort_by(f64::total_cmp);
     let median_elapsed_ms = elapsed[RUN_COUNT / 2];
+    let mut process_cpu: Vec<f64> = results
+        .iter()
+        .map(|result| result.benchmark_process_cpu_time_ms)
+        .collect();
+    process_cpu.sort_by(f64::total_cmp);
+    let median_benchmark_process_cpu_time_ms = process_cpu[RUN_COUNT / 2];
     println!(
         "{}",
         serde_json::json!({
@@ -62,6 +71,7 @@ fn print_summary(scenario: &str, results: &[RunResult]) {
             "chunk_size_bytes": V03_DEFAULT_CHUNK_SIZE,
             "median_elapsed_ms": median_elapsed_ms,
             "median_effective_throughput_mib_s": FILE_SIZE_BYTES as f64 / MIB / (median_elapsed_ms / 1000.0),
+            "median_benchmark_process_cpu_time_ms": median_benchmark_process_cpu_time_ms,
         })
     );
 }
@@ -89,6 +99,7 @@ async fn run_fresh_once() -> RunResult {
     let proxy_task =
         tokio::spawn(async move { proxy_v03_session(&proxy, &receiver_address, false).await });
 
+    let process_started = ProcessTime::now();
     let started = Instant::now();
     send_session_v03(
         &source_path,
@@ -99,6 +110,7 @@ async fn run_fresh_once() -> RunResult {
     .await
     .unwrap();
     let elapsed = started.elapsed();
+    let benchmark_process_cpu_time = process_started.elapsed();
     let frames = proxy_task.await.unwrap();
     receiver.abort();
     let _ = receiver.await;
@@ -130,6 +142,7 @@ async fn run_fresh_once() -> RunResult {
         protocol_bytes_sender_to_receiver,
         elapsed_ms,
         effective_throughput_mib_s,
+        benchmark_process_cpu_time_ms: benchmark_process_cpu_time.as_secs_f64() * 1000.0,
     }
 }
 
@@ -197,6 +210,7 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     let proxy_task =
         tokio::spawn(async move { proxy_v03_session(&proxy, &receiver_address, false).await });
 
+    let process_started = ProcessTime::now();
     let started = Instant::now();
     send_session_v03(
         &source_path,
@@ -207,6 +221,7 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     .await
     .unwrap();
     let elapsed = started.elapsed();
+    let benchmark_process_cpu_time = process_started.elapsed();
     let frames = proxy_task.await.unwrap();
     receiver.abort();
     let _ = receiver.await;
@@ -255,6 +270,7 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
         protocol_bytes_sender_to_receiver,
         elapsed_ms,
         effective_throughput_mib_s,
+        benchmark_process_cpu_time_ms: benchmark_process_cpu_time.as_secs_f64() * 1000.0,
     }
 }
 

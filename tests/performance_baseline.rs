@@ -18,6 +18,8 @@ use warpfile::protocol::{
 };
 use warpfile::receiver_v03::run_receiver_v03;
 use warpfile::sender_v03::{V03_DEFAULT_CHUNK_SIZE, send_session_v03};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessIoCounters, IO_COUNTERS};
 
 const FILE_SIZE_BYTES: usize = 32 * 1024 * 1024;
 const RUN_COUNT: usize = 5;
@@ -30,25 +32,56 @@ struct RunResult {
     elapsed_ms: f64,
     effective_throughput_mib_s: f64,
     benchmark_process_cpu_time_ms: f64,
+    #[cfg(windows)]
+    benchmark_process_windows_read_transfer_delta_bytes: u64,
+    #[cfg(windows)]
+    benchmark_process_windows_write_transfer_delta_bytes: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct WindowsProcessIoSnapshot {
+    read_transfer_count: u64,
+    write_transfer_count: u64,
+}
+
+#[cfg(windows)]
+fn windows_process_io_snapshot() -> WindowsProcessIoSnapshot {
+    let mut counters = IO_COUNTERS::default();
+    let succeeded = unsafe { GetProcessIoCounters(GetCurrentProcess(), &mut counters) };
+    assert_ne!(succeeded, 0, "GetProcessIoCounters failed");
+    WindowsProcessIoSnapshot {
+        read_transfer_count: counters.ReadTransferCount,
+        write_transfer_count: counters.WriteTransferCount,
+    }
 }
 
 fn print_run(scenario: &str, run: usize, result: &RunResult) {
-    println!(
-        "{}",
-        serde_json::json!({
-            "wfp_version": format!("0.{}", WFP_VERSION_V03),
-            "scenario": scenario,
-            "file_size_bytes": FILE_SIZE_BYTES as u64,
-            "chunk_size_bytes": V03_DEFAULT_CHUNK_SIZE,
-            "reused_bytes": result.reused_bytes,
-            "useful_data_bytes": result.useful_data_bytes,
-            "protocol_bytes_sender_to_receiver": result.protocol_bytes_sender_to_receiver,
-            "elapsed_ms": result.elapsed_ms,
-            "effective_throughput_mib_s": result.effective_throughput_mib_s,
-            "benchmark_process_cpu_time_ms": result.benchmark_process_cpu_time_ms,
-            "run": run,
-        })
-    );
+    let record = serde_json::json!({
+        "wfp_version": format!("0.{}", WFP_VERSION_V03),
+        "scenario": scenario,
+        "file_size_bytes": FILE_SIZE_BYTES as u64,
+        "chunk_size_bytes": V03_DEFAULT_CHUNK_SIZE,
+        "reused_bytes": result.reused_bytes,
+        "useful_data_bytes": result.useful_data_bytes,
+        "protocol_bytes_sender_to_receiver": result.protocol_bytes_sender_to_receiver,
+        "elapsed_ms": result.elapsed_ms,
+        "effective_throughput_mib_s": result.effective_throughput_mib_s,
+        "benchmark_process_cpu_time_ms": result.benchmark_process_cpu_time_ms,
+        "run": run,
+    });
+    #[cfg(windows)]
+    let record = {
+        let mut record = record;
+        record["benchmark_process_windows_read_transfer_delta_bytes"] = result
+            .benchmark_process_windows_read_transfer_delta_bytes
+            .into();
+        record["benchmark_process_windows_write_transfer_delta_bytes"] = result
+            .benchmark_process_windows_write_transfer_delta_bytes
+            .into();
+        record
+    };
+    println!("{record}");
 }
 
 fn print_summary(scenario: &str, results: &[RunResult]) {
@@ -61,19 +94,36 @@ fn print_summary(scenario: &str, results: &[RunResult]) {
         .collect();
     process_cpu.sort_by(f64::total_cmp);
     let median_benchmark_process_cpu_time_ms = process_cpu[RUN_COUNT / 2];
-    println!(
-        "{}",
-        serde_json::json!({
-            "record_type": "summary",
-            "scenario": scenario,
-            "run_count": RUN_COUNT,
-            "file_size_bytes": FILE_SIZE_BYTES as u64,
-            "chunk_size_bytes": V03_DEFAULT_CHUNK_SIZE,
-            "median_elapsed_ms": median_elapsed_ms,
-            "median_effective_throughput_mib_s": FILE_SIZE_BYTES as f64 / MIB / (median_elapsed_ms / 1000.0),
-            "median_benchmark_process_cpu_time_ms": median_benchmark_process_cpu_time_ms,
-        })
-    );
+    let summary = serde_json::json!({
+        "record_type": "summary",
+        "scenario": scenario,
+        "run_count": RUN_COUNT,
+        "file_size_bytes": FILE_SIZE_BYTES as u64,
+        "chunk_size_bytes": V03_DEFAULT_CHUNK_SIZE,
+        "median_elapsed_ms": median_elapsed_ms,
+        "median_effective_throughput_mib_s": FILE_SIZE_BYTES as f64 / MIB / (median_elapsed_ms / 1000.0),
+        "median_benchmark_process_cpu_time_ms": median_benchmark_process_cpu_time_ms,
+    });
+    #[cfg(windows)]
+    let summary = {
+        let mut summary = summary;
+        let mut process_read: Vec<u64> = results
+            .iter()
+            .map(|result| result.benchmark_process_windows_read_transfer_delta_bytes)
+            .collect();
+        process_read.sort_unstable();
+        let mut process_write: Vec<u64> = results
+            .iter()
+            .map(|result| result.benchmark_process_windows_write_transfer_delta_bytes)
+            .collect();
+        process_write.sort_unstable();
+        summary["median_benchmark_process_windows_read_transfer_delta_bytes"] =
+            process_read[RUN_COUNT / 2].into();
+        summary["median_benchmark_process_windows_write_transfer_delta_bytes"] =
+            process_write[RUN_COUNT / 2].into();
+        summary
+    };
+    println!("{summary}");
 }
 
 async fn run_fresh_once() -> RunResult {
@@ -99,6 +149,8 @@ async fn run_fresh_once() -> RunResult {
     let proxy_task =
         tokio::spawn(async move { proxy_v03_session(&proxy, &receiver_address, false).await });
 
+    #[cfg(windows)]
+    let io_before = windows_process_io_snapshot();
     let process_started = ProcessTime::now();
     let started = Instant::now();
     send_session_v03(
@@ -112,6 +164,8 @@ async fn run_fresh_once() -> RunResult {
     let elapsed = started.elapsed();
     let benchmark_process_cpu_time = process_started.elapsed();
     let frames = proxy_task.await.unwrap();
+    #[cfg(windows)]
+    let io_after = windows_process_io_snapshot();
     receiver.abort();
     let _ = receiver.await;
 
@@ -143,6 +197,16 @@ async fn run_fresh_once() -> RunResult {
         elapsed_ms,
         effective_throughput_mib_s,
         benchmark_process_cpu_time_ms: benchmark_process_cpu_time.as_secs_f64() * 1000.0,
+        #[cfg(windows)]
+        benchmark_process_windows_read_transfer_delta_bytes: io_after
+            .read_transfer_count
+            .checked_sub(io_before.read_transfer_count)
+            .expect("process read transfer counter decreased during benchmark"),
+        #[cfg(windows)]
+        benchmark_process_windows_write_transfer_delta_bytes: io_after
+            .write_transfer_count
+            .checked_sub(io_before.write_transfer_count)
+            .expect("process write transfer counter decreased during benchmark"),
     }
 }
 
@@ -210,6 +274,8 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     let proxy_task =
         tokio::spawn(async move { proxy_v03_session(&proxy, &receiver_address, false).await });
 
+    #[cfg(windows)]
+    let io_before = windows_process_io_snapshot();
     let process_started = ProcessTime::now();
     let started = Instant::now();
     send_session_v03(
@@ -223,6 +289,8 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     let elapsed = started.elapsed();
     let benchmark_process_cpu_time = process_started.elapsed();
     let frames = proxy_task.await.unwrap();
+    #[cfg(windows)]
+    let io_after = windows_process_io_snapshot();
     receiver.abort();
     let _ = receiver.await;
 
@@ -271,6 +339,16 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
         elapsed_ms,
         effective_throughput_mib_s,
         benchmark_process_cpu_time_ms: benchmark_process_cpu_time.as_secs_f64() * 1000.0,
+        #[cfg(windows)]
+        benchmark_process_windows_read_transfer_delta_bytes: io_after
+            .read_transfer_count
+            .checked_sub(io_before.read_transfer_count)
+            .expect("process read transfer counter decreased during benchmark"),
+        #[cfg(windows)]
+        benchmark_process_windows_write_transfer_delta_bytes: io_after
+            .write_transfer_count
+            .checked_sub(io_before.write_transfer_count)
+            .expect("process write transfer counter decreased during benchmark"),
     }
 }
 

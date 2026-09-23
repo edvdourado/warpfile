@@ -14,3 +14,6 @@ tokio = { version = "1.53.1", features = ["full"] }
 cpu-time = "1.0.0"
 proc-memstat = "0.1.0"
 tempfile = "3.27.0"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }

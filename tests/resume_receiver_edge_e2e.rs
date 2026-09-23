@@ -18,7 +18,9 @@ async fn ignores_empty_partial_and_starts_from_zero() {
 
     fs::create_dir_all(&destination_directory).unwrap();
 
-    let partial_path = destination_directory.join("empty-partial.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/empty-partial.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     /*
      * An empty .part exists.
@@ -92,7 +94,9 @@ async fn discards_partial_larger_than_announced_file() {
 
     fs::create_dir_all(&destination_directory).unwrap();
 
-    let partial_path = destination_directory.join("oversized-partial.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/oversized-partial.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     /*
      * The announced file will contain

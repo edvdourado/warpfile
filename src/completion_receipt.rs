@@ -14,7 +14,6 @@ pub const COMPLETION_RECEIPT_FORMAT_VERSION: u64 = 1;
 
 pub const BLAKE3_HASH_LENGTH: usize = 32;
 
-const WARPFILE_DIRECTORY: &str = ".warpfile";
 const RECEIPTS_DIRECTORY: &str = "receipts";
 const RECEIPT_EXTENSION: &str = "json";
 const TEMPORARY_SUFFIX: &str = ".tmp";
@@ -120,8 +119,7 @@ impl From<serde_json::Error> for CompletionReceiptError {
 }
 
 pub fn completion_receipt_path(destination_directory: &Path, transfer_id: TransferId) -> PathBuf {
-    destination_directory
-        .join(WARPFILE_DIRECTORY)
+    crate::receiver_paths::internal_directory(destination_directory)
         .join(RECEIPTS_DIRECTORY)
         .join(format!("{transfer_id}.{RECEIPT_EXTENSION}"))
 }

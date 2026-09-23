@@ -163,7 +163,9 @@ async fn commits_completed_partial_from_completion_receipt() {
 
     let data: Vec<u8> = (0..9000).map(|index| (index % 223) as u8).collect();
 
-    let partial_path = destination_directory.join("crash-window.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/crash-window.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     let final_path = destination_directory.join("crash-window.bin");
 

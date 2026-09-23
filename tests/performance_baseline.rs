@@ -284,8 +284,16 @@ async fn run_fresh_once() -> RunResult {
     assert_eq!(std::fs::read(&final_path).unwrap(), contents);
     assert_eq!(useful_data_bytes, file_size_bytes);
     assert_eq!(reused_bytes, 0);
-    assert!(!dest_dir.join("payload.bin.part").exists());
-    assert!(!dest_dir.join("payload.bin.part.warpchunks").exists());
+    assert!(
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part")
+            .exists()
+    );
+    assert!(
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part.warpchunks")
+            .exists()
+    );
     RunResult {
         useful_data_bytes,
         reused_bytes,
@@ -330,7 +338,8 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     let layout = ChunkLayout::new(file_size_bytes, V03_DEFAULT_CHUNK_SIZE).unwrap();
     assert_eq!(layout.chunk_count(), 32);
     assert!(reused_chunk_count <= layout.chunk_count());
-    let partial_path = dest_dir.join("payload.bin.part");
+    let partial_path = dest_dir.join(".warpfile/partials/payload.bin.part");
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
     let mut partial = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -361,7 +370,7 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
         (0..reused_chunk_count).collect::<Vec<_>>()
     );
     std::fs::write(
-        dest_dir.join("payload.bin.part.warpchunks"),
+        dest_dir.join(".warpfile/partials/payload.bin.part.warpchunks"),
         encode_chunk_state(&state).unwrap(),
     )
     .unwrap();
@@ -441,7 +450,11 @@ async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
         !partial_path.exists(),
         ".part must be removed after finalize"
     );
-    assert!(!dest_dir.join("payload.bin.part.warpchunks").exists());
+    assert!(
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part.warpchunks")
+            .exists()
+    );
     RunResult {
         useful_data_bytes,
         reused_bytes,

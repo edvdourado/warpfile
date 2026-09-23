@@ -88,11 +88,11 @@ The receiver additionally maintains local persistent transfer state:
 ```text
 receiver
    |
-   +--> <filename>.part
-   |
-   +--> <filename>.part.warpmeta
-   |
    +--> .warpfile/
+          |
+          +--> partials/
+          |      +--> <filename>.part
+          |      +--> <filename>.part.warpmeta
           |
           +--> receipts/
                  |
@@ -679,13 +679,13 @@ A failed client transfer therefore does not terminate the whole receiver process
 For:
 
 ```text
-video.mkv.part
+.warpfile/partials/video.mkv.part
 ```
 
 the sidecar path is:
 
 ```text
-video.mkv.part.warpmeta
+.warpfile/partials/video.mkv.part.warpmeta
 ```
 
 The current metadata schema conceptually contains:
@@ -851,13 +851,13 @@ During reconciliation, the receiver verifies the physical file's size and BLAKE3
 Incoming incomplete files use:
 
 ```text
-filename.part
+.warpfile/partials/filename.part
 ```
 
 and normally have:
 
 ```text
-filename.part.warpmeta
+.warpfile/partials/filename.part.warpmeta
 ```
 
 The receiver never exposes the final filename before complete size and BLAKE3 validation.
@@ -1023,8 +1023,8 @@ This creates a recoverable state for a process/network interruption between rece
 For example:
 
 ```text
-video.mkv.part
-video.mkv.part.warpmeta
+.warpfile/partials/video.mkv.part
+.warpfile/partials/video.mkv.part.warpmeta
 .warpfile/receipts/<id>.json
 ```
 
@@ -1564,7 +1564,7 @@ Resume requires both peers to reconstruct hash state for the retained prefix.
 Receiver:
 
 ```text
-filename.part
+.warpfile/partials/filename.part
       |
       v
 read retained prefix
@@ -1710,8 +1710,8 @@ WarpFile now has two different receiver-side persistent recovery mechanisms.
 ### Partial state
 
 ```text
-<filename>.part
-<filename>.part.warpmeta
+.warpfile/partials/<filename>.part
+.warpfile/partials/<filename>.part.warpmeta
 ```
 
 Purpose:

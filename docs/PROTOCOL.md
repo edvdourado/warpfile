@@ -870,13 +870,13 @@ Persistent sender-side transfer identity is future work.
 Incoming incomplete data is written to:
 
 ```text
-<filename>.part
+.warpfile/partials/<filename>.part
 ```
 
 For example:
 
 ```text
-video.mkv.part
+.warpfile/partials/video.mkv.part
 ```
 
 The final destination is not created from incomplete bytes.
@@ -898,13 +898,13 @@ The current reference receiver associates a local metadata file with a partial t
 For:
 
 ```text
-video.mkv.part
+.warpfile/partials/video.mkv.part
 ```
 
 the metadata path is:
 
 ```text
-video.mkv.part.warpmeta
+.warpfile/partials/video.mkv.part.warpmeta
 ```
 
 This file is local receiver state.
@@ -969,8 +969,8 @@ This permits useful data to survive a sender-process restart, even though that n
 When the sender sends RESTART, the receiver discards both:
 
 ```text
-<filename>.part
-<filename>.part.warpmeta
+.warpfile/partials/<filename>.part
+.warpfile/partials/<filename>.part.warpmeta
 ```
 
 and prepares fresh state for the current OFFER.
@@ -1212,8 +1212,8 @@ failure to rename must not destroy the complete .part
 A state such as:
 
 ```text
-file.part
-file.part.warpmeta
+.warpfile/partials/file.part
+.warpfile/partials/file.part.warpmeta
 completion receipt
 ```
 

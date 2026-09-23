@@ -469,19 +469,19 @@ The receiver may persist an advisory snapshot of verified chunks next to the par
 For a partial file:
 
 ```text
-video.mkv.part
+.warpfile/partials/video.mkv.part
 ```
 
 the snapshot path is:
 
 ```text
-video.mkv.part.warpchunks
+.warpfile/partials/video.mkv.part.warpchunks
 ```
 
 and the temporary snapshot path is:
 
 ```text
-video.mkv.part.warpchunks.tmp
+.warpfile/partials/video.mkv.part.warpchunks.tmp
 ```
 
 Format (JSON, pretty-printed):

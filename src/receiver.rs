@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use tokio::fs;
 use tokio::fs::OpenOptions;
@@ -18,6 +18,7 @@ use crate::protocol::{
     FileOffer, FileReject, Frame, MessageType, ProtocolIoError, RejectCode, ResumeRequest,
     decode_offer, encode_reject, encode_resume, read_frame, write_frame,
 };
+use crate::receiver_paths::{final_path, is_safe_filename, partial_path, partials_directory};
 use crate::transfer_metadata::{
     TransferMetadata, TransferState, read_transfer_metadata, remove_transfer_metadata,
     write_transfer_metadata,
@@ -151,11 +152,8 @@ async fn receive_connection(
         return Err(error.into());
     }
 
-    let destination = destination_directory.join(&offer.filename);
-
-    let partial_name = format!("{}.part", offer.filename);
-
-    let partial_destination = destination_directory.join(partial_name);
+    let destination = final_path(destination_directory, &offer.filename);
+    let partial_destination = partial_path(destination_directory, &offer.filename);
 
     if reconcile_completed_transfer(
         &mut stream,
@@ -182,6 +180,16 @@ async fn receive_connection(
             "destination file already exists",
         )
         .into());
+    }
+
+    if let Err(error) = fs::create_dir_all(partials_directory(destination_directory)).await {
+        send_reject(
+            &mut stream,
+            RejectCode::CannotPrepareDestination,
+            "receiver could not prepare the partial directory",
+        )
+        .await?;
+        return Err(error.into());
     }
 
     let prepared = prepare_transfer(&mut stream, &partial_destination, &offer).await?;
@@ -971,17 +979,4 @@ async fn send_reject(
     println!("Sent REJECT ({code})");
 
     Ok(())
-}
-
-fn is_safe_filename(filename: &str) -> bool {
-    if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
-        return false;
-    }
-
-    let mut components = Path::new(filename).components();
-
-    matches!(
-        (components.next(), components.next(),),
-        (Some(Component::Normal(_)), None,)
-    )
 }

@@ -9,6 +9,7 @@ use warpfile::protocol::{
 };
 
 use warpfile::receiver::receive_once;
+use warpfile::receiver_paths::partial_path;
 use warpfile::sender::run_sender;
 
 #[tokio::test]
@@ -56,6 +57,53 @@ async fn transfers_file_end_to_end() {
     let received_data = fs::read(received_path).unwrap();
 
     assert_eq!(received_data, original_data);
+}
+
+#[tokio::test]
+async fn root_files_that_match_old_partial_and_sidecar_names_survive_an_offer() {
+    let temp = tempdir().unwrap();
+    let destination = temp.path();
+    let sentinels = ["x.part", "x.part.warpmeta", "x.part.warpchunks"];
+    for name in sentinels {
+        fs::write(destination.join(name), name.as_bytes()).unwrap();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let receiver = receive_once(listener, destination);
+    let peer = async {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        perform_handshake(&mut stream).await;
+        send_offer_and_wait_for_accept(&mut stream, "x", 8).await;
+    };
+    let (result, ()) = tokio::join!(receiver, peer);
+    assert!(result.is_err());
+    assert!(partial_path(destination, "x").exists());
+    for name in sentinels {
+        assert_eq!(fs::read(destination.join(name)).unwrap(), name.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn reserves_internal_directory_as_a_final_filename() {
+    for name in [".warpfile", ".WARPFILE"] {
+        let temp = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let receiver = receive_once(listener, temp.path());
+        let peer = async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            perform_handshake(&mut stream).await;
+            send_offer(&mut stream, name, 1).await;
+            assert_eq!(
+                read_frame(&mut stream).await.unwrap().message_type,
+                MessageType::Reject
+            );
+        };
+        let (result, ()) = tokio::join!(receiver, peer);
+        assert!(result.is_err());
+        assert!(!temp.path().join(name).exists());
+    }
 }
 
 #[tokio::test]
@@ -107,7 +155,7 @@ async fn transfers_empty_file_end_to_end() {
 
     assert_eq!(metadata.len(), 0, "received empty file is not empty");
 
-    let partial_path = destination_directory.join("empty.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/empty.bin.part");
 
     assert!(
         !partial_path.exists(),
@@ -177,7 +225,7 @@ async fn rejects_file_when_destination_already_exists() {
         "existing destination file was modified"
     );
 
-    let partial_path = destination_directory.join("payload.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/payload.bin.part");
 
     assert!(
         !partial_path.exists(),
@@ -227,7 +275,7 @@ async fn preserves_partial_file_when_sender_disconnects() {
         "receiver created a final file after an interrupted transfer"
     );
 
-    let partial_path = destination_directory.join("interrupted.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/interrupted.bin.part");
 
     assert!(
         partial_path.exists(),
@@ -300,7 +348,7 @@ async fn rejects_file_with_invalid_hash() {
         "receiver created a final file even though integrity verification failed"
     );
 
-    let partial_path = destination_directory.join("corrupted.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/corrupted.bin.part");
 
     assert!(
         !partial_path.exists(),
@@ -357,7 +405,7 @@ async fn removes_partial_file_when_sender_cancels() {
         "receiver created a final file after cancellation"
     );
 
-    let partial_path = destination_directory.join("cancelled.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/cancelled.bin.part");
 
     assert!(
         !partial_path.exists(),
@@ -373,7 +421,9 @@ async fn resumes_existing_partial_when_sender_accepts_resume() {
 
     fs::create_dir_all(&destination_directory).unwrap();
 
-    let partial_path = destination_directory.join("resumable.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/resumable.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     let prefix = vec![0x11; 4096];
 
@@ -457,7 +507,9 @@ async fn restarts_from_zero_when_sender_rejects_resume() {
 
     fs::create_dir_all(&destination_directory).unwrap();
 
-    let partial_path = destination_directory.join("restart.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/restart.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     let stale_partial = vec![0xAA; 4096];
 

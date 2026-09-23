@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::mem;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -24,6 +24,7 @@ use crate::protocol::{
     ProtocolIoError, ResumeRequestV03, TransferId, decode_chunk_start_v03, decode_data_v03,
     decode_offer_v03, encode_chunk_hashes, encode_resume_v03, read_frame_for_version, write_frame,
 };
+use crate::receiver_paths::{final_path, is_safe_filename, partial_path, partials_directory};
 
 const PROGRESS_STRIDE_DIVISOR: u64 = 100;
 
@@ -302,10 +303,12 @@ impl ReceivedCompleteV03 {
 
     pub async fn finalize(
         self,
+        destination_path: &Path,
         receipt_destination: Option<&Path>,
     ) -> Result<PathBuf, ReceiverV03FinalizeError> {
         let partial_path = self.partial_path.clone();
-        let final_path = final_path_for_partial(&partial_path)?;
+        validate_partial_path(&partial_path)?;
+        let final_path = destination_path.to_path_buf();
         let file_size = self.receiver.chunk_state.layout().file_size();
         let sender_file_hash = self.sender_file_hash;
         let identity = self.identity.clone();
@@ -351,12 +354,13 @@ impl ReceivedCompleteV03 {
     pub async fn complete<S>(
         self,
         stream: &mut S,
+        destination_path: &Path,
         receipt_destination: Option<&Path>,
     ) -> Result<PathBuf, ReceiverV03CompleteError>
     where
         S: AsyncWrite + Unpin,
     {
-        let final_path = self.finalize(receipt_destination).await?;
+        let final_path = self.finalize(destination_path, receipt_destination).await?;
         let frame = Frame::new_for_version(WFP_VERSION_V03, MessageType::Verified, Vec::new())?;
         write_frame(stream, &frame).await?;
 
@@ -364,17 +368,17 @@ impl ReceivedCompleteV03 {
     }
 }
 
-fn final_path_for_partial(partial: &Path) -> Result<PathBuf, ReceiverV03FinalizeError> {
+fn validate_partial_path(partial: &Path) -> Result<(), ReceiverV03FinalizeError> {
     let file_name = partial
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| ReceiverV03FinalizeError::InvalidPartialPath(partial.to_path_buf()))?;
-    let stripped = file_name
+    file_name
         .strip_suffix(".part")
         .filter(|stripped| !stripped.is_empty())
         .ok_or_else(|| ReceiverV03FinalizeError::InvalidPartialPath(partial.to_path_buf()))?;
 
-    Ok(partial.with_file_name(stripped))
+    Ok(())
 }
 
 async fn promote_partial_no_clobber(partial: &Path, destination: &Path) -> io::Result<()> {
@@ -620,7 +624,7 @@ pub async fn reconcile_completed_transfer_v03<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    if !is_safe_filename_v03(&offer.filename) {
+    if !is_safe_filename(&offer.filename) {
         return Err(ReceiverV03ReconcileError::InvalidFilename);
     }
 
@@ -636,8 +640,8 @@ where
         return Err(ReceiverV03ReconcileError::ConflictingReceipt);
     }
 
-    let destination = destination_directory.join(&offer.filename);
-    let partial_destination = destination_directory.join(format!("{}.part", offer.filename));
+    let destination = final_path(destination_directory, &offer.filename);
+    let partial_destination = partial_path(destination_directory, &offer.filename);
 
     if fs::try_exists(&destination).await? {
         if let Err(error) =
@@ -731,19 +735,6 @@ async fn verify_physical_file_v03(
     }
 
     Ok(())
-}
-
-fn is_safe_filename_v03(filename: &str) -> bool {
-    if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
-        return false;
-    }
-
-    let mut components = Path::new(filename).components();
-
-    matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    )
 }
 
 #[derive(Debug)]
@@ -1430,7 +1421,8 @@ where
         ReceiverV03ReconcileOutcome::NotReconciled => {}
     }
 
-    let partial_destination = destination_directory.join(format!("{}.part", offer.filename));
+    fs::create_dir_all(partials_directory(destination_directory)).await?;
+    let partial_destination = partial_path(destination_directory, &offer.filename);
 
     let prepared = prepare_receiver_v03(&partial_destination, &offer).await?;
 
@@ -1445,8 +1437,9 @@ where
 
     println!("COMPLETE received; verifying final file...");
 
+    let destination = final_path(destination_directory, &offer.filename);
     let final_path = received
-        .complete(stream, Some(destination_directory))
+        .complete(stream, &destination, Some(destination_directory))
         .await?;
 
     println!("Saved to {}", final_path.display());
@@ -3121,12 +3114,35 @@ mod tests {
         assert!(snapshot.exists());
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
-        let final_path = received.finalize(None).await.unwrap();
+        let final_path = received
+            .finalize(&partial.with_extension(""), None)
+            .await
+            .unwrap();
 
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
         assert!(!partial.exists());
         assert!(!snapshot.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_promotes_from_internal_partials_to_destination_root() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        fs::create_dir_all(partials_directory(dir)).await.unwrap();
+        let partial = partial_path(dir, "archive.bin");
+        let contents = b"abcd";
+        let received = received_complete(&partial, contents, 4, 4, hash(contents)).await;
+
+        let final_path = received
+            .finalize(&final_path(dir, "archive.bin"), Some(dir))
+            .await
+            .unwrap();
+
+        assert_eq!(final_path, dir.join("archive.bin"));
+        assert_eq!(fs::read(final_path).await.unwrap(), contents);
+        assert!(!partial.exists());
+        assert!(!partials_directory(dir).join("archive.bin").exists());
     }
 
     #[tokio::test]
@@ -3136,7 +3152,10 @@ mod tests {
         let contents = b"abcd";
         let received = received_complete(&partial, contents, 4, 4, hash(contents)).await;
 
-        let final_path = received.finalize(None).await.unwrap();
+        let final_path = received
+            .finalize(&partial.with_extension(""), None)
+            .await
+            .unwrap();
 
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
         assert!(!partial.exists());
@@ -3159,7 +3178,10 @@ mod tests {
         let existing = b"existing destination";
         fs::write(&final_path, existing).await.unwrap();
 
-        let error = received.finalize(None).await.unwrap_err();
+        let error = received
+            .finalize(&partial.with_extension(""), None)
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             ReceiverV03FinalizeError::DestinationExists(path) if path == final_path
@@ -3182,7 +3204,10 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(b"different")).await;
 
-        let error = received.finalize(None).await.unwrap_err();
+        let error = received
+            .finalize(&partial.with_extension(""), None)
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             ReceiverV03FinalizeError::Verification(ReceiverV03VerificationError::FileHashMismatch)
@@ -3199,7 +3224,10 @@ mod tests {
         let contents = b"abcd";
         let received = received_complete(&partial, contents, 4, 4, hash(contents)).await;
 
-        let error = received.finalize(None).await.unwrap_err();
+        let error = received
+            .finalize(&partial.with_extension(""), None)
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             ReceiverV03FinalizeError::InvalidPartialPath(path) if path == partial
@@ -3213,7 +3241,10 @@ mod tests {
         let partial = temp.path().join("empty.bin.part");
         let received = received_complete(&partial, b"", 0, 4, hash(b"")).await;
 
-        let final_path = received.finalize(None).await.unwrap();
+        let final_path = received
+            .finalize(&partial.with_extension(""), None)
+            .await
+            .unwrap();
 
         assert_eq!(final_path, temp.path().join("empty.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), b"");
@@ -3231,7 +3262,10 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
 
-        let final_path = received.finalize(Some(receipt_dir)).await.unwrap();
+        let final_path = received
+            .finalize(&partial.with_extension(""), Some(receipt_dir))
+            .await
+            .unwrap();
 
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
@@ -3265,7 +3299,10 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(b"different")).await;
 
-        let error = received.finalize(Some(receipt_dir)).await.unwrap_err();
+        let error = received
+            .finalize(&partial.with_extension(""), Some(receipt_dir))
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             ReceiverV03FinalizeError::Verification(ReceiverV03VerificationError::FileHashMismatch)
@@ -3294,7 +3331,10 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
 
-        let error = received.finalize(Some(receipt_dir)).await.unwrap_err();
+        let error = received
+            .finalize(&partial.with_extension(""), Some(receipt_dir))
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             ReceiverV03FinalizeError::DestinationExists(path) if path == final_path
@@ -3336,7 +3376,10 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
 
-        let final_path = received.finalize(Some(receipt_dir)).await.unwrap();
+        let final_path = received
+            .finalize(&partial.with_extension(""), Some(receipt_dir))
+            .await
+            .unwrap();
 
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
@@ -3366,7 +3409,10 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
 
-        let error = received.finalize(Some(receipt_dir)).await.unwrap_err();
+        let error = received
+            .finalize(&partial.with_extension(""), Some(receipt_dir))
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             ReceiverV03FinalizeError::Receipt(CompletionReceiptError::ConflictingReceipt)
@@ -3386,7 +3432,10 @@ mod tests {
 
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
 
-        let final_path = received.finalize(None).await.unwrap();
+        let final_path = received
+            .finalize(&partial.with_extension(""), None)
+            .await
+            .unwrap();
 
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
@@ -3401,7 +3450,10 @@ mod tests {
         let received = received_complete(&partial, contents, 12, 4, hash(contents)).await;
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
 
-        let final_path = received.complete(&mut receiver_stream, None).await.unwrap();
+        let final_path = received
+            .complete(&mut receiver_stream, &partial.with_extension(""), None)
+            .await
+            .unwrap();
 
         let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
             .await
@@ -3423,7 +3475,7 @@ mod tests {
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
 
         let error = received
-            .complete(&mut receiver_stream, None)
+            .complete(&mut receiver_stream, &partial.with_extension(""), None)
             .await
             .unwrap_err();
 
@@ -3451,7 +3503,7 @@ mod tests {
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
 
         let error = received
-            .complete(&mut receiver_stream, None)
+            .complete(&mut receiver_stream, &partial.with_extension(""), None)
             .await
             .unwrap_err();
 
@@ -3482,7 +3534,11 @@ mod tests {
         drop(peer_stream);
 
         let error = received
-            .complete(&mut receiver_stream, Some(receipt_dir))
+            .complete(
+                &mut receiver_stream,
+                &partial.with_extension(""),
+                Some(receipt_dir),
+            )
             .await
             .unwrap_err();
 
@@ -3509,7 +3565,11 @@ mod tests {
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
 
         let final_path = received
-            .complete(&mut receiver_stream, Some(receipt_dir))
+            .complete(
+                &mut receiver_stream,
+                &partial.with_extension(""),
+                Some(receipt_dir),
+            )
             .await
             .unwrap();
 
@@ -3599,7 +3659,8 @@ mod tests {
         write_completion_receipt(dir, &receipt_for(&offer, contents))
             .await
             .unwrap();
-        fs::write(dir.join("archive.bin.part"), contents)
+        fs::create_dir_all(partials_directory(dir)).await.unwrap();
+        fs::write(partial_path(dir, "archive.bin"), contents)
             .await
             .unwrap();
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
@@ -3614,13 +3675,49 @@ mod tests {
         );
         assert!(dir.join("archive.bin").exists());
         assert_eq!(fs::read(dir.join("archive.bin")).await.unwrap(), contents);
-        assert!(!dir.join("archive.bin.part").exists());
+        assert!(!partial_path(dir, "archive.bin").exists());
         let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
             .await
             .unwrap();
         assert_eq!(verified.version, WFP_VERSION_V03);
         assert_eq!(verified.message_type, MessageType::Verified);
         assert!(verified.payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prepares_internal_partial_without_touching_legacy_root_files() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        for name in ["x.part", "x.part.warpmeta", "x.part.warpchunks"] {
+            fs::write(dir.join(name), name.as_bytes()).await.unwrap();
+        }
+        let mut offered = offer(4, 4);
+        offered.filename = "x".to_string();
+        let (mut receiver_stream, mut peer_stream) = duplex(4096);
+        let peer = async move {
+            write_frame(&mut peer_stream, &hello_frame_v03())
+                .await
+                .unwrap();
+            assert_eq!(
+                read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
+                    .await
+                    .unwrap()
+                    .message_type,
+                MessageType::HelloAck
+            );
+            write_frame(&mut peer_stream, &offer_frame_v03(&offered))
+                .await
+                .unwrap();
+            let (resume, batches) = read_inventory(&mut peer_stream, 0).await;
+            assert_eq!(resume.message_type, MessageType::Resume);
+            assert!(batches.is_empty());
+        };
+        let (result, ()) = tokio::join!(receive_session_v03(&mut receiver_stream, dir), peer);
+        assert!(result.is_err());
+        assert_eq!(fs::metadata(partial_path(dir, "x")).await.unwrap().len(), 4);
+        for name in ["x.part", "x.part.warpmeta", "x.part.warpchunks"] {
+            assert_eq!(fs::read(dir.join(name)).await.unwrap(), name.as_bytes());
+        }
     }
 
     #[tokio::test]
@@ -3662,7 +3759,8 @@ mod tests {
             .unwrap();
         let mut corrupted = contents.to_vec();
         corrupted[3] ^= 0x01;
-        fs::write(dir.join("archive.bin.part"), &corrupted)
+        fs::create_dir_all(partials_directory(dir)).await.unwrap();
+        fs::write(partial_path(dir, "archive.bin"), &corrupted)
             .await
             .unwrap();
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
@@ -3672,9 +3770,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome, ReceiverV03ReconcileOutcome::NotReconciled);
-        assert!(dir.join("archive.bin.part").exists());
+        assert!(partial_path(dir, "archive.bin").exists());
         assert_eq!(
-            fs::read(dir.join("archive.bin.part")).await.unwrap(),
+            fs::read(partial_path(dir, "archive.bin")).await.unwrap(),
             corrupted
         );
         assert!(!dir.join("archive.bin").exists());
@@ -3885,7 +3983,7 @@ mod tests {
         peer_stream.read_to_end(&mut extra).await.unwrap();
         assert!(extra.is_empty());
 
-        assert!(!dir.join("archive.bin.part").exists());
+        assert!(!partial_path(dir, "archive.bin").exists());
     }
 
     #[tokio::test]

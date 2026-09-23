@@ -19,7 +19,7 @@ async fn preserves_transfer_metadata_after_connection_loss() {
 
     let destination_directory = temp.path().join("received");
 
-    let partial_path = destination_directory.join("interrupted.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/interrupted.bin.part");
 
     let transfer_id = transfer_id_a();
 
@@ -82,7 +82,9 @@ async fn adopts_verified_partial_for_new_transfer_identity() {
 
     fs::create_dir_all(&destination_directory).unwrap();
 
-    let partial_path = destination_directory.join("adopt.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/adopt.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     let prefix = vec![0x11; 4096];
 
@@ -177,7 +179,9 @@ async fn restart_replaces_partial_and_transfer_metadata() {
 
     fs::create_dir_all(&destination_directory).unwrap();
 
-    let partial_path = destination_directory.join("restart.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/restart.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     let stale_prefix = vec![0xAA; 4096];
 
@@ -267,7 +271,7 @@ async fn removes_partial_metadata_after_successful_transfer() {
 
     let destination_directory = temp.path().join("received");
 
-    let partial_path = destination_directory.join("complete.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/complete.bin.part");
 
     let final_path = destination_directory.join("complete.bin");
 

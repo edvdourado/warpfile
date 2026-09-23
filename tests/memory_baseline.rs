@@ -151,8 +151,16 @@ async fn run_fresh_once(run: usize) -> RunResult {
         std::fs::read(&source_path).unwrap()
     );
     assert_eq!(useful_data_bytes, FILE_SIZE_BYTES as u64);
-    assert!(!dest_dir.join("payload.bin.part").exists());
-    assert!(!dest_dir.join("payload.bin.part.warpchunks").exists());
+    assert!(
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part")
+            .exists()
+    );
+    assert!(
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part.warpchunks")
+            .exists()
+    );
 
     let rss_peak_observed = observed_peak.load(Ordering::Relaxed);
     // RSS growth below the initial reading is reported as zero, never as a negative value.

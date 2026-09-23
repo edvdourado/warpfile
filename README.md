@@ -194,15 +194,15 @@ Unexpected connection loss does not automatically destroy useful received data.
 If a transfer is interrupted by a recoverable network failure, the receiver may preserve:
 
 ```text
-<filename>.part
-<filename>.part.warpmeta
+.warpfile/partials/<filename>.part
+.warpfile/partials/<filename>.part.warpmeta
 ```
 
 For example:
 
 ```text
-video.mkv.part
-video.mkv.part.warpmeta
+.warpfile/partials/video.mkv.part
+.warpfile/partials/video.mkv.part.warpmeta
 ```
 
 When a later `OFFER` arrives, the receiver can propose the retained prefix:
@@ -294,13 +294,13 @@ The receiver persists auxiliary metadata next to incomplete files.
 For:
 
 ```text
-video.mkv.part
+.warpfile/partials/video.mkv.part
 ```
 
 the metadata file is:
 
 ```text
-video.mkv.part.warpmeta
+.warpfile/partials/video.mkv.part.warpmeta
 ```
 
 It records information such as:
@@ -460,7 +460,7 @@ Normal successful transfers still use one-pass streaming BLAKE3.
 Incoming incomplete files are written to:
 
 ```text
-<filename>.part
+.warpfile/partials/<filename>.part
 ```
 
 The final filename is created only after complete size and BLAKE3 verification succeeds.

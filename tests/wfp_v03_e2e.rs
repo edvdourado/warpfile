@@ -206,10 +206,12 @@ async fn wfp_v03_resumes_from_preseeded_partial() {
     }
     let state = ChunkState::new(layout, records).unwrap();
 
-    let partial = dest_dir.join("payload.bin.part");
+    let partial = dest_dir.join(".warpfile/partials/payload.bin.part");
+
+    std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
     std::fs::write(&partial, &contents[..2048]).unwrap();
     std::fs::write(
-        dest_dir.join("payload.bin.part.warpchunks"),
+        dest_dir.join(".warpfile/partials/payload.bin.part.warpchunks"),
         encode_chunk_state(&state).unwrap(),
     )
     .unwrap();
@@ -264,7 +266,9 @@ async fn wfp_v03_resumes_from_preseeded_partial() {
     assert_eq!(std::fs::read(&final_path).unwrap(), contents);
     assert!(!partial.exists(), ".part must be renamed after finalize");
     assert!(
-        !dest_dir.join("payload.bin.part.warpchunks").exists(),
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part.warpchunks")
+            .exists(),
         ".warpchunks must be removed after finalize"
     );
 
@@ -323,7 +327,8 @@ async fn wfp_v03_reuses_sparse_physically_valid_chunks_on_wire() {
     }
 
     // Keep chunk 2 at its absolute file offset; a sparse file represents the hole for chunk 1.
-    let partial = dest_dir.join("payload.bin.part");
+    let partial = dest_dir.join(".warpfile/partials/payload.bin.part");
+    std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
     let mut partial_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -342,7 +347,7 @@ async fn wfp_v03_reuses_sparse_physically_valid_chunks_on_wire() {
     drop(partial_file);
     let state = ChunkState::new(layout, records).unwrap();
     std::fs::write(
-        dest_dir.join("payload.bin.part.warpchunks"),
+        dest_dir.join(".warpfile/partials/payload.bin.part.warpchunks"),
         encode_chunk_state(&state).unwrap(),
     )
     .unwrap();
@@ -436,7 +441,9 @@ async fn wfp_v03_revalidates_corrupted_sparse_chunk_before_reuse() {
         .collect();
     let state = ChunkState::new(layout, records).unwrap();
 
-    let partial = dest_dir.join("payload.bin.part");
+    let partial = dest_dir.join(".warpfile/partials/payload.bin.part");
+
+    std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
     let mut partial_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -453,7 +460,8 @@ async fn wfp_v03_revalidates_corrupted_sparse_chunk_before_reuse() {
     }
     drop(partial_file);
 
-    let metadata_path = dest_dir.join("payload.bin.part.warpchunks");
+    let metadata_path = dest_dir.join(".warpfile/partials/payload.bin.part.warpchunks");
+
     let encoded_state = encode_chunk_state(&state).unwrap();
     std::fs::write(&metadata_path, &encoded_state).unwrap();
     let persisted = decode_chunk_state(&std::fs::read(&metadata_path).unwrap()).unwrap();
@@ -618,8 +626,8 @@ async fn wfp_v03_retries_after_a_persisted_chunk_without_retransmitting_it() {
     drop(receiver_probe);
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = proxy.local_addr().unwrap().to_string();
-    let partial = dest_dir.join("payload.bin.part");
-    let chunk_state_path = dest_dir.join("payload.bin.part.warpchunks");
+    let partial = dest_dir.join(".warpfile/partials/payload.bin.part");
+    let chunk_state_path = dest_dir.join(".warpfile/partials/payload.bin.part.warpchunks");
 
     let receiver_dest = dest_dir.clone();
     let receiver_bind = receiver_address.clone();
@@ -693,7 +701,9 @@ async fn wfp_v03_retries_after_a_persisted_chunk_without_retransmitting_it() {
     );
     assert!(!partial.exists(), ".part must be removed after finalize");
     assert!(
-        !dest_dir.join("payload.bin.part.warpchunks").exists(),
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part.warpchunks")
+            .exists(),
         ".warpchunks must be removed after finalize"
     );
 }

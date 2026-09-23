@@ -269,7 +269,9 @@ async fn real_sender_and_receiver_resume_end_to_end() {
 
     let prefix_length = 83_777usize;
 
-    let partial_path = destination_directory.join("real-resume.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/real-resume.bin.part");
+
+    std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
 
     fs::write(&partial_path, &original_data[..prefix_length]).unwrap();
 

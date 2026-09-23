@@ -75,7 +75,7 @@ async fn resumes_after_real_connection_loss() {
         "receiver should report the interrupted first transfer"
     );
 
-    let partial_path = destination_directory.join("recovery.bin.part");
+    let partial_path = destination_directory.join(".warpfile/partials/recovery.bin.part");
 
     assert!(
         partial_path.exists(),

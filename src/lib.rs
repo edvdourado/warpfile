@@ -8,6 +8,7 @@ pub mod progress;
 pub mod protocol;
 pub mod receiver;
 pub mod receiver_paths;
+mod receiver_storage;
 pub mod receiver_v03;
 pub mod sender;
 pub mod sender_v03;

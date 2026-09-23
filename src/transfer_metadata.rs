@@ -4,7 +4,9 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::receiver_storage;
 use serde_json::{Value, json};
+#[cfg(test)]
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -142,11 +144,7 @@ pub async fn write_transfer_metadata(
     remove_if_exists(&temporary_path).await?;
 
     let write_result = async {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .await?;
+        let mut file = receiver_storage::open_regular(&temporary_path, false, true, false, true)?;
 
         file.write_all(&encoded).await?;
 
@@ -180,14 +178,14 @@ pub async fn write_transfer_metadata(
          */
         remove_if_exists_io(&metadata_path).await?;
 
-        fs::rename(&temporary_path, &metadata_path).await?;
+        receiver_storage::rename(&temporary_path, &metadata_path)?;
 
         Ok::<(), io::Error>(())
     }
     .await;
 
     if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary_path).await;
+        let _ = receiver_storage::remove_file(&temporary_path);
 
         return Err(TransferMetadataError::Io(error));
     }
@@ -200,7 +198,7 @@ pub async fn read_transfer_metadata(
 ) -> Result<TransferMetadata, TransferMetadataError> {
     let metadata_path = transfer_metadata_path(partial_path);
 
-    let bytes = fs::read(metadata_path).await?;
+    let bytes = receiver_storage::read(&metadata_path).await?;
 
     decode_transfer_metadata(&bytes)
 }
@@ -318,7 +316,7 @@ async fn remove_if_exists(path: &Path) -> Result<(), TransferMetadataError> {
 }
 
 async fn remove_if_exists_io(path: &Path) -> Result<(), io::Error> {
-    match fs::remove_file(path).await {
+    match receiver_storage::remove_file(path) {
         Ok(()) => Ok(()),
 
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

@@ -4,7 +4,9 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::receiver_storage;
 use serde_json::{Value, json};
+#[cfg(test)]
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -137,7 +139,7 @@ pub async fn write_completion_receipt(
         )
     })?;
 
-    fs::create_dir_all(receipt_directory).await?;
+    receiver_storage::ensure_directory(receipt_directory)?;
 
     /*
      * Completion receipts are immutable.
@@ -146,7 +148,7 @@ pub async fn write_completion_receipt(
      * the only valid case is that it describes
      * exactly the same completed transfer.
      */
-    if fs::try_exists(&receipt_path).await? {
+    if receiver_storage::exists(&receipt_path)? {
         let existing = read_completion_receipt(destination_directory, receipt.transfer_id).await?;
 
         if existing == *receipt {
@@ -164,11 +166,7 @@ pub async fn write_completion_receipt(
     let encoded = encode_completion_receipt(receipt)?;
 
     let write_result = async {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .await?;
+        let mut file = receiver_storage::open_regular(&temporary_path, false, true, false, true)?;
 
         file.write_all(&encoded).await?;
 
@@ -190,14 +188,14 @@ pub async fn write_completion_receipt(
          * a transfer ID has one immutable completion
          * record.
          */
-        fs::rename(&temporary_path, &receipt_path).await?;
+        receiver_storage::rename(&temporary_path, &receipt_path)?;
 
         Ok::<(), io::Error>(())
     }
     .await;
 
     if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary_path).await;
+        let _ = receiver_storage::remove_file(&temporary_path);
 
         return Err(CompletionReceiptError::Io(error));
     }
@@ -211,7 +209,7 @@ pub async fn read_completion_receipt(
 ) -> Result<CompletionReceipt, CompletionReceiptError> {
     let receipt_path = completion_receipt_path(destination_directory, transfer_id);
 
-    let bytes = fs::read(receipt_path).await?;
+    let bytes = receiver_storage::read(&receipt_path).await?;
 
     let receipt = decode_completion_receipt(&bytes)?;
 
@@ -331,7 +329,7 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 async fn remove_if_exists(path: &Path) -> Result<(), CompletionReceiptError> {
-    match fs::remove_file(path).await {
+    match receiver_storage::remove_file(path) {
         Ok(()) => Ok(()),
 
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

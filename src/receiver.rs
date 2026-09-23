@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use tokio::fs;
-use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -19,6 +18,7 @@ use crate::protocol::{
     decode_offer, encode_reject, encode_resume, read_frame, write_frame,
 };
 use crate::receiver_paths::{final_path, is_safe_filename, partial_path, partials_directory};
+use crate::receiver_storage;
 use crate::transfer_metadata::{
     TransferMetadata, TransferState, read_transfer_metadata, remove_transfer_metadata,
     write_transfer_metadata,
@@ -141,7 +141,7 @@ async fn receive_connection(
     println!("Size: {} bytes", offer.file_size);
     println!();
 
-    if let Err(error) = fs::create_dir_all(destination_directory).await {
+    if let Err(error) = receiver_storage::ensure_directory(destination_directory) {
         send_reject(
             &mut stream,
             RejectCode::CannotPrepareDestination,
@@ -167,7 +167,7 @@ async fn receive_connection(
         return Ok(());
     }
 
-    if fs::try_exists(&destination).await? {
+    if receiver_storage::exists(&destination)? {
         send_reject(
             &mut stream,
             RejectCode::FileExists,
@@ -182,7 +182,9 @@ async fn receive_connection(
         .into());
     }
 
-    if let Err(error) = fs::create_dir_all(partials_directory(destination_directory)).await {
+    if let Err(error) =
+        receiver_storage::ensure_directory(&partials_directory(destination_directory))
+    {
         send_reject(
             &mut stream,
             RejectCode::CannotPrepareDestination,
@@ -246,7 +248,7 @@ async fn receive_connection(
      * A later connection can verify the receipt against this
      * complete .part and finish the commit.
      */
-    if let Err(error) = fs::rename(&partial_destination, &destination).await {
+    if let Err(error) = receiver_storage::rename(&partial_destination, &destination) {
         println!();
         println!(
             "Completion receipt persisted, but final rename failed; completed partial state preserved"
@@ -285,7 +287,7 @@ async fn reconcile_completed_transfer(
 ) -> Result<bool, Box<dyn Error>> {
     let receipt_path = completion_receipt_path(destination_directory, offer.transfer_id);
 
-    if !fs::try_exists(&receipt_path).await? {
+    if !receiver_storage::exists(&receipt_path)? {
         return Ok(false);
     }
 
@@ -319,7 +321,7 @@ async fn reconcile_completed_transfer(
         .into());
     }
 
-    if fs::try_exists(destination).await? {
+    if receiver_storage::exists(destination)? {
         if let Err(error) = verify_completed_data(destination, &receipt).await {
             send_reject(
                 stream,
@@ -349,7 +351,7 @@ async fn reconcile_completed_transfer(
         return Ok(true);
     }
 
-    if fs::try_exists(partial_destination).await? {
+    if receiver_storage::exists(partial_destination)? {
         if let Err(error) = verify_completed_data(partial_destination, &receipt).await {
             send_reject(
                 stream,
@@ -361,7 +363,7 @@ async fn reconcile_completed_transfer(
             return Err(error);
         }
 
-        if let Err(error) = fs::rename(partial_destination, destination).await {
+        if let Err(error) = receiver_storage::rename(partial_destination, destination) {
             return Err(error.into());
         }
 
@@ -401,7 +403,7 @@ async fn verify_completed_data(
     path: &Path,
     receipt: &CompletionReceipt,
 ) -> Result<(), Box<dyn Error>> {
-    let metadata = fs::metadata(path).await?;
+    let metadata = receiver_storage::metadata(path)?;
 
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -441,11 +443,11 @@ async fn prepare_transfer(
 ) -> Result<PreparedTransfer, Box<dyn Error>> {
     let expected_metadata = transfer_metadata_for_offer(offer);
 
-    if !fs::try_exists(partial_destination).await? {
+    if !receiver_storage::exists(partial_destination)? {
         return prepare_fresh_transfer(stream, partial_destination, &expected_metadata).await;
     }
 
-    let partial_metadata = match fs::metadata(partial_destination).await {
+    let partial_metadata = match receiver_storage::metadata(partial_destination) {
         Ok(metadata) => metadata,
 
         Err(error) => {
@@ -577,7 +579,7 @@ async fn prepare_transfer(
                 .into());
             }
 
-            let current_size = fs::metadata(partial_destination).await?.len();
+            let current_size = receiver_storage::metadata(partial_destination)?.len();
 
             if current_size != partial_size {
                 let _ = discard_partial_state(partial_destination).await;
@@ -598,10 +600,8 @@ async fn prepare_transfer(
                 );
             }
 
-            let output = OpenOptions::new()
-                .append(true)
-                .open(partial_destination)
-                .await?;
+            let output =
+                receiver_storage::open_regular(partial_destination, false, false, true, false)?;
 
             println!("Resume accepted at byte {partial_size}");
 
@@ -683,11 +683,7 @@ async fn prepare_fresh_transfer(
         return Err(error.into());
     }
 
-    let output = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(partial_destination)
-        .await
+    let output = match receiver_storage::open_regular(partial_destination, false, true, false, true)
     {
         Ok(file) => file,
 
@@ -748,7 +744,7 @@ fn transfer_metadata_for_offer(offer: &FileOffer) -> TransferMetadata {
 }
 
 async fn discard_partial_state(partial_destination: &Path) -> Result<(), Box<dyn Error>> {
-    match fs::remove_file(partial_destination).await {
+    match receiver_storage::remove_file(partial_destination) {
         Ok(()) => {}
 
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -767,7 +763,7 @@ async fn hash_file_exact(
     path: &Path,
     expected_size: u64,
 ) -> Result<blake3::Hasher, Box<dyn Error>> {
-    let mut file = fs::File::open(path).await?;
+    let mut file = receiver_storage::open_regular(path, true, false, false, false)?;
 
     let mut hasher = blake3::Hasher::new();
 

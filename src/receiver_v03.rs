@@ -4,7 +4,9 @@ use std::io::{self, IsTerminal, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use tokio::fs::{self, OpenOptions};
+use tokio::fs;
+#[cfg(test)]
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -25,6 +27,7 @@ use crate::protocol::{
     decode_offer_v03, encode_chunk_hashes, encode_resume_v03, read_frame_for_version, write_frame,
 };
 use crate::receiver_paths::{final_path, is_safe_filename, partial_path, partials_directory};
+use crate::receiver_storage;
 
 const PROGRESS_STRIDE_DIVISOR: u64 = 100;
 
@@ -213,14 +216,15 @@ pub async fn prepare_v03_partial_file(
     partial_path: &Path,
     file_size: u64,
 ) -> Result<fs::File, ReceiverV03Error> {
-    let existed = fs::try_exists(partial_path).await?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(partial_path)
-        .await?;
+    let (file, existed) =
+        match receiver_storage::open_regular(partial_path, true, true, false, false) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                receiver_storage::open_regular(partial_path, true, true, false, true)?,
+                false,
+            ),
+            Err(error) => return Err(error.into()),
+        };
 
     let metadata = file.metadata().await?;
     if !metadata.is_file() {
@@ -382,8 +386,8 @@ fn validate_partial_path(partial: &Path) -> Result<(), ReceiverV03FinalizeError>
 }
 
 async fn promote_partial_no_clobber(partial: &Path, destination: &Path) -> io::Result<()> {
-    fs::hard_link(partial, destination).await?;
-    fs::remove_file(partial).await
+    receiver_storage::hard_link(partial, destination)?;
+    receiver_storage::remove_file(partial)
 }
 
 #[derive(Debug)]
@@ -630,7 +634,7 @@ where
 
     let receipt_path = completion_receipt_path(destination_directory, offer.transfer_id);
 
-    if !fs::try_exists(&receipt_path).await? {
+    if !receiver_storage::exists(&receipt_path)? {
         return Ok(ReceiverV03ReconcileOutcome::NotReconciled);
     }
 
@@ -643,7 +647,7 @@ where
     let destination = final_path(destination_directory, &offer.filename);
     let partial_destination = partial_path(destination_directory, &offer.filename);
 
-    if fs::try_exists(&destination).await? {
+    if receiver_storage::exists(&destination)? {
         if let Err(error) =
             verify_physical_file_v03(&destination, receipt.file_size, &receipt.blake3).await
         {
@@ -661,7 +665,7 @@ where
         return Ok(ReceiverV03ReconcileOutcome::Reconciled(destination));
     }
 
-    if fs::try_exists(&partial_destination).await? {
+    if receiver_storage::exists(&partial_destination)? {
         if let Err(_error) =
             verify_physical_file_v03(&partial_destination, receipt.file_size, &receipt.blake3).await
         {
@@ -705,7 +709,7 @@ async fn verify_physical_file_v03(
     expected_size: u64,
     expected_hash: &[u8; 32],
 ) -> Result<(), ReceiverV03VerificationError> {
-    let mut file = fs::File::open(path).await?;
+    let mut file = receiver_storage::open_regular(path, true, false, false, false)?;
 
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; FINAL_VERIFICATION_BUFFER_SIZE];
@@ -1368,7 +1372,7 @@ pub async fn receive_session_v03<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fs::create_dir_all(destination_directory).await?;
+    receiver_storage::ensure_directory(destination_directory)?;
 
     let hello = read_frame_for_version(stream, WFP_VERSION_V03).await?;
 
@@ -1421,7 +1425,7 @@ where
         ReceiverV03ReconcileOutcome::NotReconciled => {}
     }
 
-    fs::create_dir_all(partials_directory(destination_directory)).await?;
+    receiver_storage::ensure_directory(&partials_directory(destination_directory))?;
     let partial_destination = partial_path(destination_directory, &offer.filename);
 
     let prepared = prepare_receiver_v03(&partial_destination, &offer).await?;

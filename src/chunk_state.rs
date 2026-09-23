@@ -1,11 +1,13 @@
 use crate::chunk::ChunkLayout;
 use crate::chunk_manifest::ChunkHash;
+use crate::receiver_storage;
 use serde_json::{Value, json};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -184,11 +186,7 @@ pub async fn write_chunk_state(
     remove_if_exists(&temporary_path).await?;
 
     let write_result = async {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .await?;
+        let mut file = receiver_storage::open_regular(&temporary_path, false, true, false, true)?;
 
         file.write_all(&encoded).await?;
         file.flush().await?;
@@ -220,14 +218,14 @@ pub async fn write_chunk_state(
          * again.
          */
         remove_if_exists_io(&state_path).await?;
-        fs::rename(&temporary_path, &state_path).await?;
+        receiver_storage::rename(&temporary_path, &state_path)?;
 
         Ok::<(), io::Error>(())
     }
     .await;
 
     if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary_path).await;
+        let _ = receiver_storage::remove_file(&temporary_path);
         return Err(ChunkStateError::Io(error));
     }
 
@@ -236,7 +234,7 @@ pub async fn write_chunk_state(
 
 pub async fn read_chunk_state(partial_path: &Path) -> Result<ChunkState, ChunkStateError> {
     let state_path = chunk_state_path(partial_path);
-    let bytes = fs::read(state_path).await?;
+    let bytes = receiver_storage::read(&state_path).await?;
 
     decode_chunk_state(&bytes)
 }
@@ -266,7 +264,7 @@ pub async fn revalidate_chunk_state(
         return ChunkState::new(state.layout(), Vec::new());
     }
 
-    let mut file = match fs::File::open(partial_path).await {
+    let mut file = match receiver_storage::open_regular(partial_path, true, false, false, false) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return ChunkState::new(state.layout(), Vec::new());
@@ -456,7 +454,7 @@ async fn remove_if_exists(path: &Path) -> Result<(), ChunkStateError> {
 }
 
 async fn remove_if_exists_io(path: &Path) -> Result<(), io::Error> {
-    match fs::remove_file(path).await {
+    match receiver_storage::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),

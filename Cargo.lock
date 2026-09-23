@@ -206,6 +206,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-memstat"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c759dbef724e2b33d6f5456096d60f29951f838ae79dee104a539be10cab312c"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -388,6 +394,7 @@ dependencies = [
  "cpu-time",
  "getrandom",
  "if-addrs",
+ "proc-memstat",
  "serde_json",
  "tempfile",
  "tokio",

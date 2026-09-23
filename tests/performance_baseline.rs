@@ -133,7 +133,7 @@ async fn run_fresh_once() -> RunResult {
     }
 }
 
-async fn run_resume_50_once() -> RunResult {
+async fn run_resume_once(reused_chunk_count: u64) -> RunResult {
     let temp = tempdir().unwrap();
     let source_path = temp.path().join("payload.bin");
     let dest_dir = temp.path().join("receiver");
@@ -146,6 +146,7 @@ async fn run_resume_50_once() -> RunResult {
     let file_size_bytes = FILE_SIZE_BYTES as u64;
     let layout = ChunkLayout::new(file_size_bytes, V03_DEFAULT_CHUNK_SIZE).unwrap();
     assert_eq!(layout.chunk_count(), 32);
+    assert!(reused_chunk_count <= layout.chunk_count());
     let partial_path = dest_dir.join("payload.bin.part");
     let mut partial = std::fs::OpenOptions::new()
         .create(true)
@@ -155,7 +156,7 @@ async fn run_resume_50_once() -> RunResult {
         .unwrap();
     partial.set_len(file_size_bytes).unwrap();
     let mut records = Vec::new();
-    for index in 0..16 {
+    for index in 0..reused_chunk_count {
         let range = layout.range(index).unwrap();
         let start = range.offset as usize;
         let end = (range.offset + range.length) as usize;
@@ -174,7 +175,7 @@ async fn run_resume_50_once() -> RunResult {
             .iter()
             .map(|chunk| chunk.index)
             .collect::<Vec<_>>(),
-        (0..16).collect::<Vec<_>>()
+        (0..reused_chunk_count).collect::<Vec<_>>()
     );
     std::fs::write(
         dest_dir.join("payload.bin.part.warpchunks"),
@@ -215,7 +216,10 @@ async fn run_resume_50_once() -> RunResult {
         .filter(|frame| frame.message_type == MessageType::ChunkStart)
         .map(|frame| decode_chunk_start_v03(&frame.payload).unwrap().chunk_index)
         .collect();
-    assert_eq!(chunk_starts, (16..32).collect::<Vec<_>>());
+    assert_eq!(
+        chunk_starts,
+        (reused_chunk_count..layout.chunk_count()).collect::<Vec<_>>()
+    );
     let useful_data_bytes: u64 = frames
         .iter()
         .filter(|frame| frame.message_type == MessageType::Data)
@@ -225,9 +229,15 @@ async fn run_resume_50_once() -> RunResult {
         .iter()
         .map(|frame| encode_frame(frame).unwrap().len() as u64)
         .sum();
-    let reused_bytes = file_size_bytes.checked_sub(useful_data_bytes).unwrap();
-    assert_eq!(useful_data_bytes, 16 * 1024 * 1024);
-    assert_eq!(reused_bytes, 16 * 1024 * 1024);
+    let reused_bytes = file_size_bytes
+        .checked_sub(useful_data_bytes)
+        .expect("useful data bytes cannot exceed file size");
+    let expected_reused_bytes = reused_chunk_count * V03_DEFAULT_CHUNK_SIZE;
+    let expected_useful_data_bytes = file_size_bytes
+        .checked_sub(expected_reused_bytes)
+        .expect("expected reused bytes cannot exceed file size");
+    assert_eq!(useful_data_bytes, expected_useful_data_bytes);
+    assert_eq!(reused_bytes, expected_reused_bytes);
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     let effective_throughput_mib_s = file_size_bytes as f64 / MIB / elapsed.as_secs_f64();
 
@@ -252,16 +262,34 @@ async fn run_resume_50_once() -> RunResult {
 #[ignore = "manual local performance baseline"]
 async fn performance_baseline() {
     let mut fresh_results = Vec::with_capacity(RUN_COUNT);
-    let mut resume_results = Vec::with_capacity(RUN_COUNT);
+    let mut resume_25_results = Vec::with_capacity(RUN_COUNT);
+    let mut resume_50_results = Vec::with_capacity(RUN_COUNT);
+    let mut resume_75_results = Vec::with_capacity(RUN_COUNT);
+    let mut resume_87_5_results = Vec::with_capacity(RUN_COUNT);
     for run in 1..=RUN_COUNT {
         let fresh = run_fresh_once().await;
         print_run("fresh_transfer", run, &fresh);
         fresh_results.push(fresh);
 
-        let resume = run_resume_50_once().await;
-        print_run("resume_50_percent", run, &resume);
-        resume_results.push(resume);
+        let resume_25 = run_resume_once(8).await;
+        print_run("resume_25_percent", run, &resume_25);
+        resume_25_results.push(resume_25);
+
+        let resume_50 = run_resume_once(16).await;
+        print_run("resume_50_percent", run, &resume_50);
+        resume_50_results.push(resume_50);
+
+        let resume_75 = run_resume_once(24).await;
+        print_run("resume_75_percent", run, &resume_75);
+        resume_75_results.push(resume_75);
+
+        let resume_87_5 = run_resume_once(28).await;
+        print_run("resume_87_5_percent", run, &resume_87_5);
+        resume_87_5_results.push(resume_87_5);
     }
     print_summary("fresh_transfer", &fresh_results);
-    print_summary("resume_50_percent", &resume_results);
+    print_summary("resume_25_percent", &resume_25_results);
+    print_summary("resume_50_percent", &resume_50_results);
+    print_summary("resume_75_percent", &resume_75_results);
+    print_summary("resume_87_5_percent", &resume_87_5_results);
 }

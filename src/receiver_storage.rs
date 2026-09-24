@@ -27,7 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     #[cfg(target_os = "linux")]
     device: u64,
     #[cfg(target_os = "linux")]
@@ -185,6 +185,7 @@ fn directory(path: &Path, create: bool) -> io::Result<Directory> {
 mod linux {
     use super::*;
     use std::ffi::CString;
+    use std::ffi::c_void;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
@@ -204,6 +205,11 @@ mod linux {
         fn unlinkat(dirfd: i32, pathname: *const i8, flags: i32) -> i32;
         fn renameat(oldfd: i32, old: *const i8, newfd: i32, new: *const i8) -> i32;
         fn linkat(oldfd: i32, old: *const i8, newfd: i32, new: *const i8, flags: i32) -> i32;
+    }
+
+    #[link(name = "dl")]
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
     }
 
     fn name(path: &Path) -> io::Result<CString> {
@@ -310,6 +316,43 @@ mod linux {
                 source.as_ptr(),
                 to.0.as_raw_fd(),
                 target.as_ptr(),
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn rename_no_replace(
+        from: &Directory,
+        source: &Path,
+        to: &Directory,
+        target: &Path,
+    ) -> io::Result<()> {
+        type RenameAt2 = unsafe extern "C" fn(i32, *const i8, i32, *const i8, u32) -> i32;
+        const RENAME_NOREPLACE: u32 = 1;
+        // Resolve at runtime so older libc versions can still load WarpFile.
+        let symbol = unsafe { dlsym(std::ptr::null_mut(), c"renameat2".as_ptr()) };
+        if symbol.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "renameat2 is unavailable in the C runtime",
+            ));
+        }
+        // SAFETY: a non-null renameat2 symbol has this C ABI signature.
+        let renameat2: RenameAt2 = unsafe { std::mem::transmute(symbol) };
+        let source = name(source)?;
+        let target = name(target)?;
+        // SAFETY: pointers and both directory descriptors stay live for the call.
+        if unsafe {
+            renameat2(
+                from.0.as_raw_fd(),
+                source.as_ptr(),
+                to.0.as_raw_fd(),
+                target.as_ptr(),
+                RENAME_NOREPLACE,
             )
         } == 0
         {
@@ -486,7 +529,7 @@ pub fn remove_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_handle(source: &PinnedFile, destination: &Path) -> io::Result<()> {
+fn rename_handle(source: &PinnedFile, destination: &Path, replace: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     let name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -505,7 +548,7 @@ fn rename_handle(source: &PinnedFile, destination: &Path) -> io::Result<()> {
     // SAFETY: the aligned buffer has room for the header and UTF-16 filename;
     // source and buffer stay live until SetFileInformationByHandle returns.
     let result = unsafe {
-        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
@@ -523,7 +566,7 @@ fn rename_handle(source: &PinnedFile, destination: &Path) -> io::Result<()> {
     }
 }
 
-fn promoted_identity(destination: &Path) -> io::Result<FileIdentity> {
+pub(crate) fn promoted_identity(destination: &Path) -> io::Result<FileIdentity> {
     #[cfg(target_os = "linux")]
     {
         let (dir, name) = parent(destination)?;
@@ -573,7 +616,23 @@ pub fn promote_rename(source: &PinnedFile, from: &Path, to: &Path) -> io::Result
     {
         let _ = from;
         let (target_dir, target_name) = parent(to)?;
-        rename_handle(source, &target_dir.path.join(target_name))?;
+        rename_handle(source, &target_dir.path.join(target_name), true)?;
+    }
+    validate_promotion(source, to)
+}
+
+pub fn promote_rename_no_replace(source: &PinnedFile, from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let (source_dir, source_name) = parent(from)?;
+        let (target_dir, target_name) = parent(to)?;
+        linux::rename_no_replace(&source_dir, &source_name, &target_dir, &target_name)?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = from;
+        let (target_dir, target_name) = parent(to)?;
+        rename_handle(source, &target_dir.path.join(target_name), false)?;
     }
     validate_promotion(source, to)
 }
@@ -635,6 +694,69 @@ mod tests {
         remove_file(&target).unwrap();
     }
 
+    #[tokio::test]
+    async fn promote_rename_no_replace_publishes_pinned_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::write(&path, b"A").unwrap();
+        let source = pin(open_promotable(&path, true, false, false, false).unwrap());
+        promote_rename_no_replace(&source, &path, &target).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"A");
+        assert_eq!(
+            promoted_identity(&target).unwrap(),
+            source_identity(&source).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_rename_no_replace_preserves_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::write(&path, b"A").unwrap();
+        std::fs::write(&target, b"sentinel").unwrap();
+        let original_target = promoted_identity(&target).unwrap();
+        let source = pin(open_promotable(&path, true, false, false, false).unwrap());
+        assert_eq!(
+            promote_rename_no_replace(&source, &path, &target)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(promoted_identity(&target).unwrap(), original_target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"sentinel");
+        assert_eq!(std::fs::read(&path).unwrap(), b"A");
+        assert_eq!(
+            promoted_identity(&path).unwrap(),
+            source_identity(&source).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn no_replace_rename_accepts_existing_link_to_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::write(&path, b"A").unwrap();
+        std::fs::hard_link(&path, &target).unwrap();
+        let source = pin(open_promotable(&path, true, false, false, false).unwrap());
+        assert_eq!(
+            promoted_identity(&target).unwrap(),
+            source_identity(&source).unwrap()
+        );
+        promote_rename_no_replace(&source, &path, &target).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"A");
+        assert_eq!(
+            promoted_identity(&target).unwrap(),
+            source_identity(&source).unwrap()
+        );
+        validate_promotion(&source, &target).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn renamed_regular_replacement_is_not_accepted() {
@@ -648,6 +770,24 @@ mod tests {
         std::fs::write(&path, b"B").unwrap();
 
         let error = promote_rename(&source, &path, &target).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&target).unwrap(), b"B");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"A");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn no_replace_rename_rejects_swapped_source_after_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let displaced = temp.path().join("displaced");
+        let target = temp.path().join("target");
+        std::fs::write(&path, b"A").unwrap();
+        let source = pin(open_promotable(&path, true, false, false, false).unwrap());
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::write(&path, b"B").unwrap();
+
+        let error = promote_rename_no_replace(&source, &path, &target).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(std::fs::read(&target).unwrap(), b"B");
         assert_eq!(std::fs::read(&displaced).unwrap(), b"A");

@@ -834,7 +834,7 @@ existing != requested
 
 the operation reports a conflicting receipt.
 
-The implementation does not silently redefine an existing completed logical transfer.
+Receipt publication uses an atomic no-replace rename. It never replaces an existing destination that names a different filesystem object. If the destination already names the pinned receipt object, publication may succeed; otherwise a collision is classified by reading the existing receipt. A collision or publication error may leave the temporary receipt for later removal. On Linux, unavailable no-replace support fails the write rather than falling back to replacement rename.
 
 ### 11.2 Receipt trust boundary
 

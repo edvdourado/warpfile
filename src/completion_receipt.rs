@@ -165,41 +165,40 @@ pub async fn write_completion_receipt(
 
     let encoded = encode_completion_receipt(receipt)?;
 
-    let write_result = async {
-        let mut file =
-            receiver_storage::open_promotable(&temporary_path, false, true, false, true)?;
+    let mut file = receiver_storage::open_promotable(&temporary_path, false, true, false, true)?;
+    file.write_all(&encoded).await?;
+    file.flush().await?;
 
-        file.write_all(&encoded).await?;
+    /*
+     * The receipt must be durable before it
+     * becomes visible under its final name.
+     */
+    file.sync_all().await?;
 
-        file.flush().await?;
+    let source = receiver_storage::pin(file);
+    publish_completion_receipt(&source, &temporary_path, destination_directory, receipt).await
+}
 
-        /*
-         * The receipt must be durable before it
-         * becomes visible under its final name.
-         */
-        file.sync_all().await?;
-
-        let source = receiver_storage::pin(file);
-
-        /*
-         * The final receipt path must not already
-         * exist here.
-         *
-         * We deliberately do not replace receipts:
-         * a transfer ID has one immutable completion
-         * record.
-         */
-        receiver_storage::promote_rename(&source, &temporary_path, &receipt_path)?;
-
-        Ok::<(), io::Error>(())
+async fn publish_completion_receipt(
+    source: &receiver_storage::PinnedFile,
+    temporary_path: &Path,
+    destination_directory: &Path,
+    receipt: &CompletionReceipt,
+) -> Result<(), CompletionReceiptError> {
+    let receipt_path = completion_receipt_path(destination_directory, receipt.transfer_id);
+    match receiver_storage::promote_rename_no_replace(source, temporary_path, &receipt_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing =
+                read_completion_receipt(destination_directory, receipt.transfer_id).await?;
+            if existing == *receipt {
+                Ok(())
+            } else {
+                Err(CompletionReceiptError::ConflictingReceipt)
+            }
+        }
+        Err(error) => Err(CompletionReceiptError::Io(error)),
     }
-    .await;
-
-    if let Err(error) = write_result {
-        return Err(CompletionReceiptError::Io(error));
-    }
-
-    Ok(())
 }
 
 pub async fn read_completion_receipt(
@@ -435,6 +434,23 @@ mod tests {
         receipt
     }
 
+    async fn staged_receipt(
+        destination_directory: &Path,
+        receipt: &CompletionReceipt,
+    ) -> (PathBuf, receiver_storage::PinnedFile) {
+        let temporary_path =
+            completion_receipt_temporary_path(destination_directory, receipt.transfer_id);
+        receiver_storage::ensure_directory(temporary_path.parent().unwrap()).unwrap();
+        let mut file =
+            receiver_storage::open_promotable(&temporary_path, false, true, false, true).unwrap();
+        file.write_all(&encode_completion_receipt(receipt).unwrap())
+            .await
+            .unwrap();
+        file.flush().await.unwrap();
+        file.sync_all().await.unwrap();
+        (temporary_path, receiver_storage::pin(file))
+    }
+
     #[test]
     fn completion_receipt_round_trip() {
         let original = test_receipt();
@@ -546,6 +562,7 @@ mod tests {
         let path = completion_receipt_path(temp.path(), receipt.transfer_id);
 
         assert!(path.exists(), "completion receipt was not created");
+        assert!(!completion_receipt_temporary_path(temp.path(), receipt.transfer_id).exists());
 
         let loaded = read_completion_receipt(temp.path(), receipt.transfer_id)
             .await
@@ -598,6 +615,80 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded, receipt);
+    }
+
+    #[tokio::test]
+    async fn publication_race_with_identical_receipt_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let receipt = test_receipt();
+        let (temporary_path, source) = staged_receipt(temp.path(), &receipt).await;
+        let receipt_path = completion_receipt_path(temp.path(), receipt.transfer_id);
+        let encoded = encode_completion_receipt(&receipt).unwrap();
+        fs::write(&receipt_path, &encoded).await.unwrap();
+        let original_identity = receiver_storage::promoted_identity(&receipt_path).unwrap();
+
+        publish_completion_receipt(&source, &temporary_path, temp.path(), &receipt)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receiver_storage::promoted_identity(&receipt_path).unwrap(),
+            original_identity
+        );
+        assert_eq!(fs::read(&receipt_path).await.unwrap(), encoded);
+        assert_eq!(fs::read(&temporary_path).await.unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    async fn publication_race_with_conflicting_receipt_preserves_existing() {
+        let temp = tempdir().unwrap();
+        let receipt = test_receipt();
+        let (temporary_path, source) = staged_receipt(temp.path(), &receipt).await;
+        let receipt_path = completion_receipt_path(temp.path(), receipt.transfer_id);
+        let existing = encode_completion_receipt(&conflicting_receipt()).unwrap();
+        fs::write(&receipt_path, &existing).await.unwrap();
+        let original_identity = receiver_storage::promoted_identity(&receipt_path).unwrap();
+
+        let error = publish_completion_receipt(&source, &temporary_path, temp.path(), &receipt)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CompletionReceiptError::ConflictingReceipt));
+        assert_eq!(
+            receiver_storage::promoted_identity(&receipt_path).unwrap(),
+            original_identity
+        );
+        assert_eq!(fs::read(&receipt_path).await.unwrap(), existing);
+        assert_eq!(
+            fs::read(&temporary_path).await.unwrap(),
+            encode_completion_receipt(&receipt).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_race_with_malformed_receipt_preserves_existing() {
+        let temp = tempdir().unwrap();
+        let receipt = test_receipt();
+        let (temporary_path, source) = staged_receipt(temp.path(), &receipt).await;
+        let receipt_path = completion_receipt_path(temp.path(), receipt.transfer_id);
+        let malformed = b"{ this is not valid JSON";
+        fs::write(&receipt_path, malformed).await.unwrap();
+        let original_identity = receiver_storage::promoted_identity(&receipt_path).unwrap();
+
+        let error = publish_completion_receipt(&source, &temporary_path, temp.path(), &receipt)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CompletionReceiptError::Json(_)));
+        assert_eq!(
+            receiver_storage::promoted_identity(&receipt_path).unwrap(),
+            original_identity
+        );
+        assert_eq!(fs::read(&receipt_path).await.unwrap(), malformed);
+        assert_eq!(
+            fs::read(&temporary_path).await.unwrap(),
+            encode_completion_receipt(&receipt).unwrap()
+        );
     }
 
     #[tokio::test]

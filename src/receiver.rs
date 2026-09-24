@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::completion_receipt::{
@@ -33,6 +33,7 @@ struct PreparedTransfer {
 struct CompletedTransfer {
     bytes_received: u64,
     blake3: [u8; 32],
+    source: receiver_storage::PinnedFile,
 }
 
 pub async fn run_receiver(address: &str) -> Result<(), Box<dyn Error>> {
@@ -248,7 +249,9 @@ async fn receive_connection(
      * A later connection can verify the receipt against this
      * complete .part and finish the commit.
      */
-    if let Err(error) = receiver_storage::rename(&partial_destination, &destination) {
+    if let Err(error) =
+        receiver_storage::promote_rename(&completed.source, &partial_destination, &destination)
+    {
         println!();
         println!(
             "Completion receipt persisted, but final rename failed; completed partial state preserved"
@@ -322,7 +325,7 @@ async fn reconcile_completed_transfer(
     }
 
     if receiver_storage::exists(destination)? {
-        if let Err(error) = verify_completed_data(destination, &receipt).await {
+        if let Err(error) = verify_existing_final(destination, &receipt).await {
             send_reject(
                 stream,
                 RejectCode::CannotPrepareDestination,
@@ -352,18 +355,23 @@ async fn reconcile_completed_transfer(
     }
 
     if receiver_storage::exists(partial_destination)? {
-        if let Err(error) = verify_completed_data(partial_destination, &receipt).await {
-            send_reject(
-                stream,
-                RejectCode::CannotPrepareDestination,
-                "completed partial file does not match the completion receipt",
-            )
-            .await?;
+        let source =
+            match verify_completed_partial_for_promotion(partial_destination, &receipt).await {
+                Ok(source) => source,
+                Err(error) => {
+                    send_reject(
+                        stream,
+                        RejectCode::CannotPrepareDestination,
+                        "completed partial file does not match the completion receipt",
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
 
-            return Err(error);
-        }
-
-        if let Err(error) = receiver_storage::rename(partial_destination, destination) {
+        if let Err(error) =
+            receiver_storage::promote_rename(&source, partial_destination, destination)
+        {
             return Err(error.into());
         }
 
@@ -399,11 +407,29 @@ async fn reconcile_completed_transfer(
     .into())
 }
 
-async fn verify_completed_data(
+async fn verify_existing_final(
     path: &Path,
     receipt: &CompletionReceipt,
 ) -> Result<(), Box<dyn Error>> {
-    let metadata = receiver_storage::metadata(path)?;
+    let mut file = receiver_storage::open_regular(path, true, false, false, false)?;
+    verify_completed_file(&mut file, receipt).await
+}
+
+async fn verify_completed_partial_for_promotion(
+    path: &Path,
+    receipt: &CompletionReceipt,
+) -> Result<receiver_storage::PinnedFile, Box<dyn Error>> {
+    let file = receiver_storage::open_promotable(path, true, false, false, false)?;
+    let mut source = receiver_storage::pin(file);
+    verify_completed_file(source.file_mut(), receipt).await?;
+    Ok(source)
+}
+
+async fn verify_completed_file(
+    file: &mut fs::File,
+    receipt: &CompletionReceipt,
+) -> Result<(), Box<dyn Error>> {
+    let metadata = file.metadata().await?;
 
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -421,7 +447,7 @@ async fn verify_completed_data(
         .into());
     }
 
-    let hasher = hash_file_exact(path, receipt.file_size).await?;
+    let hasher = hash_file_contents(file, receipt.file_size).await?;
 
     let digest = hasher.finalize();
 
@@ -519,7 +545,10 @@ async fn prepare_transfer(
         }
     };
 
-    let hasher = match hash_file_exact(partial_destination, partial_size).await {
+    let mut output =
+        receiver_storage::open_promotable(partial_destination, true, false, true, false)?;
+    output.seek(io::SeekFrom::Start(0)).await?;
+    let hasher = match hash_file_contents(&mut output, partial_size).await {
         Ok(hasher) => hasher,
 
         Err(error) => {
@@ -547,6 +576,7 @@ async fn prepare_transfer(
 
     if let Err(error) = write_frame(stream, &resume).await {
         if !should_preserve_partial(&error) {
+            drop(output);
             let _ = discard_partial_state(partial_destination).await;
         }
 
@@ -560,6 +590,7 @@ async fn prepare_transfer(
 
         Err(error) => {
             if !should_preserve_partial(&error) {
+                drop(output);
                 let _ = discard_partial_state(partial_destination).await;
             }
 
@@ -570,6 +601,7 @@ async fn prepare_transfer(
     match response.message_type {
         MessageType::Accept => {
             if !response.payload.is_empty() {
+                drop(output);
                 let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
@@ -579,9 +611,10 @@ async fn prepare_transfer(
                 .into());
             }
 
-            let current_size = receiver_storage::metadata(partial_destination)?.len();
+            let current_size = output.metadata().await?.len();
 
             if current_size != partial_size {
+                drop(output);
                 let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
@@ -600,9 +633,6 @@ async fn prepare_transfer(
                 );
             }
 
-            let output =
-                receiver_storage::open_regular(partial_destination, false, false, true, false)?;
-
             println!("Resume accepted at byte {partial_size}");
 
             Ok(PreparedTransfer {
@@ -614,6 +644,7 @@ async fn prepare_transfer(
 
         MessageType::Restart => {
             if !response.payload.is_empty() {
+                drop(output);
                 let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
@@ -625,6 +656,7 @@ async fn prepare_transfer(
 
             println!("Sender rejected the partial file; restarting from byte 0");
 
+            drop(output);
             if let Err(error) = discard_partial_state(partial_destination).await {
                 send_reject(
                     stream,
@@ -641,6 +673,7 @@ async fn prepare_transfer(
 
         MessageType::Cancel => {
             if !response.payload.is_empty() {
+                drop(output);
                 let _ = discard_partial_state(partial_destination).await;
 
                 return Err(io::Error::new(
@@ -650,12 +683,14 @@ async fn prepare_transfer(
                 .into());
             }
 
+            drop(output);
             let _ = discard_partial_state(partial_destination).await;
 
             Err(io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled by sender").into())
         }
 
         _ => {
+            drop(output);
             let _ = discard_partial_state(partial_destination).await;
 
             Err(io::Error::new(
@@ -683,21 +718,21 @@ async fn prepare_fresh_transfer(
         return Err(error.into());
     }
 
-    let output = match receiver_storage::open_regular(partial_destination, false, true, false, true)
-    {
-        Ok(file) => file,
+    let output =
+        match receiver_storage::open_promotable(partial_destination, false, true, false, true) {
+            Ok(file) => file,
 
-        Err(error) => {
-            send_reject(
-                stream,
-                RejectCode::CannotPrepareDestination,
-                "receiver could not create the destination file",
-            )
-            .await?;
+            Err(error) => {
+                send_reject(
+                    stream,
+                    RejectCode::CannotPrepareDestination,
+                    "receiver could not create the destination file",
+                )
+                .await?;
 
-            return Err(error.into());
-        }
-    };
+                return Err(error.into());
+            }
+        };
 
     if let Err(error) = write_transfer_metadata(partial_destination, metadata).await {
         drop(output);
@@ -759,12 +794,10 @@ async fn discard_partial_state(partial_destination: &Path) -> Result<(), Box<dyn
     Ok(())
 }
 
-async fn hash_file_exact(
-    path: &Path,
+async fn hash_file_contents(
+    file: &mut fs::File,
     expected_size: u64,
 ) -> Result<blake3::Hasher, Box<dyn Error>> {
-    let mut file = receiver_storage::open_regular(path, true, false, false, false)?;
-
     let mut hasher = blake3::Hasher::new();
 
     let mut buffer = vec![0u8; MAX_DATA_PAYLOAD_LENGTH];
@@ -817,13 +850,13 @@ async fn receive_file_data(
 
     let mut progress = ProgressTracker::new("Receiving", remaining_size);
 
+    // A Tokio write may still be in flight after write_all returns. Flush
+    // before errors that lead the caller to remove the partial on Windows.
     let sender_hash = loop {
         let frame = match read_frame(stream).await {
             Ok(frame) => frame,
             Err(error) => {
-                if should_preserve_partial(&error) {
-                    output.flush().await?;
-                }
+                output.flush().await?;
                 return Err(error.into());
             }
         };
@@ -832,11 +865,20 @@ async fn receive_file_data(
             MessageType::Data => {
                 let chunk_size = frame.payload.len() as u64;
 
-                let next_total = bytes_received.checked_add(chunk_size).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "received byte count overflow")
-                })?;
+                let next_total = match bytes_received.checked_add(chunk_size) {
+                    Some(total) => total,
+                    None => {
+                        output.flush().await?;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "received byte count overflow",
+                        )
+                        .into());
+                    }
+                };
 
                 if next_total > expected_size {
+                    output.flush().await?;
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "received more bytes than announced",
@@ -855,6 +897,7 @@ async fn receive_file_data(
 
             MessageType::Complete => {
                 if frame.payload.len() != 32 {
+                    output.flush().await?;
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "COMPLETE must contain a 32-byte BLAKE3 hash",
@@ -866,6 +909,7 @@ async fn receive_file_data(
             }
 
             MessageType::Cancel => {
+                output.flush().await?;
                 if !frame.payload.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -882,6 +926,7 @@ async fn receive_file_data(
             }
 
             _ => {
+                output.flush().await?;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "expected DATA, COMPLETE, or CANCEL",
@@ -898,8 +943,6 @@ async fn receive_file_data(
      * completion receipt is allowed to become durable.
      */
     output.sync_all().await?;
-
-    drop(output);
 
     if bytes_received != expected_size {
         return Err(io::Error::new(
@@ -924,6 +967,7 @@ async fn receive_file_data(
     Ok(CompletedTransfer {
         bytes_received,
         blake3: *receiver_hash.as_bytes(),
+        source: receiver_storage::pin(output),
     })
 }
 

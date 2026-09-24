@@ -166,7 +166,8 @@ pub async fn write_completion_receipt(
     let encoded = encode_completion_receipt(receipt)?;
 
     let write_result = async {
-        let mut file = receiver_storage::open_regular(&temporary_path, false, true, false, true)?;
+        let mut file =
+            receiver_storage::open_promotable(&temporary_path, false, true, false, true)?;
 
         file.write_all(&encoded).await?;
 
@@ -178,7 +179,7 @@ pub async fn write_completion_receipt(
          */
         file.sync_all().await?;
 
-        drop(file);
+        let source = receiver_storage::pin(file);
 
         /*
          * The final receipt path must not already
@@ -188,15 +189,13 @@ pub async fn write_completion_receipt(
          * a transfer ID has one immutable completion
          * record.
          */
-        receiver_storage::rename(&temporary_path, &receipt_path)?;
+        receiver_storage::promote_rename(&source, &temporary_path, &receipt_path)?;
 
         Ok::<(), io::Error>(())
     }
     .await;
 
     if let Err(error) = write_result {
-        let _ = receiver_storage::remove_file(&temporary_path);
-
         return Err(CompletionReceiptError::Io(error));
     }
 

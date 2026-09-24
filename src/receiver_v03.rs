@@ -217,10 +217,10 @@ pub async fn prepare_v03_partial_file(
     file_size: u64,
 ) -> Result<fs::File, ReceiverV03Error> {
     let (file, existed) =
-        match receiver_storage::open_regular(partial_path, true, true, false, false) {
+        match receiver_storage::open_promotable(partial_path, true, true, false, false) {
             Ok(file) => (file, true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (
-                receiver_storage::open_regular(partial_path, true, true, false, true)?,
+                receiver_storage::open_promotable(partial_path, true, true, false, true)?,
                 false,
             ),
             Err(error) => return Err(error.into()),
@@ -268,7 +268,7 @@ pub struct ReceivedCompleteV03 {
 }
 
 impl ReceivedCompleteV03 {
-    pub async fn verify_complete_file(mut self) -> Result<(), ReceiverV03VerificationError> {
+    pub async fn verify_complete_file(mut self) -> Result<Self, ReceiverV03VerificationError> {
         let expected_size = self.receiver.chunk_state.layout().file_size();
 
         self.file.seek(io::SeekFrom::Start(0)).await?;
@@ -302,7 +302,7 @@ impl ReceivedCompleteV03 {
             return Err(ReceiverV03VerificationError::FileHashMismatch);
         }
 
-        Ok(())
+        Ok(self)
     }
 
     pub async fn finalize(
@@ -317,7 +317,8 @@ impl ReceivedCompleteV03 {
         let sender_file_hash = self.sender_file_hash;
         let identity = self.identity.clone();
 
-        self.verify_complete_file().await?;
+        let verified = self.verify_complete_file().await?;
+        let source = receiver_storage::pin(verified.file);
 
         println!("Final file verified");
 
@@ -333,7 +334,7 @@ impl ReceivedCompleteV03 {
             println!("Completion receipt persisted");
         }
 
-        promote_partial_no_clobber(&partial_path, &final_path)
+        promote_partial_no_clobber(&source, &partial_path, &final_path)
             .await
             .map_err(|error| match error.kind() {
                 io::ErrorKind::AlreadyExists => {
@@ -346,7 +347,7 @@ impl ReceivedCompleteV03 {
 
         /*
          * Cleanup is best-effort: `.warpchunks` is advisory state whose
-         * name still refers to the now-renamed partial. A failure here
+         * name still refers to the partial after promotion. A failure here
          * does not invalidate the committed destination, so it is not
          * fatal.
          */
@@ -385,9 +386,12 @@ fn validate_partial_path(partial: &Path) -> Result<(), ReceiverV03FinalizeError>
     Ok(())
 }
 
-async fn promote_partial_no_clobber(partial: &Path, destination: &Path) -> io::Result<()> {
-    receiver_storage::hard_link(partial, destination)?;
-    receiver_storage::remove_file(partial)
+async fn promote_partial_no_clobber(
+    source: &receiver_storage::PinnedFile,
+    partial: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    receiver_storage::promote_link(source, partial, destination)
 }
 
 #[derive(Debug)]
@@ -649,7 +653,7 @@ where
 
     if receiver_storage::exists(&destination)? {
         if let Err(error) =
-            verify_physical_file_v03(&destination, receipt.file_size, &receipt.blake3).await
+            verify_existing_final_v03(&destination, receipt.file_size, &receipt.blake3).await
         {
             eprintln!(
                 "Warning: completed destination does not match the completion receipt: {error}"
@@ -666,13 +670,18 @@ where
     }
 
     if receiver_storage::exists(&partial_destination)? {
-        if let Err(_error) =
-            verify_physical_file_v03(&partial_destination, receipt.file_size, &receipt.blake3).await
+        let source = match verify_partial_for_promotion_v03(
+            &partial_destination,
+            receipt.file_size,
+            &receipt.blake3,
+        )
+        .await
         {
-            return Ok(ReceiverV03ReconcileOutcome::NotReconciled);
-        }
+            Ok(source) => source,
+            Err(_error) => return Ok(ReceiverV03ReconcileOutcome::NotReconciled),
+        };
 
-        promote_partial_no_clobber(&partial_destination, &destination)
+        promote_partial_no_clobber(&source, &partial_destination, &destination)
             .await
             .map_err(|error| match error.kind() {
                 io::ErrorKind::AlreadyExists => {
@@ -704,13 +713,31 @@ where
     Ok(())
 }
 
-async fn verify_physical_file_v03(
+async fn verify_existing_final_v03(
     path: &Path,
     expected_size: u64,
     expected_hash: &[u8; 32],
 ) -> Result<(), ReceiverV03VerificationError> {
     let mut file = receiver_storage::open_regular(path, true, false, false, false)?;
+    hash_physical_file_v03(&mut file, expected_size, expected_hash).await
+}
 
+async fn verify_partial_for_promotion_v03(
+    path: &Path,
+    expected_size: u64,
+    expected_hash: &[u8; 32],
+) -> Result<receiver_storage::PinnedFile, ReceiverV03VerificationError> {
+    let file = receiver_storage::open_promotable(path, true, false, false, false)?;
+    let mut source = receiver_storage::pin(file);
+    hash_physical_file_v03(source.file_mut(), expected_size, expected_hash).await?;
+    Ok(source)
+}
+
+async fn hash_physical_file_v03(
+    file: &mut fs::File,
+    expected_size: u64,
+    expected_hash: &[u8; 32],
+) -> Result<(), ReceiverV03VerificationError> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; FINAL_VERIFICATION_BUFFER_SIZE];
     let mut bytes_read_total = 0u64;
@@ -1477,10 +1504,16 @@ pub async fn run_receiver_v03(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use std::io::Cursor;
 
     use tempfile::tempdir;
+
+    fn assert_promoted_partial(partial: &Path) {
+        #[cfg(windows)]
+        assert!(!partial.exists());
+        #[cfg(target_os = "linux")]
+        assert!(partial.exists());
+    }
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, DuplexStream, duplex};
 
     use crate::chunk::ChunkLayout;
@@ -2998,12 +3031,7 @@ mod tests {
     ) -> ReceivedCompleteV03 {
         fs::write(partial, physical).await.unwrap();
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(partial)
-            .await
-            .unwrap();
+        let file = receiver_storage::open_promotable(partial, true, true, false, false).unwrap();
 
         let layout = ChunkLayout::new(declared_size, chunk_size).unwrap();
         let chunk_state = ChunkState::new(layout, Vec::new()).unwrap();
@@ -3036,7 +3064,7 @@ mod tests {
 
         let received = received_complete(&partial, &physical, 12, 4, hash(b"abcdefghijkl")).await;
 
-        let error = received.verify_complete_file().await.unwrap_err();
+        let error = received.verify_complete_file().await.err().unwrap();
 
         assert!(matches!(
             error,
@@ -3050,7 +3078,7 @@ mod tests {
         let partial = temp.path().join("truncated.part");
         let received = received_complete(&partial, b"abc", 4, 4, hash(b"abcd")).await;
 
-        let error = received.verify_complete_file().await.unwrap_err();
+        let error = received.verify_complete_file().await.err().unwrap();
 
         assert!(matches!(
             error,
@@ -3125,7 +3153,7 @@ mod tests {
 
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
         assert!(!snapshot.exists());
     }
 
@@ -3145,7 +3173,7 @@ mod tests {
 
         assert_eq!(final_path, dir.join("archive.bin"));
         assert_eq!(fs::read(final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
         assert!(!partials_directory(dir).join("archive.bin").exists());
     }
 
@@ -3162,7 +3190,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
         assert!(!chunk_state_path(&partial).exists());
     }
 
@@ -3252,7 +3280,7 @@ mod tests {
 
         assert_eq!(final_path, temp.path().join("empty.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), b"");
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
     }
 
     #[tokio::test]
@@ -3273,7 +3301,7 @@ mod tests {
 
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
         assert!(receipt_path.exists());
         assert_eq!(
             read_completion_receipt(receipt_dir, transfer_id)
@@ -3387,7 +3415,7 @@ mod tests {
 
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
     }
 
     #[tokio::test]
@@ -3467,7 +3495,7 @@ mod tests {
         assert!(verified.payload.is_empty());
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
     }
 
     #[tokio::test]
@@ -3553,7 +3581,7 @@ mod tests {
         let final_path = temp.path().join("archive.bin");
         assert!(final_path.exists());
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
         assert!(receipt_path.exists());
     }
 
@@ -3585,7 +3613,7 @@ mod tests {
         assert!(verified.payload.is_empty());
         assert_eq!(final_path, temp.path().join("archive.bin"));
         assert_eq!(fs::read(&final_path).await.unwrap(), contents);
-        assert!(!partial.exists());
+        assert_promoted_partial(&partial);
         assert!(receipt_path.exists());
         assert_eq!(
             read_completion_receipt(receipt_dir, transfer_id)
@@ -3628,6 +3656,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_from_final_file_sends_verified() {
+        #[cfg(windows)]
+        use std::os::windows::fs::OpenOptionsExt;
+
         let temp = tempdir().unwrap();
         let dir = temp.path();
         let contents = b"abcdefghijkl";
@@ -3636,6 +3667,16 @@ mod tests {
             .await
             .unwrap();
         fs::write(dir.join("archive.bin"), contents).await.unwrap();
+        #[cfg(windows)]
+        // This reader permits verification but denies a second handle DELETE access.
+        let _final_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(
+                windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+            )
+            .open(dir.join("archive.bin"))
+            .unwrap();
         let (mut receiver_stream, mut peer_stream) = duplex(1024);
 
         let outcome = reconcile_completed_transfer_v03(&mut receiver_stream, dir, &offer)
@@ -3679,7 +3720,7 @@ mod tests {
         );
         assert!(dir.join("archive.bin").exists());
         assert_eq!(fs::read(dir.join("archive.bin")).await.unwrap(), contents);
-        assert!(!partial_path(dir, "archive.bin").exists());
+        assert_promoted_partial(&partial_path(dir, "archive.bin"));
         let verified = read_frame_for_version(&mut peer_stream, WFP_VERSION_V03)
             .await
             .unwrap();

@@ -87,6 +87,9 @@ async fn successful_transfer_persists_completion_receipt() {
 
 #[tokio::test]
 async fn reconciles_existing_final_file_from_completion_receipt() {
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
     let temp = tempdir().unwrap();
 
     let destination_directory = temp.path().join("received");
@@ -110,6 +113,17 @@ async fn reconciles_existing_final_file_from_completion_receipt() {
 
     write_completion_receipt(&destination_directory, &receipt)
         .await
+        .unwrap();
+
+    #[cfg(windows)]
+    // This reader allows verification but denies an additional DELETE-access handle.
+    let _final_reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+        )
+        .open(&final_path)
         .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -144,7 +144,8 @@ pub async fn write_transfer_metadata(
     remove_if_exists(&temporary_path).await?;
 
     let write_result = async {
-        let mut file = receiver_storage::open_regular(&temporary_path, false, true, false, true)?;
+        let mut file =
+            receiver_storage::open_promotable(&temporary_path, false, true, false, true)?;
 
         file.write_all(&encoded).await?;
 
@@ -161,7 +162,7 @@ pub async fn write_transfer_metadata(
          */
         file.sync_all().await?;
 
-        drop(file);
+        let source = receiver_storage::pin(file);
 
         /*
          * Windows does not reliably allow a
@@ -178,15 +179,15 @@ pub async fn write_transfer_metadata(
          */
         remove_if_exists_io(&metadata_path).await?;
 
-        receiver_storage::rename(&temporary_path, &metadata_path)?;
+        receiver_storage::promote_rename(&source, &temporary_path, &metadata_path)?;
 
         Ok::<(), io::Error>(())
     }
     .await;
 
     if let Err(error) = write_result {
-        let _ = receiver_storage::remove_file(&temporary_path);
-
+        // The temp name may now refer to another object. Leave any residue;
+        // the next write checks for a stale temp before creating a new one.
         return Err(TransferMetadataError::Io(error));
     }
 

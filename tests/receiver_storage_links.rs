@@ -3,7 +3,9 @@ use std::path::Path;
 
 use tempfile::tempdir;
 use warpfile::chunk::ChunkLayout;
-use warpfile::chunk_state::{ChunkState, chunk_state_path, read_chunk_state, write_chunk_state};
+use warpfile::chunk_state::{
+    ChunkState, chunk_state_path, encode_chunk_state, read_chunk_state, write_chunk_state,
+};
 use warpfile::completion_receipt::{
     CompletionReceipt, completion_receipt_path, read_completion_receipt, write_completion_receipt,
 };
@@ -15,8 +17,8 @@ use warpfile::receiver::receive_once;
 use warpfile::receiver_paths::{internal_directory, partial_path, partials_directory};
 use warpfile::receiver_v03::prepare_v03_partial_file;
 use warpfile::transfer_metadata::{
-    TransferMetadata, TransferState, read_transfer_metadata, transfer_metadata_path,
-    write_transfer_metadata,
+    TransferMetadata, TransferState, encode_transfer_metadata, read_transfer_metadata,
+    transfer_metadata_path, write_transfer_metadata,
 };
 
 #[cfg(unix)]
@@ -162,7 +164,7 @@ async fn internal_root_link_does_not_redirect_receiver() {
 }
 
 #[tokio::test]
-async fn metadata_and_temporary_links_leave_sentinel_intact() {
+async fn metadata_final_link_leaves_pinned_temporary_for_retry() {
     let temp = tempdir().unwrap();
     let partial = temp.path().join("x.part");
     let sentinel = temp.path().join("sentinel");
@@ -174,42 +176,93 @@ async fn metadata_and_temporary_links_leave_sentinel_intact() {
         state: TransferState::Partial,
     };
     let sidecar = transfer_metadata_path(&partial);
+    let temporary = sidecar.with_file_name("x.part.warpmeta.tmp");
     if !link_file(&sentinel, &sidecar) {
         return;
     }
     assert!(read_transfer_metadata(&partial).await.is_err());
     assert!(write_transfer_metadata(&partial, &metadata).await.is_err());
     assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+    assert_eq!(
+        fs::read(&temporary).unwrap(),
+        encode_transfer_metadata(&metadata).unwrap()
+    );
     fs::remove_file(&sidecar).unwrap();
-    let temporary = sidecar.with_file_name("x.part.warpmeta.tmp");
+    write_transfer_metadata(&partial, &metadata).await.unwrap();
+    assert_eq!(read_transfer_metadata(&partial).await.unwrap(), metadata);
+    assert!(!temporary.exists());
+}
+
+#[tokio::test]
+async fn metadata_temporary_link_leaves_sentinel_intact() {
+    let temp = tempdir().unwrap();
+    let partial = temp.path().join("x.part");
+    let sentinel = temp.path().join("sentinel");
+    fs::write(&sentinel, b"keep").unwrap();
+    let metadata = TransferMetadata {
+        transfer_id: id(),
+        filename: "x".into(),
+        file_size: 4,
+        state: TransferState::Partial,
+    };
+    let temporary = transfer_metadata_path(&partial).with_file_name("x.part.warpmeta.tmp");
     if !link_file(&sentinel, &temporary) {
         return;
     }
     assert!(write_transfer_metadata(&partial, &metadata).await.is_err());
     assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+    assert!(
+        fs::symlink_metadata(&temporary)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[tokio::test]
-async fn chunk_state_and_temporary_links_leave_sentinel_intact() {
+async fn chunk_state_final_link_leaves_pinned_temporary_for_retry() {
     let temp = tempdir().unwrap();
     let partial = temp.path().join("x.part");
     let sentinel = temp.path().join("sentinel");
     fs::write(&sentinel, b"keep").unwrap();
     let state = ChunkState::new(ChunkLayout::new(4, 4).unwrap(), vec![]).unwrap();
     let sidecar = chunk_state_path(&partial);
+    let temporary = sidecar.with_file_name("x.part.warpchunks.tmp");
     if !link_file(&sentinel, &sidecar) {
         return;
     }
     assert!(read_chunk_state(&partial).await.is_err());
     assert!(write_chunk_state(&partial, &state).await.is_err());
     assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+    assert_eq!(
+        fs::read(&temporary).unwrap(),
+        encode_chunk_state(&state).unwrap()
+    );
     fs::remove_file(&sidecar).unwrap();
-    let temporary = sidecar.with_file_name("x.part.warpchunks.tmp");
+    write_chunk_state(&partial, &state).await.unwrap();
+    assert_eq!(read_chunk_state(&partial).await.unwrap(), state);
+    assert!(!temporary.exists());
+}
+
+#[tokio::test]
+async fn chunk_state_temporary_link_leaves_sentinel_intact() {
+    let temp = tempdir().unwrap();
+    let partial = temp.path().join("x.part");
+    let sentinel = temp.path().join("sentinel");
+    fs::write(&sentinel, b"keep").unwrap();
+    let state = ChunkState::new(ChunkLayout::new(4, 4).unwrap(), vec![]).unwrap();
+    let temporary = chunk_state_path(&partial).with_file_name("x.part.warpchunks.tmp");
     if !link_file(&sentinel, &temporary) {
         return;
     }
     assert!(write_chunk_state(&partial, &state).await.is_err());
     assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+    assert!(
+        fs::symlink_metadata(&temporary)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[tokio::test]

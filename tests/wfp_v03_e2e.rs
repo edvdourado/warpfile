@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
 use tempfile::tempdir;
@@ -14,6 +16,23 @@ use warpfile::protocol::{
 };
 use warpfile::receiver_v03::run_receiver_v03;
 use warpfile::sender_v03::run_sender_v03;
+
+fn assert_promoted_partial(partial: &std::path::Path, final_path: &std::path::Path) {
+    assert!(final_path.is_file());
+    #[cfg(windows)]
+    assert!(!partial.exists());
+    #[cfg(target_os = "linux")]
+    {
+        let partial_metadata = std::fs::metadata(partial).unwrap();
+        let final_metadata = std::fs::metadata(final_path).unwrap();
+        assert_eq!(partial_metadata.dev(), final_metadata.dev());
+        assert_eq!(partial_metadata.ino(), final_metadata.ino());
+        assert_eq!(
+            std::fs::read(partial).unwrap(),
+            std::fs::read(final_path).unwrap()
+        );
+    }
+}
 
 async fn proxy_v03_drop_after_chunk_persisted(
     listener: &TcpListener,
@@ -148,6 +167,13 @@ async fn wfp_v03_transfers_a_small_file_end_to_end() {
 
     let received = std::fs::read(&final_path).unwrap();
     assert_eq!(received, contents, "payload bytes must match");
+    let partial = dest_dir.join(".warpfile/partials/payload.bin.part");
+    assert_promoted_partial(&partial, &final_path);
+    assert!(
+        !dest_dir
+            .join(".warpfile/partials/payload.bin.part.warpchunks")
+            .exists()
+    );
 
     let receipts_dir = dest_dir.join(".warpfile").join("receipts");
     assert!(receipts_dir.is_dir(), "receipts directory must exist");
@@ -264,7 +290,7 @@ async fn wfp_v03_resumes_from_preseeded_partial() {
 
     let final_path = dest_dir.join("payload.bin");
     assert_eq!(std::fs::read(&final_path).unwrap(), contents);
-    assert!(!partial.exists(), ".part must be renamed after finalize");
+    assert_promoted_partial(&partial, &final_path);
     assert!(
         !dest_dir
             .join(".warpfile/partials/payload.bin.part.warpchunks")
@@ -395,10 +421,7 @@ async fn wfp_v03_reuses_sparse_physically_valid_chunks_on_wire() {
 
     let final_path = dest_dir.join("payload.bin");
     assert_eq!(std::fs::read(&final_path).unwrap(), contents);
-    assert!(
-        !partial.exists(),
-        ".part must be removed after finalization"
-    );
+    assert_promoted_partial(&partial, &final_path);
     assert!(
         dest_dir.join(".warpfile/receipts").is_dir(),
         "completion receipt directory must exist after verified completion"
@@ -529,10 +552,7 @@ async fn wfp_v03_revalidates_corrupted_sparse_chunk_before_reuse() {
         std::fs::read(dest_dir.join("payload.bin")).unwrap(),
         contents
     );
-    assert!(
-        !partial.exists(),
-        ".part must be removed after finalization"
-    );
+    assert_promoted_partial(&partial, &dest_dir.join("payload.bin"));
 }
 
 #[tokio::test]
@@ -699,7 +719,7 @@ async fn wfp_v03_retries_after_a_persisted_chunk_without_retransmitting_it() {
         std::fs::read(dest_dir.join("payload.bin")).unwrap(),
         contents
     );
-    assert!(!partial.exists(), ".part must be removed after finalize");
+    assert_promoted_partial(&partial, &dest_dir.join("payload.bin"));
     assert!(
         !dest_dir
             .join(".warpfile/partials/payload.bin.part.warpchunks")
